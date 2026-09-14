@@ -7,6 +7,7 @@ from typing import Optional, Dict, Any
 from pydantic import BaseModel
 from fastapi import APIRouter, HTTPException, Depends, Request, Response, Header
 
+from database.postgres import execute_pg_query
 from auth.deps import get_auth_token, create_spac2_token, decode_spac2_token, create_text2_token, decode_text2_token
 from auth.security import hash_password, verify_password, validate_email_format, validate_password_strength
 from services.user_service import get_profile
