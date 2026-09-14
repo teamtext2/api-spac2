@@ -73,6 +73,7 @@ app.add_middleware(
 )
 
 # --- Static file mounts (local fallback for avatars/uploads) ---
+app.mount("/data/avatar", StaticFiles(directory=LOCAL_AVATARS_DIR), name="avatar")
 app.mount("/data/avatars", StaticFiles(directory=LOCAL_AVATARS_DIR), name="avatars")
 app.mount("/data/uploads", StaticFiles(directory=LOCAL_UPLOADS_DIR), name="uploads")
 
