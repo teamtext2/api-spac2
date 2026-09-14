@@ -5,7 +5,7 @@ from typing import Optional, List, Dict, Any
 from fastapi import APIRouter, HTTPException, Depends, Query, Header, Response
 from pydantic import BaseModel
 
-from auth.deps import get_auth_token, decode_text2_token, create_text2_token
+from auth.deps import get_auth_token, decode_spac2_token, create_spac2_token, decode_text2_token, create_text2_token
 from database.postgres import execute_pg_query
 
 router = APIRouter(prefix="/api/sync/note", tags=["sync_note"])
@@ -45,9 +45,9 @@ async def _resolve_user_id(
     clean_email = _clean_str(x_user_email).lower()
     clean_username = _clean_str(x_user_name).lower()
 
-    # 1. Primary: Verify Text2 JWT Token
+    # 1. Primary: Verify Spac2 JWT Token
     if clean_token:
-        payload = decode_text2_token(clean_token)
+        payload = decode_spac2_token(clean_token)
         if payload and payload.get("user_id"):
             return int(payload["user_id"])
 
@@ -71,12 +71,12 @@ async def _resolve_user_id(
                         pass
 
                 if response is not None:
-                    new_token = create_text2_token(
+                    new_token = create_spac2_token(
                         user_id=uid,
                         username=row.get("username") or clean_username or clean_email.split("@")[0],
                         email=row.get("email") or clean_email
                     )
-                    response.headers["X-New-Text2-Token"] = new_token
+                    response.headers["X-New-Spac2-Token"] = new_token
                 return uid
             else:
                 # Auto-provision user in central table so all devices share the exact same user_id
@@ -93,12 +93,12 @@ async def _resolve_user_id(
                         prov_row = prov_rows[0]
                         uid = int(prov_row.get("user_id") or (10000 + prov_row["id"]))
                         if response is not None:
-                            new_token = create_text2_token(
+                            new_token = create_spac2_token(
                                 user_id=uid,
                                 username=prov_row.get("username") or uname,
                                 email=clean_email
                             )
-                            response.headers["X-New-Text2-Token"] = new_token
+                            response.headers["X-New-Spac2-Token"] = new_token
                         return uid
                 except Exception as prov_err:
                     print(f"[ResolveUser] Auto-provision note user notice: {prov_err}")
@@ -116,12 +116,12 @@ async def _resolve_user_id(
                 row = rows[0]
                 uid = int(row.get("user_id") or (10000 + row["id"]))
                 if response is not None:
-                    new_token = create_text2_token(
+                    new_token = create_spac2_token(
                         user_id=uid,
                         username=row.get("username") or clean_username,
-                        email=row.get("email") or clean_email or f"{clean_username}@text2.co"
+                        email=row.get("email") or clean_email or f"{clean_username}@spac2.com"
                     )
-                    response.headers["X-New-Text2-Token"] = new_token
+                    response.headers["X-New-Spac2-Token"] = new_token
                 return uid
         except Exception as err:
             print(f"[ResolveUser] Username lookup warning: {err}")
@@ -145,7 +145,7 @@ async def _resolve_user_id(
         stable_id = 50000 + (email_hash_int % 40000)
         return stable_id
 
-    raise HTTPException(status_code=401, detail="Unauthorized: No valid Text2 session or token found")
+    raise HTTPException(status_code=401, detail="Unauthorized: No valid Spac2 session or token found")
 
 
 def _is_dark_color(hex_color: str) -> bool:

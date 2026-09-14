@@ -181,7 +181,7 @@ async def api_download_file(url: str, filename: str):
                     print(f"R2 get_object failed: {r2_err}")
 
         if url.startswith("http://") or url.startswith("https://"):
-            trusted_domains = ("cdn.text2os.com", "text2.co", "text2os.com", "spac2.com", "api1.spac2.com", "cdn1.spac2.com", "localhost", "127.0.0.1")
+            trusted_domains = ("cdn.spac2.com", "spac2.com", "spac2.com", "spac2.com", "api1.spac2.com", "cdn1.spac2.com", "localhost", "127.0.0.1")
             if not any(d in url for d in trusted_domains):
                 raise HTTPException(status_code=400, detail="Untrusted download domain")
 

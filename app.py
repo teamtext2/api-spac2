@@ -60,7 +60,7 @@ from botocore.config import Config
 os.makedirs(LOCAL_AVATARS_DIR, exist_ok=True)
 os.makedirs(LOCAL_UPLOADS_DIR, exist_ok=True)
 
-app = FastAPI(title="Text2Chat Realtime API", version="1.0.0")
+app = FastAPI(title="Spac2 Realtime API", version="1.0.0")
 
 # --- CORS ---
 app.add_middleware(

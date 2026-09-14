@@ -1,7 +1,7 @@
 from typing import Optional
 from fastapi import APIRouter, HTTPException, Depends, Request, Response, Header
 from database.postgres import execute_pg_query
-from auth.deps import get_auth_token, verify_google_token, create_text2_token, decode_text2_token
+from auth.deps import get_auth_token, verify_google_token, create_spac2_token, decode_spac2_token, create_text2_token, decode_text2_token
 from models.schemas import UserProfile
 from services.user_service import save_profile, get_profile, get_email_by_username
 from websocket.manager import active_connections
@@ -17,10 +17,10 @@ async def api_get_my_profile(
     x_user_email: Optional[str] = Header(None),
     x_user_name: Optional[str] = Header(None)
 ):
-    """Retrieve current authenticated user profile across Text2 Ecosystem."""
-    # 1. Text2 JWT Token lookup
+    """Retrieve current authenticated user profile across Spac2 Ecosystem."""
+    # 1. Spac2 JWT Token lookup
     if token:
-        payload = decode_text2_token(token)
+        payload = decode_spac2_token(token)
         if payload:
             lookup = payload.get("email") or payload.get("username") or str(payload.get("user_id") or "")
             if lookup:
@@ -57,9 +57,9 @@ async def api_save_profile(profile: UserProfile, request: Request, token: str = 
         base_url = str(request.base_url).rstrip("/")
         updated_profile, is_new = await save_profile(profile.dict(), base_url)
         
-        # Generate official Text2 Unified Ecosystem Token (JWT)
+        # Generate official Spac2 Unified Ecosystem Token (JWT)
         user_uid = updated_profile.get("user_id") or updated_profile.get("id") or 0
-        text2_token = create_text2_token(
+        spac2_token = create_spac2_token(
             user_id=user_uid,
             username=updated_profile.get("username", username),
             email=updated_profile.get("email", profile.email)
@@ -68,7 +68,7 @@ async def api_save_profile(profile: UserProfile, request: Request, token: str = 
         return {
             "status": "success",
             "message": f"Profile for @{username} synced.",
-            "token": text2_token,
+            "token": spac2_token,
             "profile": updated_profile,
             "is_new": is_new
         }

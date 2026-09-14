@@ -28,12 +28,12 @@ async def send_call_push(recipient_username: str, sender: str, avatar: str, is_v
         avatar_str = str(avatar).strip()
         if not (avatar_str.startswith("http://") or avatar_str.startswith("https://") or avatar_str.startswith("data:")):
             if avatar_str.startswith("/"):
-                avatar = "https://text2.co" + avatar_str
+                avatar = "https://spac2.com" + avatar_str
             else:
-                avatar = "https://text2.co/" + avatar_str
+                avatar = "https://spac2.com/" + avatar_str
 
     safe_icon = avatar if (avatar and any(avatar.lower().endswith(ext) for ext in [".png", ".jpg", ".jpeg", ".webp"])) \
-        else "https://text2.co/chat/apple-touch-icon.png"
+        else "/chat/apple-touch-icon.png"
 
     call_type_str = "Video Call" if is_video else "Audio Call"
     title = f"🔴 Incoming {call_type_str} 📞"

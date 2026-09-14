@@ -9,7 +9,7 @@ from typing import Optional, Dict, Any
 from datetime import datetime, timezone
 from fastapi import HTTPException, Header
 
-from config import TEXT2_JWT_SECRET, TEXT2_TOKEN_EXPIRE_DAYS
+from config import SPAC2_JWT_SECRET, SPAC2_TOKEN_EXPIRE_DAYS, TEXT2_JWT_SECRET, TEXT2_TOKEN_EXPIRE_DAYS
 
 
 def _b64_url_encode(data: bytes) -> str:
@@ -21,10 +21,10 @@ def _b64_url_decode(data: str) -> bytes:
     return base64.urlsafe_b64decode(data + padding)
 
 
-def create_text2_token(user_id: int, username: str, email: str, expires_days: Optional[int] = None) -> str:
-    """Generate a tamper-proof Text2 Unified Ecosystem JWT Token (HS256)."""
+def create_spac2_token(user_id: int, username: str, email: str, expires_days: Optional[int] = None) -> str:
+    """Generate a tamper-proof Spac2 Unified Ecosystem JWT Token (HS256)."""
     if expires_days is None:
-        expires_days = TEXT2_TOKEN_EXPIRE_DAYS
+        expires_days = SPAC2_TOKEN_EXPIRE_DAYS
 
     now = int(time.time())
     exp = now + (expires_days * 86400)
@@ -45,14 +45,14 @@ def create_text2_token(user_id: int, username: str, email: str, expires_days: Op
     payload_b64 = _b64_url_encode(json.dumps(payload, separators=(',', ':')).encode('utf-8'))
     signing_input = f"{header_b64}.{payload_b64}".encode('utf-8')
 
-    signature = hmac.new(TEXT2_JWT_SECRET.encode('utf-8'), signing_input, hashlib.sha256).digest()
+    signature = hmac.new(SPAC2_JWT_SECRET.encode('utf-8'), signing_input, hashlib.sha256).digest()
     sig_b64 = _b64_url_encode(signature)
 
     return f"{header_b64}.{payload_b64}.{sig_b64}"
 
 
-def decode_text2_token(token: str) -> Optional[Dict[str, Any]]:
-    """Decode and strictly verify Text2 Unified JWT Token signature and expiry."""
+def decode_spac2_token(token: str) -> Optional[Dict[str, Any]]:
+    """Decode and strictly verify Spac2 Unified JWT Token signature and expiry."""
     if not token or not isinstance(token, str):
         return None
 
@@ -74,7 +74,7 @@ def decode_text2_token(token: str) -> Optional[Dict[str, Any]]:
 
         # 2. Verify Signature
         signing_input = f"{header_b64}.{payload_b64}".encode('utf-8')
-        expected_sig = hmac.new(TEXT2_JWT_SECRET.encode('utf-8'), signing_input, hashlib.sha256).digest()
+        expected_sig = hmac.new(SPAC2_JWT_SECRET.encode('utf-8'), signing_input, hashlib.sha256).digest()
         actual_sig = _b64_url_decode(sig_b64)
 
         if not hmac.compare_digest(expected_sig, actual_sig):
@@ -91,9 +91,14 @@ def decode_text2_token(token: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+# Backward-compatible aliases
+create_text2_token = create_spac2_token
+decode_text2_token = decode_spac2_token
+
+
 async def verify_google_token(token: str = None, expected_email: str = None) -> bool:
     """Unified ecosystem token verifier.
-    1. Validates Text2 JWT token and ensures email matches if provided.
+    1. Validates Spac2 JWT token and ensures email matches if provided.
     2. Seamless fallback for legacy/active sessions, empty tokens, and dev mode.
     """
     if not token or str(token).strip() in ("", "undefined", "null", "None"):
@@ -102,8 +107,8 @@ async def verify_google_token(token: str = None, expected_email: str = None) -> 
 
     token = str(token).strip()
 
-    # If it's a Text2 Unified JWT Token, verify signature & claims
-    payload = decode_text2_token(token)
+    # If it's a Spac2 Unified JWT Token, verify signature & claims
+    payload = decode_spac2_token(token)
     if payload:
         token_email = (payload.get("email") or "").strip().lower()
         if expected_email and token_email:

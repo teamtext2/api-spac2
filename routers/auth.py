@@ -7,8 +7,7 @@ from typing import Optional, Dict, Any
 from pydantic import BaseModel
 from fastapi import APIRouter, HTTPException, Depends, Request, Response, Header
 
-from database.postgres import execute_pg_query
-from auth.deps import get_auth_token, create_text2_token, decode_text2_token
+from auth.deps import get_auth_token, create_spac2_token, decode_spac2_token, create_text2_token, decode_text2_token
 from auth.security import hash_password, verify_password, validate_email_format, validate_password_strength
 from services.user_service import get_profile
 
@@ -137,7 +136,7 @@ async def register(req: RegisterRequest, response: Response):
     }
 
     # Generate JWT Token
-    token = create_text2_token(user_id=user_id, username=user["username"], email=user["email"])
+    token = create_spac2_token(user_id=user_id, username=user["username"], email=user["email"])
     _set_auth_cookies(response, token, user_data)
 
     return {
@@ -196,7 +195,7 @@ async def login(req: LoginRequest, response: Response):
         "status": user.get("status") or "online"
     }
 
-    token = create_text2_token(user_id=user_id, username=user["username"], email=user["email"])
+    token = create_spac2_token(user_id=user_id, username=user["username"], email=user["email"])
     _set_auth_cookies(response, token, user_data)
 
     return {
@@ -226,7 +225,7 @@ async def get_current_user(
 ):
     """Retrieve current authenticated user session."""
     if token:
-        payload = decode_text2_token(token)
+        payload = decode_spac2_token(token)
         if payload:
             lookup = payload.get("email") or payload.get("username") or str(payload.get("user_id") or "")
             if lookup:

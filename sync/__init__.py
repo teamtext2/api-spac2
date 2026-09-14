@@ -1,4 +1,4 @@
-# Sync module for Text2 Ecosystem Apps
+# Sync module for Spac2 Ecosystem Apps
 from sync.note import router as note_router
 from sync.task import router as task_router
 from sync.calendar import router as calendar_router

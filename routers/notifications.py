@@ -168,6 +168,6 @@ async def test_push(username: str):
         title="🧪 Test Push",
         body="This is a test notification from the server.",
         sender="system",
-        avatar="https://text2.co/chat/apple-touch-icon.png"
+        avatar="https://spac2.com/chat/apple-touch-icon.png"
     ))
     return {"status": "triggered", "username": username}

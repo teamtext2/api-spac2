@@ -28,7 +28,7 @@ async def websocket_endpoint(websocket: WebSocket, username: str, token: str = Q
 
     email = await get_email_by_username(username)
     if not email:
-        email = f"{username}@text2.co"
+        email = f"{username}@spac2.com"
     print(f"[WS] Looked up email for @{username}: '{email}'")
 
     is_verified = await verify_google_token(token, email)
@@ -214,12 +214,12 @@ async def _route_group_message(websocket, username, email, sender, recipient, te
         return
 
     group_name = "Group"
-    group_avatar = "https://text2.co/favicon.ico"
+    group_avatar = "https://spac2.com/favicon.ico"
     try:
         group_info = await execute_pg_query("SELECT name, avatar FROM chat_groups WHERE id = $1", recipient)
         if group_info:
             group_name = group_info[0].get("name") or "Group"
-            group_avatar = group_info[0].get("avatar") or "https://text2.co/favicon.ico"
+            group_avatar = group_info[0].get("avatar") or "https://spac2.com/favicon.ico"
     except Exception:
         pass
 

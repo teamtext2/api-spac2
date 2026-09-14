@@ -27,7 +27,7 @@ async def api_add_friend(req: FriendRequest, token: str = Depends(get_auth_token
 
     uid = user_res[0]["id"]
     sender_name = user_res[0].get("name") or username
-    sender_avatar = user_res[0].get("avatar") or "https://text2.co/favicon.ico"
+    sender_avatar = user_res[0].get("avatar") or "https://spac2.com/favicon.ico"
     fid = friend_res[0]["id"]
 
     id1, id2 = min(uid, fid), max(uid, fid)
