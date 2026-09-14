@@ -47,16 +47,25 @@ def get_content_disposition(filename: str, disposition: str = "attachment") -> s
 
 @router.post("/upload/avatar")
 async def api_upload_avatar(
-    username: str = Query(...),
+    username: Optional[str] = Query(None),
     file: UploadFile = File(...),
     token: str = Depends(get_auth_token),
     request: Request = None
 ):
     """Upload, compress, and store user avatar to Cloudflare R2 under avatar/ with cdn2.spac2.com CDN domain."""
-    username = username.strip().lower()
-    email = await get_email_by_username(username)
-    if not email or not await verify_google_token(token, email):
-        raise HTTPException(status_code=401, detail="Unauthorized")
+    if not token or str(token).strip() in ("", "undefined", "null", "None"):
+        raise HTTPException(status_code=401, detail="Unauthorized: Authentication token required")
+
+    from auth.deps import decode_spac2_token
+    token_payload = decode_spac2_token(token)
+    
+    # Extract identity from token
+    token_username = token_payload.get("username") if token_payload else ""
+    token_email = token_payload.get("email") if token_payload else ""
+
+    # Effective username for the avatar filename
+    target_username = (username or token_username or "user").strip().lower()
+    target_username = re.sub(r"[^a-z0-9_]", "", target_username) or "user"
 
     try:
         content = await file.read()
@@ -65,7 +74,7 @@ async def api_upload_avatar(
 
         # Server-side compression and square crop to max 512x512 WebP/JPEG
         optimized_bytes, content_type, ext = compress_image_if_needed(content, max_dim=512, quality=85)
-        filename = f"{username}_{uuid.uuid4().hex[:12]}.{ext}"
+        filename = f"{target_username}_{uuid.uuid4().hex[:12]}.{ext}"
 
         if r2_client and R2_BUCKET_NAME:
             try:

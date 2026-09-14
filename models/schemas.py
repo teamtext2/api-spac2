@@ -4,12 +4,13 @@ from pydantic import BaseModel
 class UserProfile(BaseModel):
     id: int = 0
     user_id: int = 0
-    name: str
-    username: str
-    bio: str
-    email: str
-    status: str
-    avatar: str
+    name: str = ""
+    username: str = ""
+    bio: str = ""
+    email: str = ""
+    status: str = "online"
+    avatar: str = ""
+    avatar_url: Optional[str] = ""
     google_id: str = ""
     is_login: bool = False
 

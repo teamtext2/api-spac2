@@ -45,10 +45,43 @@ async def api_get_my_profile(
 
 
 @router.post("/profile")
-async def api_save_profile(profile: UserProfile, request: Request, token: str = Depends(get_auth_token)):
+async def api_save_profile(
+    profile: UserProfile, 
+    request: Request, 
+    token: Optional[str] = Depends(get_auth_token),
+    x_user_email: Optional[str] = Header(None)
+):
+    # 1. Resolve email from JWT token or header if missing
+    auth_email = ""
+    token_username = ""
+    if token:
+        payload = decode_spac2_token(token)
+        if payload:
+            auth_email = (payload.get("email") or "").strip().lower()
+            token_username = (payload.get("username") or "").strip().lower()
+
+    if not auth_email and x_user_email:
+        auth_email = x_user_email.strip().lower()
+
+    if not auth_email and profile.email:
+        auth_email = profile.email.strip().lower()
+
+    if not auth_email:
+        raise HTTPException(status_code=401, detail="Unauthorized: No active authentication session found")
+
+    if not profile.email:
+        profile.email = auth_email
+
+    # Map avatar_url to avatar if needed
+    if profile.avatar_url and not profile.avatar:
+        profile.avatar = profile.avatar_url
+    elif profile.avatar and not profile.avatar_url:
+        profile.avatar_url = profile.avatar
+
     username = profile.username.strip().lower()
     if not username:
-        raise HTTPException(status_code=400, detail="Username cannot be empty")
+        username = token_username or re.sub(r"[^a-z0-9_]", "", profile.email.split("@")[0].lower()) or "user"
+        profile.username = username
 
     if not await verify_google_token(token, profile.email):
         raise HTTPException(status_code=401, detail="Unauthorized: Invalid or expired authentication session")
