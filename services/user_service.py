@@ -131,21 +131,21 @@ async def _upsert_profile(existing_users, profile_data, email, base_url):
         old_avatar = existing_users[0]["avatar"]
         user_id = existing_users[0].get("user_id") or (10000 + existing_users[0]["id"])
 
-    # Username uniqueness check
+    # Username uniqueness check (Case-insensitive across all users)
     is_login = profile_data.get("is_login", False)
     if old_username and old_username != username:
-        username_check = await execute_pg_query("SELECT id FROM users WHERE username = $1", username)
+        username_check = await execute_pg_query("SELECT id FROM users WHERE LOWER(username) = LOWER($1) AND LOWER(email) != LOWER($2)", username, email)
         if username_check:
             raise HTTPException(status_code=400, detail="Username is already taken by another user")
     elif not old_username:
-        username_check = await execute_pg_query("SELECT id FROM users WHERE username = $1", username)
+        username_check = await execute_pg_query("SELECT id FROM users WHERE LOWER(username) = LOWER($1) AND LOWER(email) != LOWER($2)", username, email)
         if username_check:
             if is_login:
                 base_username = username
                 counter = 1
                 while True:
                     candidate = f"{base_username}{counter}"
-                    check = await execute_pg_query("SELECT id FROM users WHERE username = $1", candidate)
+                    check = await execute_pg_query("SELECT id FROM users WHERE LOWER(username) = LOWER($1)", candidate)
                     if not check:
                         username = candidate
                         break

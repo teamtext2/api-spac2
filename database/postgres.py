@@ -137,6 +137,8 @@ async def initialize_pg_schema():
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_users_user_id ON users(user_id);")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);")
+        await conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_lower_username ON users(LOWER(username));")
+        await conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_lower_email ON users(LOWER(email));")
 
         # ── Safe Data Migration: chat_users -> users & Free Storage ───────────
         # Check if legacy chat_users table exists, copy data to users, then drop chat_users
