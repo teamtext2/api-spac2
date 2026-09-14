@@ -6,7 +6,7 @@ from fastapi import HTTPException
 from database.postgres import execute_pg_query
 from storage.r2 import process_and_upload_avatar, delete_r2_object
 from websocket.manager import active_connections
-from config import LOCAL_AVATARS_DIR, R2_CDN_BASE
+from config import LOCAL_AVATARS_DIR, R2_CDN_BASE, R2_AVATAR_CDN_BASE
 import os
 
 
@@ -84,7 +84,7 @@ async def _merge_login_profile(existing_users, profile_data, email, base_url):
         db_status = g_status
         updated = True
     if not db_avatar and g_avatar:
-        if g_avatar.startswith("data:image/") or (g_avatar.startswith("http") and not g_avatar.startswith(f"{R2_CDN_BASE}/")):
+        if g_avatar.startswith("data:image/") or (g_avatar.startswith("http") and not (g_avatar.startswith(f"{R2_AVATAR_CDN_BASE}/") or g_avatar.startswith(f"{R2_CDN_BASE}/"))):
             db_avatar = process_and_upload_avatar(db_username, g_avatar, base_url)
         else:
             db_avatar = g_avatar
@@ -156,16 +156,20 @@ async def _upsert_profile(existing_users, profile_data, email, base_url):
     # Process avatar and upload to Cloudflare R2
     avatar_url = avatar
     if avatar != old_avatar:
-        if avatar.startswith("data:image/") or (avatar.startswith("http") and not avatar.startswith(f"{R2_CDN_BASE}/")):
+        if avatar.startswith("data:image/") or (avatar.startswith("http") and not (avatar.startswith(f"{R2_AVATAR_CDN_BASE}/") or avatar.startswith(f"{R2_CDN_BASE}/"))):
             avatar_url = process_and_upload_avatar(username, avatar, base_url)
 
         # Clean up old avatar from R2
-        if old_avatar and old_avatar.startswith(f"{R2_CDN_BASE}/"):
-            old_key = old_avatar.replace(f"{R2_CDN_BASE}/", "")
-            delete_r2_object(old_key)
+        if old_avatar:
+            if old_avatar.startswith(f"{R2_AVATAR_CDN_BASE}/"):
+                old_key = old_avatar.replace(f"{R2_AVATAR_CDN_BASE}/", "")
+                delete_r2_object(old_key)
+            elif old_avatar.startswith(f"{R2_CDN_BASE}/"):
+                old_key = old_avatar.replace(f"{R2_CDN_BASE}/", "")
+                delete_r2_object(old_key)
 
         # Clean up old local avatar
-        if old_avatar and "/data/avatars/" in old_avatar:
+        if old_avatar and ("/data/avatar/" in old_avatar or "/data/avatars/" in old_avatar):
             try:
                 local_filename = old_avatar.split("/")[-1]
                 local_path = os.path.join(LOCAL_AVATARS_DIR, local_filename)

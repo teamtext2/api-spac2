@@ -25,6 +25,7 @@ AWS_ACCESS_KEY_ID = os.environ.get("AWS_ACCESS_KEY_ID")
 AWS_SECRET_ACCESS_KEY = os.environ.get("AWS_SECRET_ACCESS_KEY")
 R2_BUCKET_NAME = os.environ.get("R2_BUCKET_NAME", "spac2")
 R2_CDN_BASE = os.environ.get("R2_CDN_BASE", "https://cdn1.spac2.com").rstrip("/")
+R2_AVATAR_CDN_BASE = os.environ.get("R2_AVATAR_CDN_BASE", "https://cdn2.spac2.com").rstrip("/")
 
 # --- VAPID (Push Notifications) ---
 VAPID_PUBLIC_KEY = os.getenv(
@@ -36,7 +37,7 @@ VAPID_CLAIMS = {"sub": os.getenv("VAPID_SUB", "mailto:admin@spac2.com")}
 
 # --- LOCAL FILE STORAGE FALLBACK ---
 LOCAL_DIR = "./data/profiles"
-LOCAL_AVATARS_DIR = "./data/avatars"
+LOCAL_AVATARS_DIR = "./data/avatar"
 LOCAL_UPLOADS_DIR = "./data/uploads"
 
 # --- SPAC2 UNIFIED AUTHENTICATION (JWT) ---

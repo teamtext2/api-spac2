@@ -18,6 +18,7 @@ from config import (
     AWS_SECRET_ACCESS_KEY,
     R2_BUCKET_NAME,
     R2_CDN_BASE,
+    R2_AVATAR_CDN_BASE,
     LOCAL_AVATARS_DIR,
 )
 
@@ -41,10 +42,10 @@ else:
     print("Cloudflare R2 credentials not fully configured in environment. Fallback to local files.")
 
 
-def compress_image_if_needed(avatar_bytes: bytes, max_dim: int = 400, quality: int = 85) -> tuple:
+def compress_image_if_needed(avatar_bytes: bytes, max_dim: int = 512, quality: int = 85) -> tuple:
     """
     Server-side image optimizer using Pillow:
-    Resizes avatar to a standard square (max 400x400), strips EXIF,
+    Resizes avatar to a standard square (max 512x512), strips EXIF,
     and encodes to WebP format for minimal bandwidth and fastest CDN loading.
     Returns (optimized_bytes, content_type, extension).
     """
@@ -55,9 +56,9 @@ def compress_image_if_needed(avatar_bytes: bytes, max_dim: int = 400, quality: i
     try:
         img = Image.open(io.BytesIO(avatar_bytes))
         
-        # Convert transparent/palette modes to RGB for universal compatibility
+        # Convert transparent/palette modes to RGBA/RGB
         if img.mode in ("RGBA", "LA", "P"):
-            background = Image.new("RGB", img.size, (255, 255, 255))
+            background = Image.new("RGBA", img.size, (255, 255, 255, 0))
             if img.mode == "P":
                 img = img.convert("RGBA")
             background.paste(img, mask=img.split()[-1] if len(img.split()) == 4 else None)
@@ -78,6 +79,10 @@ def compress_image_if_needed(avatar_bytes: bytes, max_dim: int = 400, quality: i
             ext = "webp"
         except Exception:
             # Fallback to JPEG if WebP encoder not available in Pillow build
+            if img.mode == "RGBA":
+                bg = Image.new("RGB", img.size, (255, 255, 255))
+                bg.paste(img, mask=img.split()[-1])
+                img = bg
             out_io = io.BytesIO()
             img.save(out_io, format="JPEG", quality=quality, optimize=True)
             optimized_bytes = out_io.getvalue()
@@ -97,16 +102,19 @@ def process_and_upload_avatar(username: str, avatar_src: str, base_url: str = ""
     """
     Process an avatar source (base64 data URL or remote URL), optimize/compress on server,
     upload to Cloudflare R2 (or fallback to local storage), and return the public CDN URL.
+    Folder on R2: avatar/
+    CDN Base: https://cdn2.spac2.com (via R2_AVATAR_CDN_BASE)
     """
     if not avatar_src:
         return ""
 
-    # Already on our CDN or local static — no re-upload needed
+    # Already on our avatar CDN or local static — no re-upload needed
     if (
-        f"{R2_CDN_BASE}/avatars/" in avatar_src
+        f"{R2_AVATAR_CDN_BASE}/avatar/" in avatar_src
+        or f"{R2_CDN_BASE}/avatar/" in avatar_src
+        or f"{R2_CDN_BASE}/avatars/" in avatar_src
+        or "/data/avatar/" in avatar_src
         or "/data/avatars/" in avatar_src
-        or f"{R2_CDN_BASE}/avater/" in avatar_src
-        or "/data/avater/" in avatar_src
     ):
         return avatar_src
 
@@ -137,21 +145,21 @@ def process_and_upload_avatar(username: str, avatar_src: str, base_url: str = ""
         return avatar_src
 
     # Server-side compression and optimization
-    avatar_bytes, content_type, ext = compress_image_if_needed(avatar_bytes, max_dim=400, quality=85)
+    avatar_bytes, content_type, ext = compress_image_if_needed(avatar_bytes, max_dim=512, quality=85)
 
     filename = f"{username}_{int(time.time())}.{ext}"
 
-    # Try Cloudflare R2
+    # Try Cloudflare R2 under avatar/ directory
     if r2_client and R2_BUCKET_NAME:
         try:
-            key = f"avatars/{filename}"
+            key = f"avatar/{filename}"
             r2_client.put_object(
                 Bucket=R2_BUCKET_NAME,
                 Key=key,
                 Body=avatar_bytes,
                 ContentType=content_type
             )
-            public_url = f"{R2_CDN_BASE}/{key}"
+            public_url = f"{R2_AVATAR_CDN_BASE}/{key}"
             print(f"[AVATAR SERVER] Successfully uploaded to Cloudflare R2: {public_url}")
             return public_url
         except Exception as e:
@@ -168,9 +176,9 @@ def process_and_upload_avatar(username: str, avatar_src: str, base_url: str = ""
             f.write(avatar_bytes)
 
         if base_url:
-            local_url = f"{base_url.rstrip('/')}/data/avatars/{filename}"
+            local_url = f"{base_url.rstrip('/')}/data/avatar/{filename}"
         else:
-            local_url = f"/data/avatars/{filename}"
+            local_url = f"/data/avatar/{filename}"
 
         print(f"[AVATAR SERVER] Avatar saved to local storage fallback: {local_url}")
         return local_url

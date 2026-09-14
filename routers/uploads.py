@@ -9,9 +9,17 @@ import httpx
 from database.postgres import execute_pg_query
 from auth.deps import get_auth_token, verify_google_token
 from websocket.manager import get_email_by_username
-from storage.r2 import r2_client, R2_BUCKET_NAME, upload_file_to_r2, upload_fileobj_to_r2
+from storage.r2 import (
+    r2_client,
+    R2_BUCKET_NAME,
+    upload_file_to_r2,
+    upload_fileobj_to_r2,
+    compress_image_if_needed,
+)
 from config import (
     R2_CDN_BASE,
+    R2_AVATAR_CDN_BASE,
+    LOCAL_AVATARS_DIR,
     CLOUDFLARE_ACCOUNT_ID,
     AWS_ACCESS_KEY_ID,
     AWS_SECRET_ACCESS_KEY,
@@ -35,6 +43,59 @@ def get_content_disposition(filename: str, disposition: str = "attachment") -> s
     # RFC 5987 / RFC 6266 encoding for full UTF-8 support (Vietnamese, special characters, etc.)
     utf8_encoded = urllib.parse.quote(safe_filename)
     return f'{disposition}; filename="{ascii_filename}"; filename*=UTF-8\'\'{utf8_encoded}'
+
+
+@router.post("/upload/avatar")
+async def api_upload_avatar(
+    username: str = Query(...),
+    file: UploadFile = File(...),
+    token: str = Depends(get_auth_token),
+    request: Request = None
+):
+    """Upload, compress, and store user avatar to Cloudflare R2 under avatar/ with cdn2.spac2.com CDN domain."""
+    username = username.strip().lower()
+    email = await get_email_by_username(username)
+    if not email or not await verify_google_token(token, email):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    try:
+        content = await file.read()
+        if len(content) > 15 * 1024 * 1024:
+            raise HTTPException(status_code=400, detail="Avatar image too large (max 15MB)")
+
+        # Server-side compression and square crop to max 512x512 WebP/JPEG
+        optimized_bytes, content_type, ext = compress_image_if_needed(content, max_dim=512, quality=85)
+        filename = f"{username}_{uuid.uuid4().hex[:12]}.{ext}"
+
+        if r2_client and R2_BUCKET_NAME:
+            try:
+                key = f"avatar/{filename}"
+                r2_client.put_object(
+                    Bucket=R2_BUCKET_NAME,
+                    Key=key,
+                    Body=optimized_bytes,
+                    ContentType=content_type
+                )
+                public_url = f"{R2_AVATAR_CDN_BASE}/{key}"
+                print(f"[AVATAR] Uploaded to R2: {public_url}")
+                return {"url": public_url, "filename": filename, "key": key}
+            except Exception as e:
+                print(f"R2 avatar upload failed, falling back to local: {e}")
+
+        # Local fallback
+        os.makedirs(LOCAL_AVATARS_DIR, exist_ok=True)
+        local_path = os.path.join(LOCAL_AVATARS_DIR, filename)
+        with open(local_path, "wb") as f:
+            f.write(optimized_bytes)
+
+        base_url = str(request.base_url).rstrip("/") if request else ""
+        public_url = f"{base_url}/data/avatar/{filename}"
+        return {"url": public_url, "filename": filename, "key": filename}
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        print(f"Error handling avatar upload: {e}")
+        raise HTTPException(status_code=500, detail=f"Avatar upload failed: {str(e)}")
 
 
 @router.post("/upload")
@@ -156,19 +217,21 @@ async def api_download_file(url: str, filename: str):
     content_disp = get_content_disposition(filename)
 
     try:
-        if "/data/uploads/" in url:
+        if "/data/uploads/" in url or "/data/avatar/" in url or "/data/avatars/" in url:
             local_filename = os.path.basename(url.split("?")[0])
-            local_path = os.path.join("./data/uploads", local_filename)
-            if os.path.exists(local_path):
-                return FileResponse(
-                    local_path,
-                    media_type="application/octet-stream",
-                    headers={"Content-Disposition": content_disp}
-                )
+            for d in ["./data/uploads", "./data/avatar", "./data/avatars"]:
+                local_path = os.path.join(d, local_filename)
+                if os.path.exists(local_path):
+                    return FileResponse(
+                        local_path,
+                        media_type="application/octet-stream",
+                        headers={"Content-Disposition": content_disp}
+                    )
             raise HTTPException(status_code=404, detail="File not found locally")
 
-        if url.startswith(f"{R2_CDN_BASE}/"):
-            key = url.replace(f"{R2_CDN_BASE}/", "").split("?")[0]
+        if url.startswith(f"{R2_CDN_BASE}/") or url.startswith(f"{R2_AVATAR_CDN_BASE}/"):
+            cdn_base = f"{R2_AVATAR_CDN_BASE}/" if url.startswith(f"{R2_AVATAR_CDN_BASE}/") else f"{R2_CDN_BASE}/"
+            key = url.replace(cdn_base, "").split("?")[0]
             if r2_client and R2_BUCKET_NAME:
                 try:
                     response = r2_client.get_object(Bucket=R2_BUCKET_NAME, Key=key)
@@ -181,7 +244,7 @@ async def api_download_file(url: str, filename: str):
                     print(f"R2 get_object failed: {r2_err}")
 
         if url.startswith("http://") or url.startswith("https://"):
-            trusted_domains = ("cdn.spac2.com", "spac2.com", "spac2.com", "spac2.com", "api1.spac2.com", "cdn1.spac2.com", "localhost", "127.0.0.1")
+            trusted_domains = ("cdn.spac2.com", "spac2.com", "api1.spac2.com", "cdn1.spac2.com", "cdn2.spac2.com", "localhost", "127.0.0.1")
             if not any(d in url for d in trusted_domains):
                 raise HTTPException(status_code=400, detail="Untrusted download domain")
 
