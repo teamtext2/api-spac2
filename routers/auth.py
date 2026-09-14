@@ -132,6 +132,7 @@ async def register(req: RegisterRequest, response: Response):
         "name": user["name"] or user["username"],
         "email": user["email"],
         "avatar": user.get("avatar") or "",
+        "avatar_url": user.get("avatar") or "",
         "bio": user.get("bio") or "",
         "status": user.get("status") or "online"
     }
@@ -192,6 +193,7 @@ async def login(req: LoginRequest, response: Response):
         "name": user["name"] or user["username"],
         "email": user["email"],
         "avatar": user.get("avatar") or "",
+        "avatar_url": user.get("avatar") or "",
         "bio": user.get("bio") or "",
         "status": user.get("status") or "online"
     }

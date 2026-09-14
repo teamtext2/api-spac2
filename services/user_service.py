@@ -216,6 +216,7 @@ async def _upsert_profile(existing_users, profile_data, email, base_url):
         "email": email,
         "status": status,
         "avatar": avatar_url,
+        "avatar_url": avatar_url,
         "google_id": google_id
     }
 
@@ -245,6 +246,7 @@ async def get_profile(identifier: str):
     if users:
         u = users[0]
         uid = u.get("user_id") or (10000 + u["id"])
+        avatar_val = u["avatar"] or ""
         return {
             "id": uid,
             "user_id": uid,
@@ -253,7 +255,8 @@ async def get_profile(identifier: str):
             "bio": u["bio"] or "",
             "email": u["email"] or "",
             "status": "online" if u["username"] and u["username"].strip().lower() in active_connections else "offline",
-            "avatar": u["avatar"] or "",
+            "avatar": avatar_val,
+            "avatar_url": avatar_val,
             "google_id": u["google_id"] or "",
             "last_seen": u["last_seen"] or ""
         }
