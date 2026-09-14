@@ -569,7 +569,7 @@ async def _handle_call_signal(websocket, username, data, data_str, msg_type):
             asyncio.create_task(send_call_push(
                 recipient_username=recipient,
                 sender=username,
-                avatar=data.get("senderAvatar", ""),
+                avatar=data.get("senderAvatar", "") or data.get("callerAvatar", ""),
                 is_video=is_video
             ))
             

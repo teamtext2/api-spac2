@@ -39,6 +39,7 @@ VAPID_CLAIMS = {"sub": os.getenv("VAPID_SUB", "mailto:admin@spac2.com")}
 LOCAL_DIR = "./data/profiles"
 LOCAL_AVATARS_DIR = "./data/avatar"
 LOCAL_UPLOADS_DIR = "./data/uploads"
+LOCAL_CHAT_DIR = "./data/chat"
 
 # --- SPAC2 UNIFIED AUTHENTICATION (JWT) ---
 SPAC2_JWT_SECRET = os.getenv("SPAC2_JWT_SECRET", os.getenv("TEXT2_JWT_SECRET", "spac2_ecosystem_super_secret_jwt_key_2026_x89a!"))

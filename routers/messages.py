@@ -25,29 +25,31 @@ async def delete_message_attachments(contents: list):
     """Parse attachment URLs from message content and delete them from R2/local."""
     import re
     url_pattern = re.compile(r'\[Attachment: [^\]]+\] \((https?://[^\s\)]+|/[^\s\)]+)\)')
-    LOCAL_UPLOADS_DIR = "./data/uploads"
+    from config import LOCAL_UPLOADS_DIR, LOCAL_CHAT_DIR
     for content in contents:
         if not content:
             continue
         for match in url_pattern.finditer(content):
             file_url = match.group(1)
-            if "uploads/" in file_url:
-                key = "uploads/" + file_url.split("uploads/")[-1]
-                if r2_client and R2_BUCKET_NAME:
-                    try:
-                        r2_client.delete_object(Bucket=R2_BUCKET_NAME, Key=key)
-                        print(f"Deleted R2 attachment: {key}")
-                    except Exception as e:
-                        print(f"Failed to delete R2 attachment {key}: {e}")
-            if "/data/uploads/" in file_url or "data/uploads" in file_url:
-                local_filename = file_url.split("/")[-1]
-                local_path = os.path.join(LOCAL_UPLOADS_DIR, local_filename)
-                if os.path.exists(local_path):
-                    try:
-                        os.remove(local_path)
-                        print(f"Deleted local fallback attachment: {local_path}")
-                    except Exception as e:
-                        print(f"Failed to delete local attachment {local_path}: {e}")
+            for folder in ["chat/", "uploads/", "avatar/"]:
+                if folder in file_url:
+                    key = folder + file_url.split(folder)[-1]
+                    if r2_client and R2_BUCKET_NAME:
+                        try:
+                            r2_client.delete_object(Bucket=R2_BUCKET_NAME, Key=key)
+                            print(f"Deleted R2 attachment: {key}")
+                        except Exception as e:
+                            print(f"Failed to delete R2 attachment {key}: {e}")
+                    
+                    target_dir = LOCAL_CHAT_DIR if folder == "chat/" else LOCAL_UPLOADS_DIR
+                    local_filename = file_url.split("/")[-1]
+                    local_path = os.path.join(target_dir, local_filename)
+                    if os.path.exists(local_path):
+                        try:
+                            os.remove(local_path)
+                            print(f"Deleted local fallback attachment: {local_path}")
+                        except Exception as e:
+                            print(f"Failed to delete local attachment {local_path}: {e}")
 
 
 @router.get("/messages/undelivered/{username}")

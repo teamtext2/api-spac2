@@ -110,15 +110,21 @@ async def api_upload_avatar(
 
 @router.post("/upload")
 async def api_upload_file(
-    username: str = Query(...),
+    username: Optional[str] = Query(None),
     file: UploadFile = File(...),
     token: str = Depends(get_auth_token),
+    folder: Optional[str] = Query(None),
     request: Request = None
 ):
-    username = username.strip().lower()
-    email = await get_email_by_username(username)
-    if not email or not await verify_google_token(token, email):
-        raise HTTPException(status_code=401, detail="Unauthorized")
+    if not token or str(token).strip() in ("", "undefined", "null", "None"):
+        raise HTTPException(status_code=401, detail="Unauthorized: Authentication token required")
+
+    from auth.deps import decode_spac2_token
+    token_payload = decode_spac2_token(token)
+    token_username = token_payload.get("username") if token_payload else ""
+
+    target_username = (username or token_username or "user").strip().lower()
+    target_username = re.sub(r"[^a-z0-9_]", "", target_username) or "user"
 
     try:
         # Determine file size without reading entire file into memory
@@ -136,23 +142,28 @@ async def api_upload_file(
             raise HTTPException(status_code=400, detail="File too large (max 4GB)")
 
         ext = os.path.splitext(file.filename)[1].lstrip(".") or "bin"
-        filename = f"{username}_{uuid.uuid4().hex}.{ext}"
+        filename = f"{target_username}_{uuid.uuid4().hex}.{ext}"
         content_type = file.content_type or "application/octet-stream"
+
+        # Determine target folder on Cloudflare R2 (chat/ for images and chat media, uploads/ for general files)
+        target_folder = "chat" if (folder == "chat" or content_type.startswith("image/")) else "uploads"
 
         if r2_client and R2_BUCKET_NAME:
             try:
-                key = f"uploads/{filename}"
+                key = f"{target_folder}/{filename}"
                 public_url = await run_in_threadpool(
                     upload_fileobj_to_r2, key, file.file, content_type
                 )
-                return {"url": public_url, "filename": file.filename}
+                print(f"[MEDIA] Uploaded to R2: {public_url}")
+                return {"url": public_url, "filename": file.filename, "key": key}
             except Exception as e:
                 print(f"R2 upload failed, falling back to local: {e}")
                 await file.seek(0)
 
-        LOCAL_UPLOADS_DIR = "./data/uploads"
-        os.makedirs(LOCAL_UPLOADS_DIR, exist_ok=True)
-        local_path = os.path.join(LOCAL_UPLOADS_DIR, filename)
+        from config import LOCAL_UPLOADS_DIR, LOCAL_CHAT_DIR
+        target_local_dir = LOCAL_CHAT_DIR if target_folder == "chat" else LOCAL_UPLOADS_DIR
+        os.makedirs(target_local_dir, exist_ok=True)
+        local_path = os.path.join(target_local_dir, filename)
         
         # Write chunks of 1MB to disk to avoid high RAM usage
         with open(local_path, "wb") as f:
@@ -160,13 +171,30 @@ async def api_upload_file(
                 f.write(chunk)
 
         base_url = str(request.base_url).rstrip("/") if request else ""
-        public_url = f"{base_url}/data/uploads/{filename}"
-        return {"url": public_url, "filename": file.filename}
+        public_url = f"{base_url}/data/{target_folder}/{filename}"
+        return {"url": public_url, "filename": file.filename, "key": f"{target_folder}/{filename}"}
     except HTTPException as he:
         raise he
     except Exception as e:
         print(f"Error handling upload: {e}")
         raise HTTPException(status_code=500, detail=f"File upload failed: {str(e)}")
+
+
+@router.post("/upload/chat")
+async def api_upload_chat(
+    file: UploadFile = File(...),
+    username: Optional[str] = Query(None),
+    token: str = Depends(get_auth_token),
+    request: Request = None
+):
+    """Direct upload endpoint for chat attachments and images to Cloudflare R2 chat/ folder."""
+    return await api_upload_file(
+        username=username,
+        file=file,
+        token=token,
+        folder="chat",
+        request=request
+    )
 
 
 @router.post("/upload/presigned")

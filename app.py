@@ -30,7 +30,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from config import LOCAL_AVATARS_DIR, LOCAL_UPLOADS_DIR
+from config import LOCAL_AVATARS_DIR, LOCAL_UPLOADS_DIR, LOCAL_CHAT_DIR
 from database.postgres import initialize_pg_pool, initialize_pg_schema
 from services.heartbeat import heartbeat_check_loop
 
@@ -59,6 +59,7 @@ from botocore.config import Config
 # Ensure local fallback directories exist
 os.makedirs(LOCAL_AVATARS_DIR, exist_ok=True)
 os.makedirs(LOCAL_UPLOADS_DIR, exist_ok=True)
+os.makedirs(LOCAL_CHAT_DIR, exist_ok=True)
 
 app = FastAPI(title="Spac2 Realtime API", version="1.0.0")
 
@@ -72,10 +73,11 @@ app.add_middleware(
     expose_headers=["*"],
 )
 
-# --- Static file mounts (local fallback for avatars/uploads) ---
+# --- Static file mounts (local fallback for avatars/uploads/chat) ---
 app.mount("/data/avatar", StaticFiles(directory=LOCAL_AVATARS_DIR), name="avatar")
 app.mount("/data/avatars", StaticFiles(directory=LOCAL_AVATARS_DIR), name="avatars")
 app.mount("/data/uploads", StaticFiles(directory=LOCAL_UPLOADS_DIR), name="uploads")
+app.mount("/data/chat", StaticFiles(directory=LOCAL_CHAT_DIR), name="chat")
 
 # --- Register routers ---
 app.include_router(auth.router)
