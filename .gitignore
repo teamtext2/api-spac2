@@ -1,0 +1,16 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Environment & secrets — KHÔNG BAO GIỜ commit file này!
+.env
+
+# Local mock database
+local_mock_chat.db
+
+# Local uploaded avatars
+data/
+
+# Docker
+*.log
