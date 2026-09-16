@@ -405,10 +405,13 @@ async def api_update_group_avatar(group_id: str, payload: dict, token: str = Dep
         except Exception as e:
             print(f"Failed to delete old local group avatar: {e}")
 
-    member_rows = await execute_pg_query("SELECT username FROM chat_group_members WHERE group_id = $1", group_id)
-    members = [r["username"] for r in member_rows]
+    member_rows = await execute_pg_query("SELECT username, email FROM chat_group_members WHERE group_id = $1", group_id)
+    members = [r["username"] for r in member_rows if r.get("username")]
+    member_emails = [r["email"] for r in member_rows if r.get("email")]
 
     broadcast_payload = json.dumps({"type": "group_avatar_updated", "group_id": group_id, "avatar": avatar_url, "members": members})
+    for m_email in member_emails:
+        await send_to_user_by_email(m_email, broadcast_payload)
     for m in members:
         if m in active_connections:
             for conn in list(active_connections[m]):
@@ -441,10 +444,13 @@ async def api_rename_group(group_id: str, payload: dict, token: str = Depends(ge
 
     await execute_pg_query("UPDATE chat_groups SET name = $1 WHERE id = $2", new_name, group_id)
 
-    member_rows = await execute_pg_query("SELECT username FROM chat_group_members WHERE group_id = $1", group_id)
+    member_rows = await execute_pg_query("SELECT username, email FROM chat_group_members WHERE group_id = $1", group_id)
     members = [r["username"] for r in member_rows if r.get("username")]
+    member_emails = [r["email"] for r in member_rows if r.get("email")]
 
     broadcast_payload = json.dumps({"type": "group_name_updated", "group_id": group_id, "name": new_name})
+    for m_email in member_emails:
+        await send_to_user_by_email(m_email, broadcast_payload)
     for m in members:
         if m in active_connections:
             for conn in list(active_connections[m]):
@@ -474,7 +480,7 @@ async def api_disband_group(group_id: str, payload: dict, token: str = Depends(g
     if group_rows[0]["created_by"].lower() != requester:
         raise HTTPException(status_code=403, detail="Only the group creator can disband the group")
 
-    member_rows = await execute_pg_query("SELECT username FROM chat_group_members WHERE group_id = $1", group_id)
+    member_rows = await execute_pg_query("SELECT username, email FROM chat_group_members WHERE group_id = $1", group_id)
     members = [r["username"] for r in member_rows if r.get("username")]
 
     await perform_group_disband_cleanup(group_id, members)

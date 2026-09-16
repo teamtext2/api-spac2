@@ -264,7 +264,7 @@ async def api_get_conversations(username: str, token: str = Depends(get_auth_tok
                 conversations.append({
                     "id": peer,
                     "username": peer,
-                    "email": f"{peer}@group.spac2chat",
+                    "email": f"{peer}@group.text2chat",
                     "name": ginfo.get("name") or f"Group {peer[6:12]}",
                     "avatar": ginfo.get("avatar") or "https://spac2.com/favicon.ico",
                     "status": "online",
