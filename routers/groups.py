@@ -53,7 +53,7 @@ async def perform_group_disband_cleanup(group_id: str, members_to_notify: list):
 async def _delete_message_attachments(contents: list):
     """Parse attachment URLs from message content and delete them from R2/local."""
     import re
-    url_pattern = re.compile(r'\[Attachment: [^\]]+\] \((https?://[^\s\)]+|/[^\s\)]+)\)')
+    url_pattern = re.compile(r'(?:📎\s*)?\[Attachment:\s*[^\]]+\]\s*\((https?://[^\s\)]+|/[^\s\)]+)\)', re.IGNORECASE)
     LOCAL_UPLOADS = "./data/uploads"
     for content in contents:
         if not content:

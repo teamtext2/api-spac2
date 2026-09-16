@@ -24,7 +24,7 @@ def _is_valid_uuid(val: str) -> bool:
 async def delete_message_attachments(contents: list):
     """Parse attachment URLs from message content and delete them from R2/local."""
     import re
-    url_pattern = re.compile(r'\[Attachment: [^\]]+\] \((https?://[^\s\)]+|/[^\s\)]+)\)')
+    url_pattern = re.compile(r'(?:📎\s*)?\[Attachment:\s*[^\]]+\]\s*\((https?://[^\s\)]+|/[^\s\)]+)\)', re.IGNORECASE)
     from config import LOCAL_UPLOADS_DIR, LOCAL_CHAT_DIR
     for content in contents:
         if not content:
