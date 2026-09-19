@@ -13,6 +13,7 @@ from database.postgres import execute_pg_query
 from storage.r2 import delete_user_r2_and_local_files, r2_client
 from websocket.manager import active_connections
 from auth.deps import get_auth_token, _b64_url_encode, _b64_url_decode
+from auth.security import hash_password, validate_password_strength
 from config import SPAC2_JWT_SECRET
 
 # --- HERO ADMIN CONFIGURATION ---
@@ -37,6 +38,11 @@ class AdminUserUpdateRequest(BaseModel):
     bio: Optional[str] = None
     status: Optional[str] = None
     avatar: Optional[str] = None
+
+
+class AdminResetPasswordRequest(BaseModel):
+    new_password: str
+
 
 
 # --- Token Utilities for Hero Admin ---
@@ -405,6 +411,57 @@ async def api_admin_update_user(
             "status": new_status,
             "avatar": new_avatar
         }
+    }
+
+
+@router.post("/users/{identifier}/reset-password")
+async def api_admin_reset_password(
+    identifier: str,
+    req: AdminResetPasswordRequest,
+    admin: dict = Depends(require_hero_admin)
+):
+    """Admin resets / assigns a new password for a specific user."""
+    ident = identifier.strip()
+    if ident.isdigit():
+        rows = await execute_pg_query(
+            "SELECT id, user_id, username, email FROM users WHERE user_id = $1 OR id = $1", int(ident)
+        )
+    elif "@" in ident:
+        rows = await execute_pg_query(
+            "SELECT id, user_id, username, email FROM users WHERE LOWER(email) = LOWER($1)", ident
+        )
+    else:
+        rows = await execute_pg_query(
+            "SELECT id, user_id, username, email FROM users WHERE LOWER(username) = LOWER($1)", ident
+        )
+
+    if not rows:
+        raise HTTPException(status_code=404, detail="Không tìm thấy người dùng này trong hệ thống")
+
+    user = rows[0]
+    db_id = user["id"]
+    user_id = user.get("user_id") or (10000 + db_id)
+    username = (user.get("username") or "").strip()
+
+    new_password = (req.new_password or "").strip()
+    is_valid, err_msg = validate_password_strength(new_password)
+    if not is_valid:
+        raise HTTPException(status_code=400, detail=err_msg or "Mật khẩu phải từ 6 ký tự trở lên")
+
+    pwd_hash = hash_password(new_password)
+
+    await execute_pg_query(
+        "UPDATE users SET password_hash = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
+        pwd_hash, db_id
+    )
+
+    print(f"[ADMIN RESET PASSWORD] Admin @{admin.get('sub')} reset password for user @{username} (ID: {user_id})")
+
+    return {
+        "status": "success",
+        "message": f"Cấp lại mật khẩu mới cho @{username} thành công!",
+        "user_id": user_id,
+        "username": username
     }
 
 
