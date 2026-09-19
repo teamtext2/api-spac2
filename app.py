@@ -35,7 +35,7 @@ from database.postgres import initialize_pg_pool, initialize_pg_schema
 from services.heartbeat import heartbeat_check_loop
 
 # --- Routers ---
-from routers import auth, profile, friends, groups, messages, notifications, uploads, calls
+from routers import auth, profile, friends, groups, messages, notifications, uploads, calls, admin
 from sync import note_router, task_router, calendar_router, countday_router, mindmap_router, table_router, doc_router
 
 
@@ -73,11 +73,15 @@ app.add_middleware(
     expose_headers=["*"],
 )
 
-# --- Static file mounts (local fallback for avatars/uploads/chat) ---
+# --- Static file mounts (local fallback for avatars/uploads/chat and hero console) ---
 app.mount("/data/avatar", StaticFiles(directory=LOCAL_AVATARS_DIR), name="avatar")
 app.mount("/data/avatars", StaticFiles(directory=LOCAL_AVATARS_DIR), name="avatars")
 app.mount("/data/uploads", StaticFiles(directory=LOCAL_UPLOADS_DIR), name="uploads")
 app.mount("/data/chat", StaticFiles(directory=LOCAL_CHAT_DIR), name="chat")
+
+hero_dir = os.path.join(os.path.dirname(api_dir), "hero")
+if os.path.exists(hero_dir):
+    app.mount("/hero", StaticFiles(directory=hero_dir, html=True), name="hero")
 
 # --- Register routers ---
 app.include_router(auth.router)
@@ -95,6 +99,7 @@ app.include_router(countday_router)
 app.include_router(mindmap_router)
 app.include_router(table_router)
 app.include_router(doc_router)
+app.include_router(admin.router)
 
 
 

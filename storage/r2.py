@@ -20,6 +20,8 @@ from config import (
     R2_CDN_BASE,
     R2_AVATAR_CDN_BASE,
     LOCAL_AVATARS_DIR,
+    LOCAL_CHAT_DIR,
+    LOCAL_UPLOADS_DIR,
 )
 
 # --- Initialize R2 client at module load ---
@@ -196,6 +198,74 @@ def delete_r2_object(key: str):
             print(f"Deleted R2 object: {key}")
         except Exception as e:
             print(f"Failed to delete R2 object {key}: {e}")
+
+
+def delete_user_r2_and_local_files(username: str, avatar_url: str = "") -> dict:
+    """
+    Completely purge all files belonging to a user from Cloudflare R2 and local disk storage:
+    - avatar/{username}_*
+    - chat/{username}_*
+    - uploads/{username}_*
+    - avatar_url (if hosted on R2)
+    - Local fallback files
+    """
+    deleted_r2 = 0
+    deleted_local = 0
+    clean_username = (username or "").strip().lower()
+
+    if not clean_username:
+        return {"deleted_r2": 0, "deleted_local": 0}
+
+    # 1. Cloudflare R2 Cleanup
+    if r2_client and R2_BUCKET_NAME:
+        prefixes = [f"avatar/{clean_username}_", f"chat/{clean_username}_", f"uploads/{clean_username}_"]
+        for prefix in prefixes:
+            try:
+                paginator = r2_client.get_paginator("list_objects_v2")
+                for page in paginator.paginate(Bucket=R2_BUCKET_NAME, Prefix=prefix):
+                    contents = page.get("Contents", [])
+                    if contents:
+                        delete_keys = [{"Key": obj["Key"]} for obj in contents if "Key" in obj]
+                        if delete_keys:
+                            r2_client.delete_objects(
+                                Bucket=R2_BUCKET_NAME,
+                                Delete={"Objects": delete_keys}
+                            )
+                            deleted_r2 += len(delete_keys)
+                            print(f"[R2 CLEANUP] Purged {len(delete_keys)} objects with prefix '{prefix}' for user @{clean_username}")
+            except Exception as e:
+                print(f"[R2 CLEANUP] Error listing/deleting prefix '{prefix}': {e}")
+
+        # Check explicit avatar URL if not caught by prefix
+        if avatar_url:
+            for base in [f"{R2_AVATAR_CDN_BASE}/", f"{R2_CDN_BASE}/"]:
+                if avatar_url.startswith(base):
+                    key = avatar_url.replace(base, "").split("?")[0]
+                    try:
+                        r2_client.delete_object(Bucket=R2_BUCKET_NAME, Key=key)
+                        deleted_r2 += 1
+                        print(f"[R2 CLEANUP] Explicit avatar deleted: {key}")
+                    except Exception as e:
+                        print(f"[R2 CLEANUP] Failed to delete avatar key {key}: {e}")
+
+    # 2. Local Fallback Directories Cleanup
+    for dir_path in [LOCAL_AVATARS_DIR, LOCAL_CHAT_DIR, LOCAL_UPLOADS_DIR]:
+        if os.path.exists(dir_path):
+            try:
+                for fname in os.listdir(dir_path):
+                    if fname.lower().startswith(f"{clean_username}_"):
+                        fpath = os.path.join(dir_path, fname)
+                        if os.path.isfile(fpath):
+                            try:
+                                os.remove(fpath)
+                                deleted_local += 1
+                                print(f"[LOCAL CLEANUP] Removed {fpath}")
+                            except Exception as fe:
+                                print(f"[LOCAL CLEANUP] Failed to remove {fpath}: {fe}")
+            except Exception as e:
+                print(f"[LOCAL CLEANUP] Error scanning {dir_path}: {e}")
+
+    return {"deleted_r2": deleted_r2, "deleted_local": deleted_local}
 
 
 def upload_file_to_r2(key: str, file_bytes: bytes, content_type: str) -> str:
