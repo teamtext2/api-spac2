@@ -289,3 +289,198 @@ def upload_fileobj_to_r2(key: str, fileobj, content_type: str) -> str:
     )
     return f"{R2_CDN_BASE}/{key}"
 
+
+def format_bytes(size_bytes: int) -> str:
+    """Format bytes into a human-readable string (B, KB, MB, GB, TB)."""
+    if not size_bytes or size_bytes <= 0:
+        return "0 B"
+    units = ["B", "KB", "MB", "GB", "TB"]
+    unit_index = 0
+    size = float(size_bytes)
+    while size >= 1024.0 and unit_index < len(units) - 1:
+        size /= 1024.0
+        unit_index += 1
+    if unit_index == 0:
+        return f"{int(size)} {units[unit_index]}"
+    return f"{size:.2f} {units[unit_index]}"
+
+
+def get_user_files_storage(username: str, avatar_url: str = "") -> dict:
+    """
+    Calculate total storage in bytes and file count for a user across Cloudflare R2 and local disk fallback:
+    - avatar/{username}_*
+    - chat/{username}_*
+    - uploads/{username}_*
+    - explicit avatar if on R2
+    """
+    clean_username = (username or "").strip().lower()
+    total_r2_bytes = 0
+    total_r2_files = 0
+    breakdown_r2 = {"avatar": 0, "chat": 0, "uploads": 0}
+
+    total_local_bytes = 0
+    total_local_files = 0
+    breakdown_local = {"avatar": 0, "chat": 0, "uploads": 0}
+
+    if not clean_username:
+        return {
+            "total_bytes": 0,
+            "total_formatted": "0 B",
+            "total_files": 0,
+            "r2_bytes": 0,
+            "r2_formatted": "0 B",
+            "r2_files": 0,
+            "local_bytes": 0,
+            "local_formatted": "0 B",
+            "local_files": 0,
+            "breakdown": {
+                "avatar_bytes": 0,
+                "avatar_formatted": "0 B",
+                "chat_bytes": 0,
+                "chat_formatted": "0 B",
+                "uploads_bytes": 0,
+                "uploads_formatted": "0 B"
+            }
+        }
+
+    # 1. Cloudflare R2 Scan
+    if r2_client and R2_BUCKET_NAME:
+        folders = ["avatar", "chat", "uploads"]
+        for folder in folders:
+            prefix = f"{folder}/{clean_username}_"
+            try:
+                paginator = r2_client.get_paginator("list_objects_v2")
+                for page in paginator.paginate(Bucket=R2_BUCKET_NAME, Prefix=prefix):
+                    contents = page.get("Contents", [])
+                    for obj in contents:
+                        sz = obj.get("Size", 0)
+                        total_r2_bytes += sz
+                        total_r2_files += 1
+                        breakdown_r2[folder] += sz
+            except Exception as e:
+                print(f"[STORAGE SCAN] Error listing R2 prefix {prefix}: {e}")
+
+        # Check explicit avatar URL if not in prefix
+        if avatar_url:
+            for base in [f"{R2_AVATAR_CDN_BASE}/", f"{R2_CDN_BASE}/"]:
+                if avatar_url.startswith(base):
+                    key = avatar_url.replace(base, "").split("?")[0]
+                    if not key.startswith(f"avatar/{clean_username}_"):
+                        try:
+                            head = r2_client.head_object(Bucket=R2_BUCKET_NAME, Key=key)
+                            sz = head.get("ContentLength", 0)
+                            total_r2_bytes += sz
+                            total_r2_files += 1
+                            breakdown_r2["avatar"] += sz
+                        except Exception:
+                            pass
+
+    # 2. Local Fallback Directories Scan
+    dirs = [
+        ("avatar", LOCAL_AVATARS_DIR),
+        ("chat", LOCAL_CHAT_DIR),
+        ("uploads", LOCAL_UPLOADS_DIR)
+    ]
+    for folder, dir_path in dirs:
+        if os.path.exists(dir_path):
+            try:
+                for fname in os.listdir(dir_path):
+                    if fname.lower().startswith(f"{clean_username}_"):
+                        fpath = os.path.join(dir_path, fname)
+                        if os.path.isfile(fpath):
+                            try:
+                                sz = os.path.getsize(fpath)
+                                total_local_bytes += sz
+                                total_local_files += 1
+                                breakdown_local[folder] += sz
+                            except Exception:
+                                pass
+            except Exception as e:
+                print(f"[STORAGE SCAN] Error scanning local dir {dir_path}: {e}")
+
+    total_bytes = total_r2_bytes + total_local_bytes
+    total_files = total_r2_files + total_local_files
+
+    return {
+        "total_bytes": total_bytes,
+        "total_formatted": format_bytes(total_bytes),
+        "total_files": total_files,
+        "r2_bytes": total_r2_bytes,
+        "r2_formatted": format_bytes(total_r2_bytes),
+        "r2_files": total_r2_files,
+        "local_bytes": total_local_bytes,
+        "local_formatted": format_bytes(total_local_bytes),
+        "local_files": total_local_files,
+        "breakdown": {
+            "avatar_bytes": breakdown_r2["avatar"] + breakdown_local["avatar"],
+            "avatar_formatted": format_bytes(breakdown_r2["avatar"] + breakdown_local["avatar"]),
+            "chat_bytes": breakdown_r2["chat"] + breakdown_local["chat"],
+            "chat_formatted": format_bytes(breakdown_r2["chat"] + breakdown_local["chat"]),
+            "uploads_bytes": breakdown_r2["uploads"] + breakdown_local["uploads"],
+            "uploads_formatted": format_bytes(breakdown_r2["uploads"] + breakdown_local["uploads"]),
+        }
+    }
+
+
+def get_all_r2_storage_summary() -> dict:
+    """Scan all objects in R2 bucket and return overall size and file count."""
+    total_bytes = 0
+    total_files = 0
+    folder_breakdown = {"avatar": 0, "chat": 0, "uploads": 0, "other": 0}
+
+    if r2_client and R2_BUCKET_NAME:
+        try:
+            paginator = r2_client.get_paginator("list_objects_v2")
+            for page in paginator.paginate(Bucket=R2_BUCKET_NAME):
+                contents = page.get("Contents", [])
+                for obj in contents:
+                    sz = obj.get("Size", 0)
+                    key = obj.get("Key", "")
+                    total_bytes += sz
+                    total_files += 1
+                    if key.startswith("avatar/"):
+                        folder_breakdown["avatar"] += sz
+                    elif key.startswith("chat/"):
+                        folder_breakdown["chat"] += sz
+                    elif key.startswith("uploads/"):
+                        folder_breakdown["uploads"] += sz
+                    else:
+                        folder_breakdown["other"] += sz
+        except Exception as e:
+            print(f"[R2 SUMMARY SCAN] Error: {e}")
+
+    # Also scan local directories
+    local_bytes = 0
+    local_files = 0
+    for dir_path in [LOCAL_AVATARS_DIR, LOCAL_CHAT_DIR, LOCAL_UPLOADS_DIR]:
+        if os.path.exists(dir_path):
+            try:
+                for fname in os.listdir(dir_path):
+                    fpath = os.path.join(dir_path, fname)
+                    if os.path.isfile(fpath):
+                        try:
+                            sz = os.path.getsize(fpath)
+                            local_bytes += sz
+                            local_files += 1
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+    all_bytes = total_bytes + local_bytes
+    all_files = total_files + local_files
+
+    return {
+        "total_bytes": all_bytes,
+        "total_formatted": format_bytes(all_bytes),
+        "total_files": all_files,
+        "r2_bytes": total_bytes,
+        "r2_formatted": format_bytes(total_bytes),
+        "r2_files": total_files,
+        "local_bytes": local_bytes,
+        "local_formatted": format_bytes(local_bytes),
+        "local_files": local_files,
+        "folders": {k: format_bytes(v) for k, v in folder_breakdown.items()}
+    }
+
+

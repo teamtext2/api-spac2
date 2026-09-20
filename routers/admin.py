@@ -10,7 +10,13 @@ from pydantic import BaseModel
 from fastapi import APIRouter, HTTPException, Depends, Header, Query, Request
 
 from database.postgres import execute_pg_query
-from storage.r2 import delete_user_r2_and_local_files, r2_client
+from storage.r2 import (
+    delete_user_r2_and_local_files,
+    r2_client,
+    get_user_files_storage,
+    get_all_r2_storage_summary,
+    format_bytes,
+)
 from websocket.manager import active_connections
 from auth.deps import get_auth_token, _b64_url_encode, _b64_url_decode
 from auth.security import hash_password, validate_password_strength
@@ -102,6 +108,149 @@ async def require_hero_admin(token: str = Depends(get_auth_token)):
     return payload
 
 
+# --- Storage Calculation Helpers ---
+async def get_user_db_storage_bytes(user_id: int, username: str) -> dict:
+    """Calculate database storage size for a user across cloud sync tables and messages."""
+    clean_uname = (username or "").strip().lower()
+
+    apps = {
+        "notes": {"bytes": 0, "count": 0},
+        "tasks": {"bytes": 0, "count": 0},
+        "docs": {"bytes": 0, "count": 0},
+        "mindmap": {"bytes": 0, "count": 0},
+        "table": {"bytes": 0, "count": 0},
+        "calendar": {"bytes": 0, "count": 0},
+        "countday": {"bytes": 0, "count": 0},
+        "messages": {"bytes": 0, "count": 0}
+    }
+
+    try:
+        res = await execute_pg_query(
+            "SELECT COUNT(*) AS count, COALESCE(SUM(LENGTH(COALESCE(title, '')) + LENGTH(COALESCE(content, '')) + 40), 0) AS bytes FROM user_sync_notes WHERE user_id = $1",
+            user_id
+        )
+        if res:
+            apps["notes"]["count"] = int(res[0].get("count") or 0)
+            apps["notes"]["bytes"] = int(res[0].get("bytes") or 0)
+    except Exception:
+        pass
+
+    try:
+        res1 = await execute_pg_query(
+            "SELECT COUNT(*) AS count, COALESCE(SUM(LENGTH(COALESCE(title, '')) + LENGTH(COALESCE(note, '')) + 40), 0) AS bytes FROM user_sync_tasks WHERE user_id = $1",
+            user_id
+        )
+        res2 = await execute_pg_query(
+            "SELECT COUNT(*) AS count, COALESCE(SUM(LENGTH(COALESCE(name, '')) + 30), 0) AS bytes FROM user_sync_task_projects WHERE user_id = $1",
+            user_id
+        )
+        t_cnt = (int(res1[0]["count"]) if res1 else 0) + (int(res2[0]["count"]) if res2 else 0)
+        t_bytes = (int(res1[0]["bytes"]) if res1 else 0) + (int(res2[0]["bytes"]) if res2 else 0)
+        apps["tasks"]["count"] = t_cnt
+        apps["tasks"]["bytes"] = t_bytes
+    except Exception:
+        pass
+
+    try:
+        res = await execute_pg_query(
+            "SELECT COUNT(*) AS count, COALESCE(SUM(LENGTH(COALESCE(title, '')) + LENGTH(COALESCE(body, '')) + LENGTH(COALESCE(preview_text, '')) + 100), 0) AS bytes FROM user_sync_docs WHERE user_id = $1",
+            user_id
+        )
+        if res:
+            apps["docs"]["count"] = int(res[0].get("count") or 0)
+            apps["docs"]["bytes"] = int(res[0].get("bytes") or 0)
+    except Exception:
+        pass
+
+    try:
+        res = await execute_pg_query(
+            "SELECT COUNT(*) AS count, COALESCE(SUM(LENGTH(COALESCE(name, '')) + 50), 0) AS bytes FROM user_sync_mindmap_projects WHERE user_id = $1",
+            user_id
+        )
+        if res:
+            apps["mindmap"]["count"] = int(res[0].get("count") or 0)
+            apps["mindmap"]["bytes"] = int(res[0].get("bytes") or 0)
+    except Exception:
+        pass
+
+    try:
+        res = await execute_pg_query(
+            "SELECT COUNT(*) AS count, COALESCE(SUM(LENGTH(COALESCE(name, '')) + 50), 0) AS bytes FROM user_sync_table_projects WHERE user_id = $1",
+            user_id
+        )
+        if res:
+            apps["table"]["count"] = int(res[0].get("count") or 0)
+            apps["table"]["bytes"] = int(res[0].get("bytes") or 0)
+    except Exception:
+        pass
+
+    try:
+        res = await execute_pg_query(
+            "SELECT COUNT(*) AS count, COALESCE(SUM(LENGTH(COALESCE(title, '')) + LENGTH(COALESCE(description, '')) + 40), 0) AS bytes FROM user_sync_calendar_events WHERE user_id = $1",
+            user_id
+        )
+        if res:
+            apps["calendar"]["count"] = int(res[0].get("count") or 0)
+            apps["calendar"]["bytes"] = int(res[0].get("bytes") or 0)
+    except Exception:
+        pass
+
+    try:
+        res = await execute_pg_query(
+            "SELECT COUNT(*) AS count, COALESCE(SUM(LENGTH(COALESCE(title, '')) + 30), 0) AS bytes FROM user_sync_countday_events WHERE user_id = $1",
+            user_id
+        )
+        if res:
+            apps["countday"]["count"] = int(res[0].get("count") or 0)
+            apps["countday"]["bytes"] = int(res[0].get("bytes") or 0)
+    except Exception:
+        pass
+
+    try:
+        if clean_uname:
+            res = await execute_pg_query(
+                "SELECT COUNT(*) AS count, COALESCE(SUM(LENGTH(COALESCE(content, '')) + 50), 0) AS bytes FROM messages WHERE LOWER(sender_id) = LOWER($1)",
+                clean_uname
+            )
+            if res:
+                apps["messages"]["count"] = int(res[0].get("count") or 0)
+                apps["messages"]["bytes"] = int(res[0].get("bytes") or 0)
+    except Exception:
+        pass
+
+    total_db_bytes = sum(item["bytes"] for item in apps.values())
+    total_db_items = sum(item["count"] for item in apps.values())
+
+    return {
+        "total_bytes": total_db_bytes,
+        "total_formatted": format_bytes(total_db_bytes),
+        "total_items": total_db_items,
+        "apps": {
+            k: {
+                "count": v["count"],
+                "bytes": v["bytes"],
+                "formatted": format_bytes(v["bytes"])
+            }
+            for k, v in apps.items()
+        }
+    }
+
+
+async def get_user_total_cloud_storage(user_id: int, username: str, avatar_url: str = "") -> dict:
+    """Calculate combined Cloud Storage (R2/Local Files + Cloud Sync DB) for a user."""
+    files_storage = get_user_files_storage(username, avatar_url)
+    db_storage = await get_user_db_storage_bytes(user_id, username)
+
+    total_bytes = files_storage["total_bytes"] + db_storage["total_bytes"]
+
+    return {
+        "total_bytes": total_bytes,
+        "total_formatted": format_bytes(total_bytes),
+        "files": files_storage,
+        "database": db_storage
+    }
+
+
 # --- Endpoints ---
 
 @router.post("/login")
@@ -141,7 +290,7 @@ async def api_admin_verify(admin: dict = Depends(require_hero_admin)):
 
 @router.get("/stats")
 async def api_admin_stats(admin: dict = Depends(require_hero_admin)):
-    """Get system overview metrics."""
+    """Get system overview metrics and total cloud storage usage."""
     try:
         user_cnt = await execute_pg_query("SELECT COUNT(*) AS count FROM users")
         total_users = int(user_cnt[0]["count"]) if user_cnt else 0
@@ -149,11 +298,34 @@ async def api_admin_stats(admin: dict = Depends(require_hero_admin)):
         msg_cnt = await execute_pg_query("SELECT COUNT(*) AS count FROM messages")
         total_messages = int(msg_cnt[0]["count"]) if msg_cnt else 0
 
+        # Global R2 & Files Storage
+        r2_summary = get_all_r2_storage_summary()
+        total_files_bytes = r2_summary.get("total_bytes", 0)
+
+        # Global Sync Tables DB Storage (approximate)
+        db_total_bytes = 0
+        for table in ["user_sync_notes", "user_sync_tasks", "user_sync_docs", "user_sync_mindmap_projects", "user_sync_table_projects", "messages"]:
+            try:
+                res = await execute_pg_query(f"SELECT COUNT(*) AS cnt FROM {table}")
+                if res:
+                    db_total_bytes += int(res[0]["cnt"]) * 300
+            except Exception:
+                pass
+
+        total_cloud_storage = total_files_bytes + db_total_bytes
+
         return {
             "total_users": total_users,
             "online_users": len(active_connections),
             "total_messages": total_messages,
-            "r2_connected": r2_client is not None
+            "r2_connected": r2_client is not None,
+            "total_storage_bytes": total_cloud_storage,
+            "total_storage_formatted": format_bytes(total_cloud_storage),
+            "r2_storage_bytes": total_files_bytes,
+            "r2_storage_formatted": format_bytes(total_files_bytes),
+            "r2_total_files": r2_summary.get("total_files", 0),
+            "db_storage_bytes": db_total_bytes,
+            "db_storage_formatted": format_bytes(db_total_bytes)
         }
     except Exception as e:
         return {
@@ -161,6 +333,8 @@ async def api_admin_stats(admin: dict = Depends(require_hero_admin)):
             "online_users": len(active_connections),
             "total_messages": 0,
             "r2_connected": r2_client is not None,
+            "total_storage_bytes": 0,
+            "total_storage_formatted": "0 B",
             "error": str(e)
         }
 
@@ -170,31 +344,30 @@ async def api_admin_get_users(
     page: int = Query(1, ge=1),
     limit: int = Query(10, ge=1, le=100),
     search: Optional[str] = Query(None),
+    sort_by: str = Query("id_desc"),
     admin: dict = Depends(require_hero_admin)
 ):
     """
-    Get paginated user list with search support.
-    Default limit is 10 users per page.
+    Get paginated user list with search support, cloud storage metrics, and sorting options:
+    - id_desc: Newest users first (default)
+    - id_asc: Oldest users first
+    - storage_desc: Highest Cloud Storage usage first
+    - storage_asc: Lowest Cloud Storage usage first
+    - name_asc: Alphabetical by Name
     """
-    offset = (page - 1) * limit
     search_q = (search or "").strip()
 
+    # Query matching users
     if search_q:
         if search_q.isdigit():
             target_num = int(search_q)
-            # Match by ID/user_id or text
             users = await execute_pg_query(
                 """
                 SELECT id, user_id, username, name, email, bio, status, avatar, google_id, last_seen, created_at, updated_at
                 FROM users
                 WHERE user_id = $1 OR id = $1 OR username ILIKE $2 OR email ILIKE $2 OR name ILIKE $2
                 ORDER BY id DESC
-                LIMIT $3 OFFSET $4
                 """,
-                target_num, f"%{search_q}%", limit, offset
-            )
-            count_res = await execute_pg_query(
-                "SELECT COUNT(*) AS count FROM users WHERE user_id = $1 OR id = $1 OR username ILIKE $2 OR email ILIKE $2 OR name ILIKE $2",
                 target_num, f"%{search_q}%"
             )
         else:
@@ -204,12 +377,7 @@ async def api_admin_get_users(
                 FROM users
                 WHERE username ILIKE $1 OR email ILIKE $1 OR name ILIKE $1
                 ORDER BY id DESC
-                LIMIT $2 OFFSET $3
                 """,
-                f"%{search_q}%", limit, offset
-            )
-            count_res = await execute_pg_query(
-                "SELECT COUNT(*) AS count FROM users WHERE username ILIKE $1 OR email ILIKE $1 OR name ILIKE $1",
                 f"%{search_q}%"
             )
     else:
@@ -218,29 +386,32 @@ async def api_admin_get_users(
             SELECT id, user_id, username, name, email, bio, status, avatar, google_id, last_seen, created_at, updated_at
             FROM users
             ORDER BY id DESC
-            LIMIT $1 OFFSET $2
-            """,
-            limit, offset
+            """
         )
-        count_res = await execute_pg_query("SELECT COUNT(*) AS count FROM users")
 
-    total = int(count_res[0]["count"]) if count_res else len(users)
+    total = len(users)
 
-    # Format output & attach realtime status
-    result_users = []
+    # Format user records and attach storage calculation
+    formatted_users = []
     for u in users:
         uid = u.get("user_id") or (10000 + u["id"])
         uname = (u.get("username") or "").strip()
         is_online = uname.lower() in active_connections if uname else False
-        
-        # Format created_at to ISO string if needed
+
         created_at_val = u.get("created_at")
         if hasattr(created_at_val, "isoformat"):
             created_at_str = created_at_val.isoformat()
         else:
             created_at_str = str(created_at_val or "")
 
-        result_users.append({
+        avatar_url = u.get("avatar") or ""
+
+        # Compute storage for this user
+        files_data = get_user_files_storage(uname, avatar_url)
+        db_data = await get_user_db_storage_bytes(uid, uname)
+        user_total_bytes = files_data["total_bytes"] + db_data["total_bytes"]
+
+        formatted_users.append({
             "id": uid,
             "db_id": u["id"],
             "user_id": uid,
@@ -250,27 +421,156 @@ async def api_admin_get_users(
             "bio": u.get("bio") or "",
             "status": "online" if is_online else (u.get("status") or "offline"),
             "is_online": is_online,
-            "avatar": u.get("avatar") or "",
-            "avatar_url": u.get("avatar") or "",
+            "avatar": avatar_url,
+            "avatar_url": avatar_url,
             "google_id": u.get("google_id") or "",
             "last_seen": u.get("last_seen") or "",
-            "created_at": created_at_str
+            "created_at": created_at_str,
+            "storage_bytes": user_total_bytes,
+            "storage_formatted": format_bytes(user_total_bytes),
+            "files_count": files_data["total_files"],
+            "files_bytes": files_data["total_bytes"],
+            "files_formatted": files_data["total_formatted"],
+            "db_bytes": db_data["total_bytes"],
+            "db_formatted": db_data["total_formatted"],
+            "db_items_count": db_data["total_items"]
         })
 
-    has_more = (offset + len(result_users)) < total
+    # Sort users
+    if sort_by == "storage_desc":
+        formatted_users.sort(key=lambda x: x["storage_bytes"], reverse=True)
+    elif sort_by == "storage_asc":
+        formatted_users.sort(key=lambda x: x["storage_bytes"], reverse=False)
+    elif sort_by == "id_asc":
+        formatted_users.sort(key=lambda x: x["db_id"], reverse=False)
+    elif sort_by == "name_asc":
+        formatted_users.sort(key=lambda x: (x["name"] or x["username"]).lower())
+    else:  # id_desc default
+        formatted_users.sort(key=lambda x: x["db_id"], reverse=True)
+
+    # Paginate
+    offset = (page - 1) * limit
+    paged_users = formatted_users[offset : offset + limit]
+    has_more = (offset + len(paged_users)) < total
 
     return {
-        "users": result_users,
+        "users": paged_users,
         "total": total,
         "page": page,
         "limit": limit,
-        "has_more": has_more
+        "has_more": has_more,
+        "sort_by": sort_by
+    }
+
+
+@router.get("/storage/ranking")
+async def api_admin_storage_ranking(
+    limit: int = Query(50, ge=1, le=500),
+    search: Optional[str] = Query(None),
+    admin: dict = Depends(require_hero_admin)
+):
+    """
+    Get full Leaderboard / Ranking of users ordered by Cloud Storage usage (Highest to Lowest).
+    Provides exact percentages, breakdown between R2 Files and Database App Sync.
+    """
+    search_q = (search or "").strip()
+
+    if search_q:
+        if search_q.isdigit():
+            users = await execute_pg_query(
+                "SELECT id, user_id, username, name, email, avatar, created_at FROM users WHERE user_id = $1 OR id = $1 OR username ILIKE $2 OR email ILIKE $2 OR name ILIKE $2",
+                int(search_q), f"%{search_q}%"
+            )
+        else:
+            users = await execute_pg_query(
+                "SELECT id, user_id, username, name, email, avatar, created_at FROM users WHERE username ILIKE $1 OR email ILIKE $1 OR name ILIKE $1",
+                f"%{search_q}%"
+            )
+    else:
+        users = await execute_pg_query("SELECT id, user_id, username, name, email, avatar, created_at FROM users")
+
+    if not users:
+        return {
+            "ranking": [],
+            "total_users": 0,
+            "total_storage_bytes": 0,
+            "total_storage_formatted": "0 B",
+            "total_files_bytes": 0,
+            "total_db_bytes": 0
+        }
+
+    ranking_list = []
+    total_system_storage_bytes = 0
+    total_system_files_bytes = 0
+    total_system_db_bytes = 0
+
+    for u in users:
+        uid = u.get("user_id") or (10000 + u["id"])
+        uname = (u.get("username") or "").strip()
+        avatar_url = u.get("avatar") or ""
+
+        files_data = get_user_files_storage(uname, avatar_url)
+        db_data = await get_user_db_storage_bytes(uid, uname)
+
+        user_total_bytes = files_data["total_bytes"] + db_data["total_bytes"]
+        total_system_storage_bytes += user_total_bytes
+        total_system_files_bytes += files_data["total_bytes"]
+        total_system_db_bytes += db_data["total_bytes"]
+
+        ranking_list.append({
+            "id": uid,
+            "user_id": uid,
+            "username": uname,
+            "name": u.get("name") or uname,
+            "email": u.get("email") or "",
+            "avatar": avatar_url,
+            "total_bytes": user_total_bytes,
+            "total_formatted": format_bytes(user_total_bytes),
+            "files_bytes": files_data["total_bytes"],
+            "files_formatted": files_data["total_formatted"],
+            "files_count": files_data["total_files"],
+            "r2_bytes": files_data["r2_bytes"],
+            "r2_formatted": files_data["r2_formatted"],
+            "local_bytes": files_data["local_bytes"],
+            "local_formatted": files_data["local_formatted"],
+            "db_bytes": db_data["total_bytes"],
+            "db_formatted": db_data["total_formatted"],
+            "db_items_count": db_data["total_items"],
+            "breakdown": {
+                "avatar": files_data["breakdown"]["avatar_formatted"],
+                "chat_media": files_data["breakdown"]["chat_formatted"],
+                "uploads": files_data["breakdown"]["uploads_formatted"],
+                "apps": db_data["apps"]
+            }
+        })
+
+    # Sort descending by total storage
+    ranking_list.sort(key=lambda x: x["total_bytes"], reverse=True)
+
+    # Assign ranks and percentage of total
+    for idx, item in enumerate(ranking_list):
+        item["rank"] = idx + 1
+        pct = (item["total_bytes"] / total_system_storage_bytes * 100.0) if total_system_storage_bytes > 0 else 0.0
+        item["percentage_of_total"] = round(pct, 2)
+
+    top_ranking = ranking_list[:limit]
+
+    return {
+        "ranking": top_ranking,
+        "total_users": len(ranking_list),
+        "total_storage_bytes": total_system_storage_bytes,
+        "total_storage_formatted": format_bytes(total_system_storage_bytes),
+        "total_files_bytes": total_system_files_bytes,
+        "total_files_formatted": format_bytes(total_system_files_bytes),
+        "total_db_bytes": total_system_db_bytes,
+        "total_db_formatted": format_bytes(total_system_db_bytes),
+        "avg_storage_per_user": format_bytes(int(total_system_storage_bytes / len(ranking_list))) if ranking_list else "0 B"
     }
 
 
 @router.get("/users/{identifier}")
 async def api_admin_get_single_user(identifier: str, admin: dict = Depends(require_hero_admin)):
-    """Retrieve detailed information of a single user."""
+    """Retrieve detailed information of a single user including complete Cloud Storage breakdown."""
     ident = identifier.strip()
     if ident.isdigit():
         rows = await execute_pg_query(
@@ -291,6 +591,10 @@ async def api_admin_get_single_user(identifier: str, admin: dict = Depends(requi
     u = rows[0]
     uid = u.get("user_id") or (10000 + u["id"])
     uname = u.get("username") or ""
+    avatar_url = u.get("avatar") or ""
+
+    # Calculate complete cloud storage breakdown
+    storage_data = await get_user_total_cloud_storage(uid, uname, avatar_url)
 
     # Count items in various tables
     notes_cnt = await execute_pg_query("SELECT COUNT(*) AS count FROM user_sync_notes WHERE user_id = $1", uid)
@@ -308,7 +612,7 @@ async def api_admin_get_single_user(identifier: str, admin: dict = Depends(requi
             "email": u.get("email") or "",
             "bio": u.get("bio") or "",
             "status": "online" if uname.lower() in active_connections else (u.get("status") or "offline"),
-            "avatar": u.get("avatar") or "",
+            "avatar": avatar_url,
             "google_id": u.get("google_id") or "",
             "created_at": str(u.get("created_at") or ""),
             "updated_at": str(u.get("updated_at") or "")
@@ -318,7 +622,8 @@ async def api_admin_get_single_user(identifier: str, admin: dict = Depends(requi
             "tasks_count": int(tasks_cnt[0]["count"]) if tasks_cnt else 0,
             "docs_count": int(docs_cnt[0]["count"]) if docs_cnt else 0,
             "messages_sent": int(msgs_cnt[0]["count"]) if msgs_cnt else 0
-        }
+        },
+        "storage": storage_data
     }
 
 
