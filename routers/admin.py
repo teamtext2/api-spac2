@@ -294,7 +294,7 @@ _stats_cache = {"data": None, "ts": 0}
 
 @router.get("/stats")
 async def api_admin_stats(admin: dict = Depends(require_hero_admin)):
-    """Get system overview metrics and total cloud storage usage (with in-memory TTL caching)."""
+    """Get system overview metrics (100% lightweight, no heavy storage scans)."""
     now = time.time()
     if _stats_cache["data"] and (now - _stats_cache["ts"] < 30):
         cached = dict(_stats_cache["data"])
@@ -308,34 +308,12 @@ async def api_admin_stats(admin: dict = Depends(require_hero_admin)):
         msg_cnt = await execute_pg_query("SELECT COUNT(*) AS count FROM messages")
         total_messages = int(msg_cnt[0]["count"]) if msg_cnt else 0
 
-        # Global R2 & Files Storage
-        r2_summary = get_all_r2_storage_summary()
-        total_files_bytes = r2_summary.get("total_bytes", 0)
-
-        # Global Sync Tables DB Storage (approximate)
-        db_total_bytes = 0
-        for table in ["user_sync_notes", "user_sync_tasks", "user_sync_docs", "user_sync_mindmap_projects", "user_sync_table_projects", "messages"]:
-            try:
-                res = await execute_pg_query(f"SELECT COUNT(*) AS cnt FROM {table}")
-                if res:
-                    db_total_bytes += int(res[0]["cnt"]) * 300
-            except Exception:
-                pass
-
-        total_cloud_storage = total_files_bytes + db_total_bytes
-
         data = {
             "total_users": total_users,
             "online_users": len(active_connections),
             "total_messages": total_messages,
             "r2_connected": r2_client is not None,
-            "total_storage_bytes": total_cloud_storage,
-            "total_storage_formatted": format_bytes(total_cloud_storage),
-            "r2_storage_bytes": total_files_bytes,
-            "r2_storage_formatted": format_bytes(total_files_bytes),
-            "r2_total_files": r2_summary.get("total_files", 0),
-            "db_storage_bytes": db_total_bytes,
-            "db_storage_formatted": format_bytes(db_total_bytes)
+            "system_status": "healthy"
         }
         _stats_cache["data"] = data
         _stats_cache["ts"] = now
@@ -346,8 +324,7 @@ async def api_admin_stats(admin: dict = Depends(require_hero_admin)):
             "online_users": len(active_connections),
             "total_messages": 0,
             "r2_connected": r2_client is not None,
-            "total_storage_bytes": 0,
-            "total_storage_formatted": "0 B",
+            "system_status": "error",
             "error": str(e)
         }
 
@@ -470,126 +447,19 @@ async def api_admin_get_users(
     }
 
 
-_ranking_cache = {"data": None, "ts": 0}
-
-
 @router.get("/storage/ranking")
 async def api_admin_storage_ranking(
     limit: int = Query(50, ge=1, le=500),
     search: Optional[str] = Query(None),
     admin: dict = Depends(require_hero_admin)
 ):
-    """
-    Get Leaderboard / Ranking of users ordered by Cloud Storage usage with 60s in-memory caching.
-    """
-    search_q = (search or "").strip()
-    now = time.time()
-
-    if not search_q and _ranking_cache["data"] and (now - _ranking_cache["ts"] < 60):
-        cached = _ranking_cache["data"]
-        return {
-            **cached,
-            "ranking": cached["ranking"][:limit]
-        }
-
-    if search_q:
-        if search_q.isdigit():
-            users = await execute_pg_query(
-                "SELECT id, user_id, username, name, email, avatar, created_at FROM users WHERE user_id = $1 OR id = $1 OR username ILIKE $2 OR email ILIKE $2 OR name ILIKE $2",
-                int(search_q), f"%{search_q}%"
-            )
-        else:
-            users = await execute_pg_query(
-                "SELECT id, user_id, username, name, email, avatar, created_at FROM users WHERE username ILIKE $1 OR email ILIKE $1 OR name ILIKE $1",
-                f"%{search_q}%"
-            )
-    else:
-        users = await execute_pg_query("SELECT id, user_id, username, name, email, avatar, created_at FROM users")
-
-    if not users:
-        return {
-            "ranking": [],
-            "total_users": 0,
-            "total_storage_bytes": 0,
-            "total_storage_formatted": "0 B",
-            "total_files_bytes": 0,
-            "total_db_bytes": 0
-        }
-
-    ranking_list = []
-    total_system_storage_bytes = 0
-    total_system_files_bytes = 0
-    total_system_db_bytes = 0
-
-    for u in users:
-        uid = u.get("user_id") or (10000 + u["id"])
-        uname = (u.get("username") or "").strip()
-        avatar_url = u.get("avatar") or ""
-
-        files_data = get_user_files_storage(uname, avatar_url)
-        db_data = await get_user_db_storage_bytes(uid, uname)
-
-        user_total_bytes = files_data["total_bytes"] + db_data["total_bytes"]
-        total_system_storage_bytes += user_total_bytes
-        total_system_files_bytes += files_data["total_bytes"]
-        total_system_db_bytes += db_data["total_bytes"]
-
-        ranking_list.append({
-            "id": uid,
-            "user_id": uid,
-            "username": uname,
-            "name": u.get("name") or uname,
-            "email": u.get("email") or "",
-            "avatar": avatar_url,
-            "total_bytes": user_total_bytes,
-            "total_formatted": format_bytes(user_total_bytes),
-            "files_bytes": files_data["total_bytes"],
-            "files_formatted": files_data["total_formatted"],
-            "files_count": files_data["total_files"],
-            "r2_bytes": files_data["r2_bytes"],
-            "r2_formatted": files_data["r2_formatted"],
-            "local_bytes": files_data["local_bytes"],
-            "local_formatted": files_data["local_formatted"],
-            "db_bytes": db_data["total_bytes"],
-            "db_formatted": db_data["total_formatted"],
-            "db_items_count": db_data["total_items"],
-            "breakdown": {
-                "avatar": files_data["breakdown"]["avatar_formatted"],
-                "chat_media": files_data["breakdown"]["chat_formatted"],
-                "uploads": files_data["breakdown"]["uploads_formatted"],
-                "apps": db_data["apps"]
-            }
-        })
-
-    # Sort descending by total storage
-    ranking_list.sort(key=lambda x: x["total_bytes"], reverse=True)
-
-    # Assign ranks and percentage of total
-    for idx, item in enumerate(ranking_list):
-        item["rank"] = idx + 1
-        pct = (item["total_bytes"] / total_system_storage_bytes * 100.0) if total_system_storage_bytes > 0 else 0.0
-        item["percentage_of_total"] = round(pct, 2)
-
-    top_ranking = ranking_list[:limit]
-
-    res = {
-        "ranking": ranking_list,
-        "total_users": len(ranking_list),
-        "total_storage_bytes": total_system_storage_bytes,
-        "total_storage_formatted": format_bytes(total_system_storage_bytes),
-        "total_files_bytes": total_system_files_bytes,
-        "total_files_formatted": format_bytes(total_system_files_bytes),
-        "total_db_bytes": total_system_db_bytes,
-        "total_db_formatted": format_bytes(total_system_db_bytes),
-        "avg_storage_per_user": format_bytes(int(total_system_storage_bytes / len(ranking_list))) if ranking_list else "0 B"
-    }
-    if not search_q:
-        _ranking_cache["data"] = res
-        _ranking_cache["ts"] = now
-
+    """Storage ranking disabled for large databases to maintain ultra-fast server response."""
     return {
-        **res,
-        "ranking": top_ranking
+        "ranking": [],
+        "total_users": 0,
+        "total_storage_bytes": 0,
+        "total_storage_formatted": "0 B",
+        "message": "Chi tiết dung lượng xem theo từng user riêng biệt"
     }
 
 
