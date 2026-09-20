@@ -288,9 +288,19 @@ async def api_admin_verify(admin: dict = Depends(require_hero_admin)):
     }
 
 
+# --- In-Memory Caches for Hero Admin ---
+_stats_cache = {"data": None, "ts": 0}
+
+
 @router.get("/stats")
 async def api_admin_stats(admin: dict = Depends(require_hero_admin)):
-    """Get system overview metrics and total cloud storage usage."""
+    """Get system overview metrics and total cloud storage usage (with in-memory TTL caching)."""
+    now = time.time()
+    if _stats_cache["data"] and (now - _stats_cache["ts"] < 30):
+        cached = dict(_stats_cache["data"])
+        cached["online_users"] = len(active_connections)
+        return cached
+
     try:
         user_cnt = await execute_pg_query("SELECT COUNT(*) AS count FROM users")
         total_users = int(user_cnt[0]["count"]) if user_cnt else 0
@@ -314,7 +324,7 @@ async def api_admin_stats(admin: dict = Depends(require_hero_admin)):
 
         total_cloud_storage = total_files_bytes + db_total_bytes
 
-        return {
+        data = {
             "total_users": total_users,
             "online_users": len(active_connections),
             "total_messages": total_messages,
@@ -327,6 +337,9 @@ async def api_admin_stats(admin: dict = Depends(require_hero_admin)):
             "db_storage_bytes": db_total_bytes,
             "db_storage_formatted": format_bytes(db_total_bytes)
         }
+        _stats_cache["data"] = data
+        _stats_cache["ts"] = now
+        return data
     except Exception as e:
         return {
             "total_users": 0,
@@ -348,50 +361,72 @@ async def api_admin_get_users(
     admin: dict = Depends(require_hero_admin)
 ):
     """
-    Get paginated user list with search support, cloud storage metrics, and sorting options:
-    - id_desc: Newest users first (default)
-    - id_asc: Oldest users first
-    - storage_desc: Highest Cloud Storage usage first
-    - storage_asc: Lowest Cloud Storage usage first
-    - name_asc: Alphabetical by Name
+    Get paginated user list using ultra-fast database-level SQL pagination.
+    Zero N+1 storage computation on listing to eliminate server lag regardless of user count.
     """
     search_q = (search or "").strip()
+    offset = (page - 1) * limit
 
-    # Query matching users
+    order_clause = "id DESC"
+    if sort_by == "id_asc":
+        order_clause = "id ASC"
+    elif sort_by == "name_asc":
+        order_clause = "LOWER(COALESCE(name, username)) ASC, id DESC"
+    elif sort_by == "name_desc":
+        order_clause = "LOWER(COALESCE(name, username)) DESC, id DESC"
+
+    # Query matching users with SQL LIMIT & OFFSET
     if search_q:
         if search_q.isdigit():
             target_num = int(search_q)
+            cnt_res = await execute_pg_query(
+                "SELECT COUNT(*) AS count FROM users WHERE user_id = $1 OR id = $1 OR username ILIKE $2 OR email ILIKE $2 OR name ILIKE $2",
+                target_num, f"%{search_q}%"
+            )
+            total = int(cnt_res[0]["count"]) if cnt_res else 0
+
             users = await execute_pg_query(
-                """
+                f"""
                 SELECT id, user_id, username, name, email, bio, status, avatar, google_id, last_seen, created_at, updated_at
                 FROM users
                 WHERE user_id = $1 OR id = $1 OR username ILIKE $2 OR email ILIKE $2 OR name ILIKE $2
-                ORDER BY id DESC
+                ORDER BY {order_clause}
+                LIMIT $3 OFFSET $4
                 """,
-                target_num, f"%{search_q}%"
+                target_num, f"%{search_q}%", limit, offset
             )
         else:
+            cnt_res = await execute_pg_query(
+                "SELECT COUNT(*) AS count FROM users WHERE username ILIKE $1 OR email ILIKE $1 OR name ILIKE $1",
+                f"%{search_q}%"
+            )
+            total = int(cnt_res[0]["count"]) if cnt_res else 0
+
             users = await execute_pg_query(
-                """
+                f"""
                 SELECT id, user_id, username, name, email, bio, status, avatar, google_id, last_seen, created_at, updated_at
                 FROM users
                 WHERE username ILIKE $1 OR email ILIKE $1 OR name ILIKE $1
-                ORDER BY id DESC
+                ORDER BY {order_clause}
+                LIMIT $2 OFFSET $3
                 """,
-                f"%{search_q}%"
+                f"%{search_q}%", limit, offset
             )
     else:
+        cnt_res = await execute_pg_query("SELECT COUNT(*) AS count FROM users")
+        total = int(cnt_res[0]["count"]) if cnt_res else 0
+
         users = await execute_pg_query(
-            """
+            f"""
             SELECT id, user_id, username, name, email, bio, status, avatar, google_id, last_seen, created_at, updated_at
             FROM users
-            ORDER BY id DESC
-            """
+            ORDER BY {order_clause}
+            LIMIT $1 OFFSET $2
+            """,
+            limit, offset
         )
 
-    total = len(users)
-
-    # Format user records and attach storage calculation
+    # Fast mapping for only the returned 10-20 users
     formatted_users = []
     for u in users:
         uid = u.get("user_id") or (10000 + u["id"])
@@ -405,11 +440,6 @@ async def api_admin_get_users(
             created_at_str = str(created_at_val or "")
 
         avatar_url = u.get("avatar") or ""
-
-        # Compute storage for this user
-        files_data = get_user_files_storage(uname, avatar_url)
-        db_data = await get_user_db_storage_bytes(uid, uname)
-        user_total_bytes = files_data["total_bytes"] + db_data["total_bytes"]
 
         formatted_users.append({
             "id": uid,
@@ -425,42 +455,22 @@ async def api_admin_get_users(
             "avatar_url": avatar_url,
             "google_id": u.get("google_id") or "",
             "last_seen": u.get("last_seen") or "",
-            "created_at": created_at_str,
-            "storage_bytes": user_total_bytes,
-            "storage_formatted": format_bytes(user_total_bytes),
-            "files_count": files_data["total_files"],
-            "files_bytes": files_data["total_bytes"],
-            "files_formatted": files_data["total_formatted"],
-            "db_bytes": db_data["total_bytes"],
-            "db_formatted": db_data["total_formatted"],
-            "db_items_count": db_data["total_items"]
+            "created_at": created_at_str
         })
 
-    # Sort users
-    if sort_by == "storage_desc":
-        formatted_users.sort(key=lambda x: x["storage_bytes"], reverse=True)
-    elif sort_by == "storage_asc":
-        formatted_users.sort(key=lambda x: x["storage_bytes"], reverse=False)
-    elif sort_by == "id_asc":
-        formatted_users.sort(key=lambda x: x["db_id"], reverse=False)
-    elif sort_by == "name_asc":
-        formatted_users.sort(key=lambda x: (x["name"] or x["username"]).lower())
-    else:  # id_desc default
-        formatted_users.sort(key=lambda x: x["db_id"], reverse=True)
-
-    # Paginate
-    offset = (page - 1) * limit
-    paged_users = formatted_users[offset : offset + limit]
-    has_more = (offset + len(paged_users)) < total
+    has_more = (offset + len(formatted_users)) < total
 
     return {
-        "users": paged_users,
+        "users": formatted_users,
         "total": total,
         "page": page,
         "limit": limit,
         "has_more": has_more,
         "sort_by": sort_by
     }
+
+
+_ranking_cache = {"data": None, "ts": 0}
 
 
 @router.get("/storage/ranking")
@@ -470,10 +480,17 @@ async def api_admin_storage_ranking(
     admin: dict = Depends(require_hero_admin)
 ):
     """
-    Get full Leaderboard / Ranking of users ordered by Cloud Storage usage (Highest to Lowest).
-    Provides exact percentages, breakdown between R2 Files and Database App Sync.
+    Get Leaderboard / Ranking of users ordered by Cloud Storage usage with 60s in-memory caching.
     """
     search_q = (search or "").strip()
+    now = time.time()
+
+    if not search_q and _ranking_cache["data"] and (now - _ranking_cache["ts"] < 60):
+        cached = _ranking_cache["data"]
+        return {
+            **cached,
+            "ranking": cached["ranking"][:limit]
+        }
 
     if search_q:
         if search_q.isdigit():
@@ -555,8 +572,8 @@ async def api_admin_storage_ranking(
 
     top_ranking = ranking_list[:limit]
 
-    return {
-        "ranking": top_ranking,
+    res = {
+        "ranking": ranking_list,
         "total_users": len(ranking_list),
         "total_storage_bytes": total_system_storage_bytes,
         "total_storage_formatted": format_bytes(total_system_storage_bytes),
@@ -565,6 +582,14 @@ async def api_admin_storage_ranking(
         "total_db_bytes": total_system_db_bytes,
         "total_db_formatted": format_bytes(total_system_db_bytes),
         "avg_storage_per_user": format_bytes(int(total_system_storage_bytes / len(ranking_list))) if ranking_list else "0 B"
+    }
+    if not search_q:
+        _ranking_cache["data"] = res
+        _ranking_cache["ts"] = now
+
+    return {
+        **res,
+        "ranking": top_ranking
     }
 
 
