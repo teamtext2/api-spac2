@@ -28,6 +28,12 @@ class LoginRequest(BaseModel):
     password: str
 
 
+class ChangePasswordRequest(BaseModel):
+    current_password: Optional[str] = None
+    new_password: str
+    confirm_password: Optional[str] = None
+
+
 def _set_auth_cookies(response: Response, token: str, user_data: Dict[str, Any]):
     """Set cross-app authentication cookies for standard 30-day ecosystem persistence."""
     max_age = 30 * 86400  # 30 days
@@ -236,10 +242,83 @@ async def get_current_user(
                 if p:
                     return p
 
-    for ident in [x_user_email, x_user_id, x_user_name]:
-        if ident and ident.strip():
-            p = await get_profile(ident.strip())
-            if p:
-                return p
-
     raise HTTPException(status_code=401, detail="Unauthorized: No active session found.")
+
+
+@router.post("/change-password")
+async def change_password(
+    req: ChangePasswordRequest,
+    token: Optional[str] = Depends(get_auth_token),
+    x_user_id: Optional[str] = Header(None),
+    x_user_email: Optional[str] = Header(None),
+    x_user_name: Optional[str] = Header(None)
+):
+    """Change current authenticated user's password."""
+    user_ident = ""
+    if token:
+        payload = decode_spac2_token(token)
+        if payload:
+            user_ident = payload.get("email") or payload.get("username") or str(payload.get("user_id") or "")
+
+    if not user_ident:
+        for ident in [x_user_email, x_user_id, x_user_name]:
+            if ident and ident.strip():
+                user_ident = ident.strip()
+                break
+
+    if not user_ident:
+        raise HTTPException(status_code=401, detail="Unauthorized: No active session found.")
+
+    # Find user in DB
+    users = []
+    if user_ident.isdigit():
+        users = await execute_pg_query(
+            "SELECT id, user_id, username, email, password_hash FROM users WHERE user_id = $1 OR id = $1",
+            int(user_ident)
+        )
+    if not users:
+        users = await execute_pg_query(
+            "SELECT id, user_id, username, email, password_hash FROM users WHERE email = $1 OR username = $2",
+            user_ident.lower(), user_ident.lower()
+        )
+
+    if not users:
+        raise HTTPException(status_code=404, detail="User account not found.")
+
+    user = users[0]
+    stored_hash = user.get("password_hash")
+
+    # If the account already has a password, current password is required and must match
+    if stored_hash:
+        if not req.current_password:
+            raise HTTPException(status_code=400, detail="Vui lòng nhập mật khẩu hiện tại / Current password is required.")
+        if not verify_password(req.current_password, stored_hash):
+            raise HTTPException(status_code=400, detail="Mật khẩu hiện tại không chính xác / Current password is incorrect.")
+
+    # Validate new password
+    new_pw = (req.new_password or "").strip()
+    if not new_pw:
+        raise HTTPException(status_code=400, detail="Mật khẩu mới không được để trống / New password cannot be empty.")
+
+    if req.confirm_password is not None and new_pw != req.confirm_password.strip():
+        raise HTTPException(status_code=400, detail="Mật khẩu xác nhận không khớp / Confirm password does not match.")
+
+    is_valid_pw, pw_error = validate_password_strength(new_pw)
+    if not is_valid_pw:
+        raise HTTPException(status_code=400, detail=pw_error)
+
+    if stored_hash and req.current_password and req.current_password == new_pw:
+        raise HTTPException(status_code=400, detail="Mật khẩu mới không được trùng với mật khẩu hiện tại / New password cannot be the same as current password.")
+
+    # Hash and update in DB
+    pwd_hash = hash_password(new_pw)
+    await execute_pg_query(
+        "UPDATE users SET password_hash = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
+        pwd_hash, user["id"]
+    )
+
+    return {
+        "status": "success",
+        "message": "Đổi mật khẩu thành công! / Password changed successfully."
+    }
+
