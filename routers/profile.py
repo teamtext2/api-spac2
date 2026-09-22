@@ -1,4 +1,5 @@
-from typing import Optional
+import re
+from typing import Optional, List, Dict, Any
 from fastapi import APIRouter, HTTPException, Depends, Request, Response, Header
 from database.postgres import execute_pg_query
 from auth.deps import get_auth_token, verify_google_token, create_spac2_token, decode_spac2_token, create_text2_token, decode_text2_token
@@ -6,20 +7,22 @@ from models.schemas import UserProfile
 from services.user_service import save_profile, get_profile, get_email_by_username
 from websocket.manager import active_connections
 from config import DEFAULT_AVATAR_URL
+from storage.r2 import (
+    get_user_files_storage,
+    delete_user_folder_files,
+    format_bytes,
+)
 
 router = APIRouter(prefix="/api", tags=["profile"])
 
 
-@router.get("/profile")
-async def api_get_my_profile(
-    request: Request,
+async def get_authenticated_user(
     token: Optional[str] = Depends(get_auth_token),
     x_user_id: Optional[str] = Header(None),
     x_user_email: Optional[str] = Header(None),
     x_user_name: Optional[str] = Header(None)
-):
-    """Retrieve current authenticated user profile across Spac2 Ecosystem."""
-    # 1. Spac2 JWT Token lookup
+) -> dict:
+    """Resolve the currently authenticated user from Spac2 unified session token or headers."""
     if token:
         payload = decode_spac2_token(token)
         if payload:
@@ -29,20 +32,322 @@ async def api_get_my_profile(
                 if p:
                     return p
 
-    # 2. Header-based identity lookup
     for ident in [x_user_email, x_user_id, x_user_name]:
         if ident and ident.strip():
             p = await get_profile(ident.strip())
             if p:
                 return p
 
-    # 3. Fallback: Check if token is raw identifier
     if token and len(token) < 200:
         p = await get_profile(token)
         if p:
             return p
 
     raise HTTPException(status_code=401, detail="Unauthorized: No active profile session found")
+
+
+@router.get("/profile")
+async def api_get_my_profile(
+    user: dict = Depends(get_authenticated_user)
+):
+    """Retrieve current authenticated user profile across Spac2 Ecosystem."""
+    return user
+
+
+@router.get("/profile/storage")
+async def api_get_user_storage(
+    user: dict = Depends(get_authenticated_user)
+):
+    """
+    On-demand calculation of user cloud storage across all sync apps and media.
+    Only executed when explicitly requested by user.
+    """
+    user_id = user["user_id"]
+    username = (user.get("username") or "").strip().lower()
+    avatar_url = user.get("avatar") or ""
+
+    files_storage = get_user_files_storage(username, avatar_url)
+    breakdown_files = files_storage.get("breakdown", {})
+
+    apps_list = []
+
+    # 1. Notes
+    notes_bytes = 0
+    notes_cnt = 0
+    try:
+        res = await execute_pg_query(
+            "SELECT COUNT(*) AS count, COALESCE(SUM(LENGTH(COALESCE(title, '')) + LENGTH(COALESCE(content, '')) + 40), 0) AS bytes FROM user_sync_notes WHERE user_id = $1",
+            user_id
+        )
+        if res:
+            notes_cnt = int(res[0].get("count") or 0)
+            notes_bytes = int(res[0].get("bytes") or 0)
+    except Exception:
+        pass
+    apps_list.append({
+        "app_key": "notes",
+        "name": "Ghi chú (Notes)",
+        "icon": "ph-note",
+        "count": notes_cnt,
+        "count_label": f"{notes_cnt} ghi chú",
+        "bytes": notes_bytes,
+        "formatted": format_bytes(notes_bytes)
+    })
+
+    # 2. Tasks
+    tasks_bytes = 0
+    tasks_cnt = 0
+    try:
+        res1 = await execute_pg_query(
+            "SELECT COUNT(*) AS count, COALESCE(SUM(LENGTH(COALESCE(title, '')) + LENGTH(COALESCE(note, '')) + 40), 0) AS bytes FROM user_sync_tasks WHERE user_id = $1",
+            user_id
+        )
+        res2 = await execute_pg_query(
+            "SELECT COUNT(*) AS count, COALESCE(SUM(LENGTH(COALESCE(name, '')) + 30), 0) AS bytes FROM user_sync_task_projects WHERE user_id = $1",
+            user_id
+        )
+        t_cnt = (int(res1[0]["count"]) if res1 else 0) + (int(res2[0]["count"]) if res2 else 0)
+        t_bytes = (int(res1[0]["bytes"]) if res1 else 0) + (int(res2[0]["bytes"]) if res2 else 0)
+        tasks_cnt = t_cnt
+        tasks_bytes = t_bytes
+    except Exception:
+        pass
+    apps_list.append({
+        "app_key": "tasks",
+        "name": "Công việc (Tasks)",
+        "icon": "ph-check-square",
+        "count": tasks_cnt,
+        "count_label": f"{tasks_cnt} mục",
+        "bytes": tasks_bytes,
+        "formatted": format_bytes(tasks_bytes)
+    })
+
+    # 3. Docs
+    docs_bytes = 0
+    docs_cnt = 0
+    try:
+        res = await execute_pg_query(
+            "SELECT COUNT(*) AS count, COALESCE(SUM(LENGTH(COALESCE(title, '')) + LENGTH(COALESCE(body, '')) + LENGTH(COALESCE(preview_text, '')) + 100), 0) AS bytes FROM user_sync_docs WHERE user_id = $1",
+            user_id
+        )
+        if res:
+            docs_cnt = int(res[0].get("count") or 0)
+            docs_bytes = int(res[0].get("bytes") or 0)
+    except Exception:
+        pass
+    apps_list.append({
+        "app_key": "docs",
+        "name": "Tài liệu (Docs)",
+        "icon": "ph-file-text",
+        "count": docs_cnt,
+        "count_label": f"{docs_cnt} tài liệu",
+        "bytes": docs_bytes,
+        "formatted": format_bytes(docs_bytes)
+    })
+
+    # 4. Mindmap
+    mm_bytes = 0
+    mm_cnt = 0
+    try:
+        res = await execute_pg_query(
+            "SELECT COUNT(*) AS count, COALESCE(SUM(LENGTH(COALESCE(name, '')) + LENGTH(COALESCE(data::text, '')) + 50), 0) AS bytes FROM user_sync_mindmap_projects WHERE user_id = $1",
+            user_id
+        )
+        if res:
+            mm_cnt = int(res[0].get("count") or 0)
+            mm_bytes = int(res[0].get("bytes") or 0)
+    except Exception:
+        pass
+    apps_list.append({
+        "app_key": "mindmap",
+        "name": "Sơ đồ tư duy (Mindmap)",
+        "icon": "ph-tree-structure",
+        "count": mm_cnt,
+        "count_label": f"{mm_cnt} sơ đồ",
+        "bytes": mm_bytes,
+        "formatted": format_bytes(mm_bytes)
+    })
+
+    # 5. Table
+    tbl_bytes = 0
+    tbl_cnt = 0
+    try:
+        res = await execute_pg_query(
+            "SELECT COUNT(*) AS count, COALESCE(SUM(LENGTH(COALESCE(name, '')) + LENGTH(COALESCE(data::text, '')) + 50), 0) AS bytes FROM user_sync_table_projects WHERE user_id = $1",
+            user_id
+        )
+        if res:
+            tbl_cnt = int(res[0].get("count") or 0)
+            tbl_bytes = int(res[0].get("bytes") or 0)
+    except Exception:
+        pass
+    apps_list.append({
+        "app_key": "table",
+        "name": "Bảng tính (Table)",
+        "icon": "ph-table",
+        "count": tbl_cnt,
+        "count_label": f"{tbl_cnt} bảng",
+        "bytes": tbl_bytes,
+        "formatted": format_bytes(tbl_bytes)
+    })
+
+    # 6. Calendar
+    cal_bytes = 0
+    cal_cnt = 0
+    try:
+        res = await execute_pg_query(
+            "SELECT COUNT(*) AS count, COALESCE(SUM(LENGTH(COALESCE(title, '')) + LENGTH(COALESCE(description, '')) + 40), 0) AS bytes FROM user_sync_calendar_events WHERE user_id = $1",
+            user_id
+        )
+        if res:
+            cal_cnt = int(res[0].get("count") or 0)
+            cal_bytes = int(res[0].get("bytes") or 0)
+    except Exception:
+        pass
+    apps_list.append({
+        "app_key": "calendar",
+        "name": "Lịch biểu (Calendar)",
+        "icon": "ph-calendar-blank",
+        "count": cal_cnt,
+        "count_label": f"{cal_cnt} sự kiện",
+        "bytes": cal_bytes,
+        "formatted": format_bytes(cal_bytes)
+    })
+
+    # 7. Countday
+    cd_bytes = 0
+    cd_cnt = 0
+    try:
+        res = await execute_pg_query(
+            "SELECT COUNT(*) AS count, COALESCE(SUM(LENGTH(COALESCE(title, '')) + 30), 0) AS bytes FROM user_sync_countday_events WHERE user_id = $1",
+            user_id
+        )
+        if res:
+            cd_cnt = int(res[0].get("count") or 0)
+            cd_bytes = int(res[0].get("bytes") or 0)
+    except Exception:
+        pass
+    apps_list.append({
+        "app_key": "countday",
+        "name": "Đếm ngày (Countday)",
+        "icon": "ph-hourglass-medium",
+        "count": cd_cnt,
+        "count_label": f"{cd_cnt} sự kiện",
+        "bytes": cd_bytes,
+        "formatted": format_bytes(cd_bytes)
+    })
+
+    # 8. Chat & Media (Messages + R2 Chat Files)
+    chat_file_bytes = int(breakdown_files.get("chat_bytes") or 0)
+    chat_msg_bytes = 0
+    chat_msg_cnt = 0
+    try:
+        if username:
+            res = await execute_pg_query(
+                "SELECT COUNT(*) AS count, COALESCE(SUM(LENGTH(COALESCE(content, '')) + 50), 0) AS bytes FROM messages WHERE LOWER(sender_id) = LOWER($1) OR LOWER(recipient_id) = LOWER($1)",
+                username
+            )
+            if res:
+                chat_msg_cnt = int(res[0].get("count") or 0)
+                chat_msg_bytes = int(res[0].get("bytes") or 0)
+    except Exception:
+        pass
+    total_chat_bytes = chat_msg_bytes + chat_file_bytes
+    apps_list.append({
+        "app_key": "chat",
+        "name": "Tin nhắn & Media Chat",
+        "icon": "ph-chats",
+        "count": chat_msg_cnt,
+        "count_label": f"{chat_msg_cnt} tin nhắn & tệp",
+        "bytes": total_chat_bytes,
+        "formatted": format_bytes(total_chat_bytes)
+    })
+
+    # 9. Uploads
+    uploads_bytes = int(breakdown_files.get("uploads_bytes") or 0)
+    apps_list.append({
+        "app_key": "uploads",
+        "name": "Tệp tải lên (Uploads)",
+        "icon": "ph-upload-simple",
+        "count": 0,
+        "count_label": "Tệp lưu trữ",
+        "bytes": uploads_bytes,
+        "formatted": format_bytes(uploads_bytes)
+    })
+
+    total_storage_bytes = sum(item["bytes"] for item in apps_list)
+
+    return {
+        "status": "success",
+        "total_bytes": total_storage_bytes,
+        "total_formatted": format_bytes(total_storage_bytes),
+        "apps": apps_list
+    }
+
+
+@router.delete("/profile/storage/{app_key}")
+async def api_delete_user_app_data(
+    app_key: str,
+    user: dict = Depends(get_authenticated_user)
+):
+    """
+    Delete all database rows and Cloudflare R2 / local files for a specific application.
+    """
+    user_id = user["user_id"]
+    username = (user.get("username") or "").strip().lower()
+    app = (app_key or "").strip().lower()
+
+    valid_apps = ["notes", "tasks", "docs", "mindmap", "table", "calendar", "countday", "chat", "uploads"]
+    if app not in valid_apps:
+        raise HTTPException(status_code=400, detail="Mã ứng dụng không hợp lệ")
+
+    deleted_info = {}
+
+    try:
+        if app == "notes":
+            await execute_pg_query("DELETE FROM user_sync_notes WHERE user_id = $1", user_id)
+            deleted_info["app"] = "Ghi chú (Notes)"
+        elif app == "tasks":
+            await execute_pg_query("DELETE FROM user_sync_tasks WHERE user_id = $1", user_id)
+            await execute_pg_query("DELETE FROM user_sync_task_projects WHERE user_id = $1", user_id)
+            deleted_info["app"] = "Công việc (Tasks)"
+        elif app == "docs":
+            await execute_pg_query("DELETE FROM user_sync_docs WHERE user_id = $1", user_id)
+            deleted_info["app"] = "Tài liệu (Docs)"
+        elif app == "mindmap":
+            await execute_pg_query("DELETE FROM user_sync_mindmap_projects WHERE user_id = $1", user_id)
+            deleted_info["app"] = "Sơ đồ tư duy (Mindmap)"
+        elif app == "table":
+            await execute_pg_query("DELETE FROM user_sync_table_projects WHERE user_id = $1", user_id)
+            deleted_info["app"] = "Bảng tính (Table)"
+        elif app == "calendar":
+            await execute_pg_query("DELETE FROM user_sync_calendar_events WHERE user_id = $1", user_id)
+            deleted_info["app"] = "Lịch biểu (Calendar)"
+        elif app == "countday":
+            await execute_pg_query("DELETE FROM user_sync_countday_events WHERE user_id = $1", user_id)
+            deleted_info["app"] = "Đếm ngày (Countday)"
+        elif app == "chat":
+            if username:
+                await execute_pg_query(
+                    "DELETE FROM messages WHERE LOWER(sender_id) = LOWER($1) OR LOWER(recipient_id) = LOWER($1)",
+                    username
+                )
+            r2_res = delete_user_folder_files(username, "chat")
+            deleted_info["app"] = "Tin nhắn & Media Chat"
+            deleted_info["files_cleaned"] = r2_res
+        elif app == "uploads":
+            r2_res = delete_user_folder_files(username, "uploads")
+            deleted_info["app"] = "Tệp tải lên (Uploads)"
+            deleted_info["files_cleaned"] = r2_res
+
+        return {
+            "status": "success",
+            "message": f"Đã xóa sạch dữ liệu ứng dụng {deleted_info.get('app', app)} thành công!",
+            "details": deleted_info
+        }
+    except Exception as e:
+        print(f"[APP DATA PURGE ERROR] Failed to delete {app} for user {user_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Không thể xóa dữ liệu {app}: {str(e)}")
 
 
 @router.post("/profile")

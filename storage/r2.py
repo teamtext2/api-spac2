@@ -268,6 +268,63 @@ def delete_user_r2_and_local_files(username: str, avatar_url: str = "") -> dict:
     return {"deleted_r2": deleted_r2, "deleted_local": deleted_local}
 
 
+def delete_user_folder_files(username: str, folder: str) -> dict:
+    """
+    Delete all files belonging to a user in a specific folder category (avatar, chat, uploads)
+    from Cloudflare R2 and local disk storage.
+    """
+    deleted_r2 = 0
+    deleted_local = 0
+    clean_username = (username or "").strip().lower()
+    clean_folder = (folder or "").strip().lower()
+
+    if not clean_username or clean_folder not in ("avatar", "chat", "uploads"):
+        return {"deleted_r2": 0, "deleted_local": 0}
+
+    # 1. Cloudflare R2 Cleanup
+    if r2_client and R2_BUCKET_NAME:
+        prefix = f"{clean_folder}/{clean_username}_"
+        try:
+            paginator = r2_client.get_paginator("list_objects_v2")
+            for page in paginator.paginate(Bucket=R2_BUCKET_NAME, Prefix=prefix):
+                contents = page.get("Contents", [])
+                if contents:
+                    delete_keys = [{"Key": obj["Key"]} for obj in contents if "Key" in obj]
+                    if delete_keys:
+                        r2_client.delete_objects(
+                            Bucket=R2_BUCKET_NAME,
+                            Delete={"Objects": delete_keys}
+                        )
+                        deleted_r2 += len(delete_keys)
+                        print(f"[R2 CLEANUP] Purged {len(delete_keys)} objects in '{prefix}' for user @{clean_username}")
+        except Exception as e:
+            print(f"[R2 CLEANUP] Error deleting prefix '{prefix}': {e}")
+
+    # 2. Local Fallback Directory Cleanup
+    dir_map = {
+        "avatar": LOCAL_AVATARS_DIR,
+        "chat": LOCAL_CHAT_DIR,
+        "uploads": LOCAL_UPLOADS_DIR
+    }
+    dir_path = dir_map.get(clean_folder)
+    if dir_path and os.path.exists(dir_path):
+        try:
+            for fname in os.listdir(dir_path):
+                if fname.lower().startswith(f"{clean_username}_"):
+                    fpath = os.path.join(dir_path, fname)
+                    if os.path.isfile(fpath):
+                        try:
+                            os.remove(fpath)
+                            deleted_local += 1
+                            print(f"[LOCAL CLEANUP] Removed {fpath}")
+                        except Exception as fe:
+                            print(f"[LOCAL CLEANUP] Failed to remove {fpath}: {fe}")
+        except Exception as e:
+            print(f"[LOCAL CLEANUP] Error scanning {dir_path}: {e}")
+
+    return {"deleted_r2": deleted_r2, "deleted_local": deleted_local}
+
+
 def upload_file_to_r2(key: str, file_bytes: bytes, content_type: str) -> str:
     """Upload a generic file to R2 and return its CDN URL."""
     r2_client.put_object(

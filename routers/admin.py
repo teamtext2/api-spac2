@@ -305,13 +305,9 @@ async def api_admin_stats(admin: dict = Depends(require_hero_admin)):
         user_cnt = await execute_pg_query("SELECT COUNT(*) AS count FROM users")
         total_users = int(user_cnt[0]["count"]) if user_cnt else 0
 
-        msg_cnt = await execute_pg_query("SELECT COUNT(*) AS count FROM messages")
-        total_messages = int(msg_cnt[0]["count"]) if msg_cnt else 0
-
         data = {
             "total_users": total_users,
             "online_users": len(active_connections),
-            "total_messages": total_messages,
             "r2_connected": r2_client is not None,
             "system_status": "healthy"
         }
@@ -322,7 +318,6 @@ async def api_admin_stats(admin: dict = Depends(require_hero_admin)):
         return {
             "total_users": 0,
             "online_users": len(active_connections),
-            "total_messages": 0,
             "r2_connected": r2_client is not None,
             "system_status": "error",
             "error": str(e)
