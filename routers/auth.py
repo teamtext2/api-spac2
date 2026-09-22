@@ -24,6 +24,10 @@ class RegisterRequest(BaseModel):
     username: Optional[str] = None
 
 
+class CheckEmailRequest(BaseModel):
+    email: str
+
+
 class LoginRequest(BaseModel):
     email: str
     password: str
@@ -33,6 +37,42 @@ class ChangePasswordRequest(BaseModel):
     current_password: Optional[str] = None
     new_password: str
     confirm_password: Optional[str] = None
+
+
+# --- Anti-Brute Force In-Memory Rate Limiting ---
+_failed_logins: Dict[str, List[float]] = {}
+_lockouts: Dict[str, float] = {}
+
+
+def _check_rate_limit(key: str) -> Optional[int]:
+    """Check if key is currently locked out. Return remaining seconds if locked, else None."""
+    now = time.time()
+    locked_until = _lockouts.get(key, 0)
+    if now < locked_until:
+        return int(locked_until - now) + 1
+    elif key in _lockouts:
+        del _lockouts[key]
+    return None
+
+
+def _record_failed_attempt(key: str, max_attempts: int = 5, window_seconds: int = 60, lockout_seconds: int = 30) -> Optional[int]:
+    """Record a failed attempt. If threshold reached, lock out key for lockout_seconds."""
+    now = time.time()
+    attempts = _failed_logins.setdefault(key, [])
+    attempts = [t for t in attempts if now - t < window_seconds]
+    attempts.append(now)
+    _failed_logins[key] = attempts
+
+    if len(attempts) >= max_attempts:
+        _lockouts[key] = now + lockout_seconds
+        _failed_logins[key] = []
+        return lockout_seconds
+    return None
+
+
+def _clear_failed_attempts(key: str):
+    _failed_logins.pop(key, None)
+    _lockouts.pop(key, None)
 
 
 def _set_auth_cookies(response: Response, token: str, user_data: Dict[str, Any]):
@@ -63,6 +103,54 @@ def _clear_auth_cookies(response: Response):
     """Clear authentication cookies on logout."""
     response.delete_cookie(key="auth_token", path="/")
     response.delete_cookie(key="user-profile", path="/")
+
+
+@router.post("/check-email")
+async def api_check_email(req: CheckEmailRequest, request: Request):
+    """
+    Progressive Step-1 verification:
+    Verify if email or username exists, returns public greeting profile info for 2-step login.
+    """
+    client_ip = request.client.host if request.client else "unknown"
+    lockout_sec = _check_rate_limit(f"check_{client_ip}")
+    if lockout_sec:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Too many attempts. Please wait {lockout_sec}s before trying again.",
+            headers={"Retry-After": str(lockout_sec)}
+        )
+
+    ident = (req.email or "").strip().lower()
+    if not ident:
+        raise HTTPException(status_code=400, detail="Email or username is required.")
+
+    users = await execute_pg_query(
+        """
+        SELECT id, user_id, username, name, email, avatar, status 
+        FROM users 
+        WHERE LOWER(email) = $1 OR LOWER(username) = $1
+        LIMIT 1
+        """,
+        ident
+    )
+
+    if not users:
+        return {
+            "status": "success",
+            "exists": False,
+            "message": "No account found with this email or username."
+        }
+
+    u = users[0]
+    display_name = u.get("name") or u.get("username") or "User"
+    return {
+        "status": "success",
+        "exists": True,
+        "name": display_name,
+        "username": u.get("username") or "",
+        "email": u.get("email") or "",
+        "avatar": u.get("avatar") or DEFAULT_AVATAR_URL
+    }
 
 
 @router.post("/register")
@@ -157,10 +245,20 @@ async def register(req: RegisterRequest, response: Response):
 
 
 @router.post("/login")
-async def login(req: LoginRequest, response: Response):
-    """Sign in with email/username and password."""
+async def login(req: LoginRequest, request: Request, response: Response):
+    """Sign in with email/username and password with anti-brute force rate limiting and cooldown."""
+    client_ip = request.client.host if request.client else "unknown"
     ident = (req.email or "").strip().lower()
     password = req.password or ""
+
+    rate_key = f"{client_ip}_{ident}"
+    lockout_sec = _check_rate_limit(rate_key) or _check_rate_limit(client_ip)
+    if lockout_sec:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Too many failed login attempts. Please wait {lockout_sec}s before trying again.",
+            headers={"Retry-After": str(lockout_sec)}
+        )
 
     if not ident:
         raise HTTPException(status_code=400, detail="Email or username is required.")
@@ -172,19 +270,37 @@ async def login(req: LoginRequest, response: Response):
         """
         SELECT id, user_id, username, name, email, password_hash, avatar, bio, status 
         FROM users 
-        WHERE email = $1 OR username = $2
+        WHERE LOWER(email) = $1 OR LOWER(username) = $1
         """,
-        ident, ident
+        ident
     )
 
     if not users:
+        lock = _record_failed_attempt(rate_key) or _record_failed_attempt(client_ip)
+        if lock:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Too many failed attempts. Security cooldown active: {lock}s.",
+                headers={"Retry-After": str(lock)}
+            )
         raise HTTPException(status_code=401, detail="Invalid email/username or password.")
 
     user = users[0]
     stored_hash = user.get("password_hash")
 
     if not stored_hash or not verify_password(password, stored_hash):
+        lock = _record_failed_attempt(rate_key) or _record_failed_attempt(client_ip)
+        if lock:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Too many failed attempts. Security cooldown active: {lock}s.",
+                headers={"Retry-After": str(lock)}
+            )
         raise HTTPException(status_code=401, detail="Invalid email/username or password.")
+
+    # Success: Clear any failed attempts
+    _clear_failed_attempts(rate_key)
+    _clear_failed_attempts(client_ip)
 
     db_id = user["id"]
     user_id = user.get("user_id") or (10000 + db_id)

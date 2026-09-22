@@ -86,10 +86,10 @@ async def api_get_user_storage(
         pass
     apps_list.append({
         "app_key": "notes",
-        "name": "Ghi chú (Notes)",
+        "name": "Notes",
         "icon": "ph-note",
         "count": notes_cnt,
-        "count_label": f"{notes_cnt} ghi chú",
+        "count_label": f"{notes_cnt} notes",
         "bytes": notes_bytes,
         "formatted": format_bytes(notes_bytes)
     })
@@ -114,10 +114,10 @@ async def api_get_user_storage(
         pass
     apps_list.append({
         "app_key": "tasks",
-        "name": "Công việc (Tasks)",
+        "name": "Tasks & Projects",
         "icon": "ph-check-square",
         "count": tasks_cnt,
-        "count_label": f"{tasks_cnt} mục",
+        "count_label": f"{tasks_cnt} items",
         "bytes": tasks_bytes,
         "formatted": format_bytes(tasks_bytes)
     })
@@ -137,10 +137,10 @@ async def api_get_user_storage(
         pass
     apps_list.append({
         "app_key": "docs",
-        "name": "Tài liệu (Docs)",
+        "name": "Documents",
         "icon": "ph-file-text",
         "count": docs_cnt,
-        "count_label": f"{docs_cnt} tài liệu",
+        "count_label": f"{docs_cnt} docs",
         "bytes": docs_bytes,
         "formatted": format_bytes(docs_bytes)
     })
@@ -160,10 +160,10 @@ async def api_get_user_storage(
         pass
     apps_list.append({
         "app_key": "mindmap",
-        "name": "Sơ đồ tư duy (Mindmap)",
+        "name": "Mindmaps",
         "icon": "ph-tree-structure",
         "count": mm_cnt,
-        "count_label": f"{mm_cnt} sơ đồ",
+        "count_label": f"{mm_cnt} maps",
         "bytes": mm_bytes,
         "formatted": format_bytes(mm_bytes)
     })
@@ -183,10 +183,10 @@ async def api_get_user_storage(
         pass
     apps_list.append({
         "app_key": "table",
-        "name": "Bảng tính (Table)",
+        "name": "Spreadsheets",
         "icon": "ph-table",
         "count": tbl_cnt,
-        "count_label": f"{tbl_cnt} bảng",
+        "count_label": f"{tbl_cnt} sheets",
         "bytes": tbl_bytes,
         "formatted": format_bytes(tbl_bytes)
     })
@@ -206,10 +206,10 @@ async def api_get_user_storage(
         pass
     apps_list.append({
         "app_key": "calendar",
-        "name": "Lịch biểu (Calendar)",
+        "name": "Calendar",
         "icon": "ph-calendar-blank",
         "count": cal_cnt,
-        "count_label": f"{cal_cnt} sự kiện",
+        "count_label": f"{cal_cnt} events",
         "bytes": cal_bytes,
         "formatted": format_bytes(cal_bytes)
     })
@@ -229,10 +229,10 @@ async def api_get_user_storage(
         pass
     apps_list.append({
         "app_key": "countday",
-        "name": "Đếm ngày (Countday)",
+        "name": "Countdowns",
         "icon": "ph-hourglass-medium",
         "count": cd_cnt,
-        "count_label": f"{cd_cnt} sự kiện",
+        "count_label": f"{cd_cnt} events",
         "bytes": cd_bytes,
         "formatted": format_bytes(cd_bytes)
     })
@@ -255,10 +255,10 @@ async def api_get_user_storage(
     total_chat_bytes = chat_msg_bytes + chat_file_bytes
     apps_list.append({
         "app_key": "chat",
-        "name": "Tin nhắn & Media Chat",
+        "name": "Chat Messages & Media",
         "icon": "ph-chats",
         "count": chat_msg_cnt,
-        "count_label": f"{chat_msg_cnt} tin nhắn & tệp",
+        "count_label": f"{chat_msg_cnt} messages & media",
         "bytes": total_chat_bytes,
         "formatted": format_bytes(total_chat_bytes)
     })
@@ -267,10 +267,10 @@ async def api_get_user_storage(
     uploads_bytes = int(breakdown_files.get("uploads_bytes") or 0)
     apps_list.append({
         "app_key": "uploads",
-        "name": "Tệp tải lên (Uploads)",
+        "name": "Uploaded Files",
         "icon": "ph-upload-simple",
         "count": 0,
-        "count_label": "Tệp lưu trữ",
+        "count_label": "Cloud files",
         "bytes": uploads_bytes,
         "formatted": format_bytes(uploads_bytes)
     })
@@ -299,33 +299,33 @@ async def api_delete_user_app_data(
 
     valid_apps = ["notes", "tasks", "docs", "mindmap", "table", "calendar", "countday", "chat", "uploads"]
     if app not in valid_apps:
-        raise HTTPException(status_code=400, detail="Mã ứng dụng không hợp lệ")
+        raise HTTPException(status_code=400, detail="Invalid application identifier")
 
     deleted_info = {}
 
     try:
         if app == "notes":
             await execute_pg_query("DELETE FROM user_sync_notes WHERE user_id = $1", user_id)
-            deleted_info["app"] = "Ghi chú (Notes)"
+            deleted_info["app"] = "Notes"
         elif app == "tasks":
             await execute_pg_query("DELETE FROM user_sync_tasks WHERE user_id = $1", user_id)
             await execute_pg_query("DELETE FROM user_sync_task_projects WHERE user_id = $1", user_id)
-            deleted_info["app"] = "Công việc (Tasks)"
+            deleted_info["app"] = "Tasks & Projects"
         elif app == "docs":
             await execute_pg_query("DELETE FROM user_sync_docs WHERE user_id = $1", user_id)
-            deleted_info["app"] = "Tài liệu (Docs)"
+            deleted_info["app"] = "Documents"
         elif app == "mindmap":
             await execute_pg_query("DELETE FROM user_sync_mindmap_projects WHERE user_id = $1", user_id)
-            deleted_info["app"] = "Sơ đồ tư duy (Mindmap)"
+            deleted_info["app"] = "Mindmaps"
         elif app == "table":
             await execute_pg_query("DELETE FROM user_sync_table_projects WHERE user_id = $1", user_id)
-            deleted_info["app"] = "Bảng tính (Table)"
+            deleted_info["app"] = "Spreadsheets"
         elif app == "calendar":
             await execute_pg_query("DELETE FROM user_sync_calendar_events WHERE user_id = $1", user_id)
-            deleted_info["app"] = "Lịch biểu (Calendar)"
+            deleted_info["app"] = "Calendar"
         elif app == "countday":
             await execute_pg_query("DELETE FROM user_sync_countday_events WHERE user_id = $1", user_id)
-            deleted_info["app"] = "Đếm ngày (Countday)"
+            deleted_info["app"] = "Countdowns"
         elif app == "chat":
             if username:
                 await execute_pg_query(
@@ -333,21 +333,21 @@ async def api_delete_user_app_data(
                     username
                 )
             r2_res = delete_user_folder_files(username, "chat")
-            deleted_info["app"] = "Tin nhắn & Media Chat"
+            deleted_info["app"] = "Chat Messages & Media"
             deleted_info["files_cleaned"] = r2_res
         elif app == "uploads":
             r2_res = delete_user_folder_files(username, "uploads")
-            deleted_info["app"] = "Tệp tải lên (Uploads)"
+            deleted_info["app"] = "Uploaded Files"
             deleted_info["files_cleaned"] = r2_res
 
         return {
             "status": "success",
-            "message": f"Đã xóa sạch dữ liệu ứng dụng {deleted_info.get('app', app)} thành công!",
+            "message": f"Successfully deleted all data for {deleted_info.get('app', app)} from Database and R2!",
             "details": deleted_info
         }
     except Exception as e:
         print(f"[APP DATA PURGE ERROR] Failed to delete {app} for user {user_id}: {e}")
-        raise HTTPException(status_code=500, detail=f"Không thể xóa dữ liệu {app}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to delete {app} data: {str(e)}")
 
 
 @router.post("/profile")
