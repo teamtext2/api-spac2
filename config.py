@@ -26,6 +26,7 @@ AWS_SECRET_ACCESS_KEY = os.environ.get("AWS_SECRET_ACCESS_KEY")
 R2_BUCKET_NAME = os.environ.get("R2_BUCKET_NAME", "spac2")
 R2_CDN_BASE = os.environ.get("R2_CDN_BASE", "https://cdn2.spac2.com").rstrip("/")
 R2_AVATAR_CDN_BASE = os.environ.get("R2_AVATAR_CDN_BASE", "https://cdn2.spac2.com").rstrip("/")
+DEFAULT_AVATAR_URL = os.environ.get("DEFAULT_AVATAR_URL", "https://cdn2.spac2.com/avatar/avatar.png")
 
 # --- VAPID (Push Notifications) ---
 VAPID_PUBLIC_KEY = os.getenv(

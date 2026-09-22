@@ -20,6 +20,7 @@ from websocket.manager import (
 from auth.deps import verify_google_token
 from services.push import send_web_push
 from services.call_push import send_call_push
+from config import DEFAULT_AVATAR_URL
 
 
 async def websocket_endpoint(websocket: WebSocket, username: str, token: str = Query(None)):
@@ -245,7 +246,7 @@ async def _route_group_message(websocket, username, email, sender, recipient, te
                         "senderName": sender_name,
                         "recipient": recipient,
                         "text": text,
-                        "senderAvatar": data.get("senderAvatar", ""),
+                        "senderAvatar": data.get("senderAvatar") or DEFAULT_AVATAR_URL,
                         "senderEmail": data.get("senderEmail", ""),
                         "groupName": group_name,
                         "groupAvatar": group_avatar,
@@ -268,7 +269,7 @@ async def _route_group_message(websocket, username, email, sender, recipient, te
                 title=push_title,
                 body=text,
                 sender=recipient,
-                avatar=data.get("senderAvatar", "")
+                avatar=data.get("senderAvatar") or DEFAULT_AVATAR_URL
             ))
 
     await execute_pg_query("UPDATE messages SET delivered = TRUE WHERE id = $1", msg_uuid)
@@ -304,7 +305,7 @@ async def _route_direct_message(websocket, username, sender, recipient, text, da
                     "sender": sender,
                     "recipient": recipient,
                     "text": text,
-                    "senderAvatar": data.get("senderAvatar", ""),
+                    "senderAvatar": data.get("senderAvatar") or DEFAULT_AVATAR_URL,
                     "senderEmail": data.get("senderEmail", ""),
                     "timestamp": timestamp,
                     "replyTo": data.get("replyTo"),
@@ -354,7 +355,7 @@ async def _route_direct_message(websocket, username, sender, recipient, text, da
             title=data.get("senderName") or sender.upper(),
             body=text,
             sender=sender,
-            avatar=data.get("senderAvatar", "")
+            avatar=data.get("senderAvatar") or DEFAULT_AVATAR_URL
         ))
 
     # Broadcast to all OTHER connections of the sender (multi-tab/device sync)
@@ -368,7 +369,7 @@ async def _route_direct_message(websocket, username, sender, recipient, text, da
                         "sender": sender,
                         "recipient": recipient,
                         "text": text,
-                        "senderAvatar": data.get("senderAvatar", ""),
+                        "senderAvatar": data.get("senderAvatar") or DEFAULT_AVATAR_URL,
                         "senderEmail": data.get("senderEmail", ""),
                         "timestamp": timestamp,
                         "replyTo": data.get("replyTo"),
@@ -569,7 +570,7 @@ async def _handle_call_signal(websocket, username, data, data_str, msg_type):
             asyncio.create_task(send_call_push(
                 recipient_username=recipient,
                 sender=username,
-                avatar=data.get("senderAvatar", "") or data.get("callerAvatar", ""),
+                avatar=data.get("senderAvatar", "") or data.get("callerAvatar", "") or DEFAULT_AVATAR_URL,
                 is_video=is_video
             ))
             

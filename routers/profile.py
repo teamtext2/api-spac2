@@ -5,6 +5,7 @@ from auth.deps import get_auth_token, verify_google_token, create_spac2_token, d
 from models.schemas import UserProfile
 from services.user_service import save_profile, get_profile, get_email_by_username
 from websocket.manager import active_connections
+from config import DEFAULT_AVATAR_URL
 
 router = APIRouter(prefix="/api", tags=["profile"])
 
@@ -147,6 +148,9 @@ async def api_search_user(q: str, response: Response):
             u["user_id"] = uid
             uname = u.get("username", "").strip().lower()
             u["status"] = "online" if uname in active_connections else "offline"
+            avatar_val = u.get("avatar") or DEFAULT_AVATAR_URL
+            u["avatar"] = avatar_val
+            u["avatar_url"] = avatar_val
         return users
     except Exception as e:
         print(f"Error searching users: {e}")

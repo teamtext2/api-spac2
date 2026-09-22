@@ -9,6 +9,7 @@ from auth.deps import get_auth_token, verify_google_token
 from models.schemas import MarkDeliveredRequest, MarkReadRequest, DeleteMessagesRequest, DeleteConversationRequest
 from websocket.manager import get_email_by_username, get_username_by_email
 from storage.r2 import r2_client, R2_BUCKET_NAME
+from config import DEFAULT_AVATAR_URL
 
 router = APIRouter(prefix="/api", tags=["messages"])
 
@@ -302,7 +303,7 @@ async def api_get_conversations(username: str, token: str = Depends(get_auth_tok
                     "username": peer_uname,
                     "email": peer_email,
                     "name": uinfo.get("name") or peer_uname.upper(),
-                    "avatar": uinfo.get("avatar") or "https://spac2.com/favicon.ico",
+                    "avatar": uinfo.get("avatar") or DEFAULT_AVATAR_URL,
                     "status": "online" if is_online else (uinfo.get("status") or "offline"),
                     "last_seen": uinfo.get("last_seen"),
                     "bio": uinfo.get("bio") or "Hey there! I am using Spac2 Chat.",
@@ -439,7 +440,7 @@ async def api_sync_messages(username: str, since: float = 0.0, token: str = Depe
                 "read_at": read_ts,
                 "reactions": reactions_dict,
                 "delivered": True if msg["recipient"] == username else msg["delivered"],
-                "senderAvatar": sender_avatars.get(sender_id, "https://spac2.com/favicon.ico"),
+                "senderAvatar": sender_avatars.get(sender_id) or DEFAULT_AVATAR_URL,
                 "update_id": msg.get("update_id", 0),
                 "replyTo": msg.get("reply_to"),
                 "forwardedFrom": msg.get("forwarded_from"),
@@ -567,7 +568,7 @@ async def api_get_messages_history(
                 "read_at": read_ts,
                 "reactions": reactions_dict,
                 "delivered": True if msg["recipient"] == username else msg["delivered"],
-                "senderAvatar": sender_avatars.get(msg["sender"].strip().lower(), "https://spac2.com/favicon.ico"),
+                "senderAvatar": sender_avatars.get(msg["sender"].strip().lower()) or DEFAULT_AVATAR_URL,
                 "replyTo": msg.get("reply_to"),
                 "forwardedFrom": msg.get("forwarded_from"),
                 "forwarded": True if msg.get("forwarded_from") else False

@@ -11,6 +11,7 @@ from database.postgres import execute_pg_query
 from auth.deps import get_auth_token, create_spac2_token, decode_spac2_token, create_text2_token, decode_text2_token
 from auth.security import hash_password, verify_password, validate_email_format, validate_password_strength
 from services.user_service import get_profile
+from config import DEFAULT_AVATAR_URL
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
@@ -137,8 +138,8 @@ async def register(req: RegisterRequest, response: Response):
         "username": user["username"],
         "name": user["name"] or user["username"],
         "email": user["email"],
-        "avatar": user.get("avatar") or "",
-        "avatar_url": user.get("avatar") or "",
+        "avatar": user.get("avatar") or DEFAULT_AVATAR_URL,
+        "avatar_url": user.get("avatar") or DEFAULT_AVATAR_URL,
         "bio": user.get("bio") or "",
         "status": user.get("status") or "online"
     }
@@ -198,8 +199,8 @@ async def login(req: LoginRequest, response: Response):
         "username": user["username"],
         "name": user["name"] or user["username"],
         "email": user["email"],
-        "avatar": user.get("avatar") or "",
-        "avatar_url": user.get("avatar") or "",
+        "avatar": user.get("avatar") or DEFAULT_AVATAR_URL,
+        "avatar_url": user.get("avatar") or DEFAULT_AVATAR_URL,
         "bio": user.get("bio") or "",
         "status": user.get("status") or "online"
     }

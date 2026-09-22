@@ -1,6 +1,6 @@
 import asyncio
 import json
-from config import VAPID_PRIVATE_KEY, VAPID_CLAIMS
+from config import VAPID_PRIVATE_KEY, VAPID_CLAIMS, DEFAULT_AVATAR_URL
 from database.postgres import execute_pg_query
 
 
@@ -162,9 +162,9 @@ async def send_web_push(recipient_username: str, title: str, body: str, sender: 
                 avatar = "https://spac2.com/" + avatar_str
 
     # iOS 16.4+: icon must be a PNG/JPG URL (no .ico, no .svg)
-    # Use apple-touch-icon as fallback for maximum iOS compatibility
+    # Use DEFAULT_AVATAR_URL as fallback for maximum compatibility
     safe_icon = avatar if (avatar and any(avatar.lower().endswith(ext) for ext in [".png", ".jpg", ".jpeg", ".webp"])) \
-        else "/chat/apple-touch-icon.png"
+        else DEFAULT_AVATAR_URL
 
     # Send FULL payload — no SW fetch needed.
     # Android Doze mode can block SW fetch calls, so we include all display

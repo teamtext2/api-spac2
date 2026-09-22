@@ -6,7 +6,7 @@ from fastapi import HTTPException
 from database.postgres import execute_pg_query
 from storage.r2 import process_and_upload_avatar, delete_r2_object
 from websocket.manager import active_connections
-from config import LOCAL_AVATARS_DIR, R2_CDN_BASE, R2_AVATAR_CDN_BASE
+from config import LOCAL_AVATARS_DIR, R2_CDN_BASE, R2_AVATAR_CDN_BASE, DEFAULT_AVATAR_URL
 import os
 
 
@@ -108,7 +108,8 @@ async def _merge_login_profile(existing_users, profile_data, email, base_url):
         "bio": db_bio,
         "email": email,
         "status": db_status,
-        "avatar": db_avatar,
+        "avatar": db_avatar or DEFAULT_AVATAR_URL,
+        "avatar_url": db_avatar or DEFAULT_AVATAR_URL,
         "google_id": db_google_id
     }
 
@@ -215,8 +216,8 @@ async def _upsert_profile(existing_users, profile_data, email, base_url):
         "bio": bio,
         "email": email,
         "status": status,
-        "avatar": avatar_url,
-        "avatar_url": avatar_url,
+        "avatar": avatar_url or DEFAULT_AVATAR_URL,
+        "avatar_url": avatar_url or DEFAULT_AVATAR_URL,
         "google_id": google_id
     }
 
@@ -246,7 +247,7 @@ async def get_profile(identifier: str):
     if users:
         u = users[0]
         uid = u.get("user_id") or (10000 + u["id"])
-        avatar_val = u["avatar"] or ""
+        avatar_val = u["avatar"] or DEFAULT_AVATAR_URL
         return {
             "id": uid,
             "user_id": uid,

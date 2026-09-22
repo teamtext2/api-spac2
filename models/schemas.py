@@ -10,8 +10,8 @@ class UserProfile(BaseModel):
     bio: str = ""
     email: str = ""
     status: str = "online"
-    avatar: str = ""
-    avatar_url: Optional[str] = ""
+    avatar: str = "https://cdn2.spac2.com/avatar/avatar.png"
+    avatar_url: Optional[str] = "https://cdn2.spac2.com/avatar/avatar.png"
     google_id: str = ""
     is_login: bool = False
 

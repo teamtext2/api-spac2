@@ -4,6 +4,7 @@ from database.postgres import execute_pg_query
 from auth.deps import get_auth_token, verify_google_token
 from models.schemas import FriendRequest
 from websocket.manager import active_connections, get_email_by_username
+from config import DEFAULT_AVATAR_URL
 
 router = APIRouter(prefix="/api", tags=["friends"])
 
@@ -27,7 +28,7 @@ async def api_add_friend(req: FriendRequest, token: str = Depends(get_auth_token
 
     uid = user_res[0]["id"]
     sender_name = user_res[0].get("name") or username
-    sender_avatar = user_res[0].get("avatar") or "https://spac2.com/favicon.ico"
+    sender_avatar = user_res[0].get("avatar") or DEFAULT_AVATAR_URL
     fid = friend_res[0]["id"]
 
     id1, id2 = min(uid, fid), max(uid, fid)
@@ -97,6 +98,9 @@ async def api_get_friends(username: str, token: str = Depends(get_auth_token)):
         for friend in friends:
             friend_username = friend.get("username", "").strip().lower()
             friend["status"] = "online" if friend_username in active_connections else "offline"
+            fav = friend.get("avatar") or DEFAULT_AVATAR_URL
+            friend["avatar"] = fav
+            friend["avatar_url"] = fav
         return friends
     except Exception as e:
         print(f"Error getting friends list: {e}")

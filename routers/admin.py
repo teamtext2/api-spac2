@@ -20,7 +20,7 @@ from storage.r2 import (
 from websocket.manager import active_connections
 from auth.deps import get_auth_token, _b64_url_encode, _b64_url_decode
 from auth.security import hash_password, validate_password_strength
-from config import SPAC2_JWT_SECRET
+from config import SPAC2_JWT_SECRET, DEFAULT_AVATAR_URL
 
 # --- HERO ADMIN CONFIGURATION ---
 HERO_ADMIN_USERNAME = os.getenv("HERO_ADMIN_USERNAME", "091205015565")
@@ -416,7 +416,7 @@ async def api_admin_get_users(
         else:
             created_at_str = str(created_at_val or "")
 
-        avatar_url = u.get("avatar") or ""
+        avatar_url = u.get("avatar") or DEFAULT_AVATAR_URL
 
         formatted_users.append({
             "id": uid,
@@ -486,7 +486,7 @@ async def api_admin_get_single_user(identifier: str, admin: dict = Depends(requi
     u = rows[0]
     uid = u.get("user_id") or (10000 + u["id"])
     uname = u.get("username") or ""
-    avatar_url = u.get("avatar") or ""
+    avatar_url = u.get("avatar") or DEFAULT_AVATAR_URL
 
     # Calculate complete cloud storage breakdown
     storage_data = await get_user_total_cloud_storage(uid, uname, avatar_url)
