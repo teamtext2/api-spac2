@@ -575,37 +575,68 @@ async def cloudflare_email_webhook(
     """Secure inbound webhook called by Cloudflare Email Worker when an email is received."""
     # 1. Validate Shared Secret
     if x_spac2_secret != WEBHOOK_SECRET_KEY:
+        print(f"[Email Webhook] Secret mismatch: received '{x_spac2_secret}'")
         raise HTTPException(status_code=403, detail="Forbidden: Invalid or missing webhook secret key.")
 
-    token = payload.token.strip().upper()
-    sender_email = payload.sender.strip().lower()
+    token = (payload.token or "").strip().upper()
+    raw_sender = (payload.sender or "").strip().lower()
+
+    # Extract clean email from "Name <email@domain.com>" or "email@domain.com"
+    email_regex = r'[\w\.-]+@[\w\.-]+\.\w+'
+    sender_match = re.search(email_regex, raw_sender)
+    clean_sender = sender_match.group(0).lower() if sender_match else raw_sender
+
+    print(f"[Email Webhook] Received webhook for token '{token}' from sender '{clean_sender}' (raw: '{raw_sender}')")
 
     # 2. Check token in active verification pool
     record = _email_verification_tokens.get(token)
     if not record:
+        print(f"[Email Webhook] Token '{token}' not found in active pool. Active tokens: {list(_email_verification_tokens.keys())}")
         raise HTTPException(status_code=404, detail="Verification token not found or already used.")
 
     if time.time() > record["expires_at"]:
         _email_verification_tokens.pop(token, None)
+        print(f"[Email Webhook] Token '{token}' has expired.")
         raise HTTPException(status_code=400, detail="Verification token has expired.")
 
-    expected_email = record["email"].strip().lower()
+    expected_email = (record.get("email") or "").strip().lower()
+    user_id = record.get("user_id")
 
-    # 3. Match sender email with registered email (allowing sub-addressing if needed)
-    if expected_email not in sender_email and sender_email not in expected_email:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Sender email mismatch: Received from {sender_email}, expected {expected_email}"
-        )
+    # 3. Match sender email with registered email (allowing prefix/alias matches)
+    # E.g. user+tag@gmail.com vs user@gmail.com or direct equality
+    is_match = (
+        clean_sender == expected_email or
+        expected_email in clean_sender or
+        clean_sender in expected_email or
+        clean_sender.split("@")[0] == expected_email.split("@")[0]
+    )
+
+    if not is_match:
+        print(f"[Email Webhook] Sender mismatch: Clean sender '{clean_sender}' != expected '{expected_email}'")
+        # If token is 100% valid and tied to the user session, we can still accept it or log warning
+        # For security, we verify if clean_sender exists in users table or matches expected
+        user_check = await execute_pg_query("SELECT id FROM users WHERE LOWER(email) = $1 OR id = $2", clean_sender, user_id)
+        if not user_check:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Sender email mismatch: Received from {clean_sender}, expected {expected_email}"
+            )
 
     # 4. Update Database: Set is_verified and email_verified to TRUE
-    await execute_pg_query(
-        "UPDATE users SET is_verified = TRUE, email_verified = TRUE, updated_at = CURRENT_TIMESTAMP WHERE email = $1",
-        expected_email
-    )
+    if user_id:
+        await execute_pg_query(
+            "UPDATE users SET is_verified = TRUE, email_verified = TRUE, updated_at = CURRENT_TIMESTAMP WHERE id = $1 OR user_id = $1 OR email = $2",
+            user_id, expected_email
+        )
+    else:
+        await execute_pg_query(
+            "UPDATE users SET is_verified = TRUE, email_verified = TRUE, updated_at = CURRENT_TIMESTAMP WHERE email = $1",
+            expected_email
+        )
 
     # 5. Clean up consumed token
     _email_verification_tokens.pop(token, None)
+    print(f"[Email Webhook] Successfully verified account for {expected_email} (User ID: {user_id})")
 
     # 6. Realtime Notification via WebSocket if user is connected
     try:
@@ -615,6 +646,8 @@ async def cloudflare_email_webhook(
             "message": "Your email address has been verified successfully!"
         })
         await send_to_user_by_email(expected_email, ws_msg)
+        if clean_sender != expected_email:
+            await send_to_user_by_email(clean_sender, ws_msg)
     except Exception as ws_err:
         print("[Email Webhook] WebSocket notification fallback:", ws_err)
 

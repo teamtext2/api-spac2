@@ -10,11 +10,15 @@
 
 export default {
   async email(message, env, ctx) {
-    const sender = (message.from || "").toLowerCase().trim();
+    let rawSender = (message.from || "").toLowerCase().trim();
     const recipient = (message.to || "").toLowerCase().trim();
     const subject = message.headers.get("subject") || "";
 
-    console.log(`[Email Verifier] Inbound email from: ${sender} to: ${recipient}, subject: "${subject}"`);
+    // Extract clean email from "Name <email@domain.com>" or "<email@domain.com>"
+    const emailMatch = rawSender.match(/<([^>]+)>/) || rawSender.match(/([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)/);
+    const sender = emailMatch ? emailMatch[1].toLowerCase().trim() : rawSender;
+
+    console.log(`[Email Verifier] Inbound email from: ${sender} (raw: ${rawSender}) to: ${recipient}, subject: "${subject}"`);
 
     // 1. Read the raw message content (stream)
     let rawContent = "";
