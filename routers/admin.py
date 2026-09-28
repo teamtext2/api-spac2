@@ -359,7 +359,7 @@ async def api_admin_get_users(
 
             users = await execute_pg_query(
                 f"""
-                SELECT id, user_id, username, name, email, bio, status, avatar, google_id, last_seen, created_at, updated_at
+                SELECT id, user_id, username, name, email, bio, status, avatar, google_id, last_seen, created_at, updated_at, is_verified, email_verified
                 FROM users
                 WHERE user_id = $1 OR id = $1 OR username ILIKE $2 OR email ILIKE $2 OR name ILIKE $2
                 ORDER BY {order_clause}
@@ -376,7 +376,7 @@ async def api_admin_get_users(
 
             users = await execute_pg_query(
                 f"""
-                SELECT id, user_id, username, name, email, bio, status, avatar, google_id, last_seen, created_at, updated_at
+                SELECT id, user_id, username, name, email, bio, status, avatar, google_id, last_seen, created_at, updated_at, is_verified, email_verified
                 FROM users
                 WHERE username ILIKE $1 OR email ILIKE $1 OR name ILIKE $1
                 ORDER BY {order_clause}
@@ -390,7 +390,7 @@ async def api_admin_get_users(
 
         users = await execute_pg_query(
             f"""
-            SELECT id, user_id, username, name, email, bio, status, avatar, google_id, last_seen, created_at, updated_at
+            SELECT id, user_id, username, name, email, bio, status, avatar, google_id, last_seen, created_at, updated_at, is_verified, email_verified
             FROM users
             ORDER BY {order_clause}
             LIMIT $1 OFFSET $2
@@ -404,6 +404,7 @@ async def api_admin_get_users(
         uid = u.get("user_id") or (10000 + u["id"])
         uname = (u.get("username") or "").strip()
         is_online = uname.lower() in active_connections if uname else False
+        verified = bool(u.get("is_verified") or u.get("email_verified"))
 
         created_at_val = u.get("created_at")
         if hasattr(created_at_val, "isoformat"):
@@ -421,6 +422,8 @@ async def api_admin_get_users(
             "name": u.get("name") or "",
             "email": u.get("email") or "",
             "bio": u.get("bio") or "",
+            "is_verified": verified,
+            "email_verified": verified,
             "status": "online" if is_online else (u.get("status") or "offline"),
             "is_online": is_online,
             "avatar": avatar_url,
@@ -775,4 +778,53 @@ async def api_admin_delete_user(
             "email": email
         },
         "storage_cleaned": storage_result
+    }
+
+
+class AdminVerifyRequest(BaseModel):
+    is_verified: bool = True
+
+
+@router.post("/users/{identifier}/verify")
+async def api_admin_verify_user(
+    identifier: str,
+    req: Optional[AdminVerifyRequest] = None,
+    admin: dict = Depends(require_hero_admin)
+):
+    """Admin tool: Manually grant or revoke verified status for any user without sending email."""
+    ident = str(identifier).strip()
+    users = []
+    if ident.isdigit():
+        users = await execute_pg_query("SELECT id, user_id, username, email FROM users WHERE user_id = $1 OR id = $1", int(ident))
+    elif "@" in ident:
+        users = await execute_pg_query("SELECT id, user_id, username, email FROM users WHERE LOWER(email) = LOWER($1)", ident)
+    else:
+        users = await execute_pg_query("SELECT id, user_id, username, email FROM users WHERE LOWER(username) = LOWER($1)", ident)
+
+    if not users:
+        raise HTTPException(status_code=404, detail="Không tìm thấy người dùng này")
+
+    user = users[0]
+    db_id = user["id"]
+    user_id = user.get("user_id") or (10000 + db_id)
+    username = user.get("username") or ""
+    email = user.get("email") or ""
+
+    verified = req.is_verified if req is not None else True
+
+    await execute_pg_query(
+        "UPDATE users SET is_verified = $1, email_verified = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2 OR user_id = $3",
+        verified, db_id, user_id
+    )
+
+    action_text = "cấp tích xác minh (Verified)" if verified else "hủy trạng thái xác minh"
+    print(f"[HERO ADMIN] Manual verify: Admin {admin.get('sub')} has {action_text} for @{username} (ID: {user_id})")
+
+    return {
+        "status": "success",
+        "message": f"Đã {action_text} cho tài khoản @{username} (ID: #{user_id}) thành công!",
+        "user_id": user_id,
+        "username": username,
+        "email": email,
+        "is_verified": verified
     }
