@@ -2,8 +2,9 @@ from __future__ import annotations
 import json
 import re
 import time
+import secrets
 import urllib.parse
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from pydantic import BaseModel
 from fastapi import APIRouter, HTTPException, Depends, Request, Response, Header
 
@@ -12,6 +13,7 @@ from auth.deps import get_auth_token, create_spac2_token, decode_spac2_token, cr
 from auth.security import hash_password, verify_password, validate_email_format, validate_password_strength
 from services.user_service import get_profile
 from config import DEFAULT_AVATAR_URL
+from websocket.manager import send_to_user_by_email
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
@@ -437,5 +439,188 @@ async def change_password(
     return {
         "status": "success",
         "message": "Đổi mật khẩu thành công! / Password changed successfully."
+    }
+
+
+# ==============================================================================
+# REVERSE EMAIL VERIFICATION (INBOUND PARSE VIA CLOUDFLARE EMAIL ROUTING)
+# Target Address: verify@spac2.com
+# ==============================================================================
+
+# In-memory temporary token cache (Key: "SPAC2-XXXXXX" -> { "user_id": int, "email": str, "expires_at": float })
+_email_verification_tokens: Dict[str, Dict[str, Any]] = {}
+WEBHOOK_SECRET_KEY = "spac2_super_secure_secret_2026"
+TARGET_VERIFY_EMAIL = "verify@spac2.com"
+
+
+class InitiateEmailVerifyResponse(BaseModel):
+    token: str
+    target_email: str
+    subject: str
+    body: str
+    mailto_link: str
+    expires_in_minutes: int
+
+
+class CloudflareEmailWebhookPayload(BaseModel):
+    sender: str
+    recipient: Optional[str] = "verify@spac2.com"
+    token: str
+    subject: Optional[str] = ""
+    received_at: Optional[str] = None
+
+
+@router.post("/email-verify/initiate", response_model=InitiateEmailVerifyResponse)
+async def initiate_email_verification(
+    token: Optional[str] = Depends(get_auth_token),
+    x_user_email: Optional[str] = Header(None),
+    x_user_id: Optional[str] = Header(None)
+):
+    """Generate a reverse email verification token & 1-click mailto link for current user."""
+    user_email = None
+    user_id = None
+
+    if token:
+        payload = decode_spac2_token(token)
+        if payload:
+            user_email = payload.get("email")
+            user_id = payload.get("user_id") or payload.get("id")
+
+    if not user_email:
+        for ident in [x_user_email, x_user_id]:
+            if ident and ident.strip():
+                p = await get_profile(ident.strip())
+                if p:
+                    user_email = p.get("email")
+                    user_id = p.get("id") or p.get("user_id")
+                    break
+
+    if not user_email:
+        raise HTTPException(status_code=401, detail="Unauthorized: No active user session found.")
+
+    user_email = user_email.strip().lower()
+
+    # Generate an easy-to-read 6-character hex token (e.g. SPAC2-7E9B1C)
+    hex_code = secrets.token_hex(3).upper()
+    token_str = f"SPAC2-{hex_code}"
+
+    # TTL: 20 minutes
+    _email_verification_tokens[token_str] = {
+        "user_id": user_id,
+        "email": user_email,
+        "expires_at": time.time() + (20 * 60)
+    }
+
+    subject = f"Verify Spac2 Account - {token_str}"
+    body = f"Spac2 Reverse Verification\nToken: {token_str}\n(Please click Send without changing the subject or body to verify your Spac2 account instantly)."
+    mailto_link = f"mailto:{TARGET_VERIFY_EMAIL}?subject={urllib.parse.quote(subject)}&body={urllib.parse.quote(body)}"
+
+    return {
+        "token": token_str,
+        "target_email": TARGET_VERIFY_EMAIL,
+        "subject": subject,
+        "body": body,
+        "mailto_link": mailto_link,
+        "expires_in_minutes": 20
+    }
+
+
+@router.get("/email-verify/status")
+async def check_email_verification_status(
+    token: Optional[str] = Depends(get_auth_token),
+    x_user_email: Optional[str] = Header(None),
+    x_user_id: Optional[str] = Header(None)
+):
+    """Check whether current authenticated user's email is verified."""
+    user_ident = None
+    if token:
+        payload = decode_spac2_token(token)
+        if payload:
+            user_ident = payload.get("email") or str(payload.get("user_id") or "")
+
+    if not user_ident:
+        for ident in [x_user_email, x_user_id]:
+            if ident and ident.strip():
+                user_ident = ident.strip()
+                break
+
+    if not user_ident:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    users = []
+    if str(user_ident).isdigit():
+        users = await execute_pg_query(
+            "SELECT is_verified, email_verified FROM users WHERE user_id = $1 OR id = $1",
+            int(user_ident)
+        )
+    else:
+        users = await execute_pg_query(
+            "SELECT is_verified, email_verified FROM users WHERE LOWER(email) = $1 OR LOWER(username) = $1",
+            str(user_ident).lower()
+        )
+
+    is_verified = False
+    if users:
+        u = users[0]
+        is_verified = bool(u.get("is_verified") or u.get("email_verified"))
+
+    return {"is_verified": is_verified}
+
+
+@router.post("/email-webhook")
+async def cloudflare_email_webhook(
+    payload: CloudflareEmailWebhookPayload,
+    x_spac2_secret: Optional[str] = Header(None, alias="X-Spac2-Secret")
+):
+    """Secure inbound webhook called by Cloudflare Email Worker when an email is received."""
+    # 1. Validate Shared Secret
+    if x_spac2_secret != WEBHOOK_SECRET_KEY:
+        raise HTTPException(status_code=403, detail="Forbidden: Invalid or missing webhook secret key.")
+
+    token = payload.token.strip().upper()
+    sender_email = payload.sender.strip().lower()
+
+    # 2. Check token in active verification pool
+    record = _email_verification_tokens.get(token)
+    if not record:
+        raise HTTPException(status_code=404, detail="Verification token not found or already used.")
+
+    if time.time() > record["expires_at"]:
+        _email_verification_tokens.pop(token, None)
+        raise HTTPException(status_code=400, detail="Verification token has expired.")
+
+    expected_email = record["email"].strip().lower()
+
+    # 3. Match sender email with registered email (allowing sub-addressing if needed)
+    if expected_email not in sender_email and sender_email not in expected_email:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Sender email mismatch: Received from {sender_email}, expected {expected_email}"
+        )
+
+    # 4. Update Database: Set is_verified and email_verified to TRUE
+    await execute_pg_query(
+        "UPDATE users SET is_verified = TRUE, email_verified = TRUE, updated_at = CURRENT_TIMESTAMP WHERE email = $1",
+        expected_email
+    )
+
+    # 5. Clean up consumed token
+    _email_verification_tokens.pop(token, None)
+
+    # 6. Realtime Notification via WebSocket if user is connected
+    try:
+        ws_msg = json.dumps({
+            "type": "EMAIL_VERIFIED",
+            "email": expected_email,
+            "message": "Your email address has been verified successfully!"
+        })
+        await send_to_user_by_email(expected_email, ws_msg)
+    except Exception as ws_err:
+        print("[Email Webhook] WebSocket notification fallback:", ws_err)
+
+    return {
+        "status": "success",
+        "message": f"Account with email {expected_email} successfully verified!",
+        "email": expected_email
     }
 

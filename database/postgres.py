@@ -133,6 +133,8 @@ async def initialize_pg_schema():
         await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash VARCHAR(255);")
         await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS google_id VARCHAR(255);")
         await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_seen VARCHAR(255);")
+        await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_verified BOOLEAN DEFAULT FALSE;")
+        await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN DEFAULT FALSE;")
         await conn.execute("UPDATE users SET user_id = 10000 + id WHERE user_id IS NULL;")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_users_user_id ON users(user_id);")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);")

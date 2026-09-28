@@ -230,17 +230,17 @@ async def get_profile(identifier: str):
     
     if ident.isdigit():
         users = await execute_pg_query(
-            "SELECT id, user_id, username, name, bio, email, status, avatar, google_id, last_seen FROM users WHERE user_id = $1 OR id = $1",
+            "SELECT id, user_id, username, name, bio, email, status, avatar, google_id, last_seen, is_verified, email_verified FROM users WHERE user_id = $1 OR id = $1",
             int(ident)
         )
     elif "@" in ident:
         users = await execute_pg_query(
-            "SELECT id, user_id, username, name, bio, email, status, avatar, google_id, last_seen FROM users WHERE LOWER(email) = $1",
+            "SELECT id, user_id, username, name, bio, email, status, avatar, google_id, last_seen, is_verified, email_verified FROM users WHERE LOWER(email) = $1",
             ident
         )
     else:
         users = await execute_pg_query(
-            "SELECT id, user_id, username, name, bio, email, status, avatar, google_id, last_seen FROM users WHERE LOWER(username) = $1",
+            "SELECT id, user_id, username, name, bio, email, status, avatar, google_id, last_seen, is_verified, email_verified FROM users WHERE LOWER(username) = $1",
             ident
         )
 
@@ -248,6 +248,7 @@ async def get_profile(identifier: str):
         u = users[0]
         uid = u.get("user_id") or (10000 + u["id"])
         avatar_val = u["avatar"] or DEFAULT_AVATAR_URL
+        verified = bool(u.get("is_verified") or u.get("email_verified"))
         return {
             "id": uid,
             "user_id": uid,
@@ -255,6 +256,8 @@ async def get_profile(identifier: str):
             "username": u["username"] or "",
             "bio": u["bio"] or "",
             "email": u["email"] or "",
+            "is_verified": verified,
+            "email_verified": verified,
             "status": "online" if u["username"] and u["username"].strip().lower() in active_connections else "offline",
             "avatar": avatar_val,
             "avatar_url": avatar_val,
