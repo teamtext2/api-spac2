@@ -817,12 +817,12 @@ async def api_admin_verify_user(
         verified, db_id, user_id
     )
 
-    action_text = "cấp tích xác minh (Verified)" if verified else "hủy trạng thái xác minh"
-    print(f"[HERO ADMIN] Manual verify: Admin {admin.get('sub')} has {action_text} for @{username} (ID: {user_id})")
+    action_text = "granted Verified status to" if verified else "revoked Verified status from"
+    print(f"[HERO ADMIN] Manual verify: Admin {admin.get('sub')} has {action_text} @{username} (ID: {user_id})")
 
     return {
         "status": "success",
-        "message": f"Đã {action_text} cho tài khoản @{username} (ID: #{user_id}) thành công!",
+        "message": f"Successfully {action_text} @{username} (ID: #{user_id})!",
         "user_id": user_id,
         "username": username,
         "email": email,

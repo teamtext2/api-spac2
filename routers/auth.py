@@ -6,7 +6,7 @@ import secrets
 import urllib.parse
 from typing import Optional, Dict, Any, List
 from pydantic import BaseModel
-from fastapi import APIRouter, HTTPException, Depends, Request, Response, Header
+from fastapi import APIRouter, HTTPException, Depends, Request, Response, Header, Query
 
 from database.postgres import execute_pg_query
 from auth.deps import get_auth_token, create_spac2_token, decode_spac2_token, create_text2_token, decode_text2_token
@@ -528,10 +528,11 @@ async def initiate_email_verification(
 @router.get("/email-verify/status")
 async def check_email_verification_status(
     token: Optional[str] = Depends(get_auth_token),
+    verify_token: Optional[str] = Query(None),
     x_user_email: Optional[str] = Header(None),
     x_user_id: Optional[str] = Header(None)
 ):
-    """Check whether current authenticated user's email is verified."""
+    """Check whether current authenticated user's email is verified with rich status feedback."""
     user_ident = None
     if token:
         payload = decode_spac2_token(token)
@@ -564,7 +565,29 @@ async def check_email_verification_status(
         u = users[0]
         is_verified = bool(u.get("is_verified") or u.get("email_verified"))
 
-    return {"is_verified": is_verified}
+    res: Dict[str, Any] = {"is_verified": is_verified}
+
+    if verify_token:
+        v_token = verify_token.strip().upper()
+        if is_verified:
+            res["status"] = "verified"
+            res["message"] = "Your email has been verified successfully."
+        elif v_token in _email_verification_tokens:
+            rec = _email_verification_tokens[v_token]
+            if time.time() > rec["expires_at"]:
+                res["status"] = "expired"
+                res["message"] = "Verification token has expired. Please request a new verification code."
+            elif rec.get("last_error"):
+                res["status"] = "error"
+                res["message"] = rec["last_error"]
+            else:
+                res["status"] = "pending"
+                res["message"] = "Waiting for incoming email verification."
+        else:
+            res["status"] = "pending"
+            res["message"] = "Waiting for incoming email verification."
+
+    return res
 
 
 @router.post("/email-webhook")
@@ -603,7 +626,6 @@ async def cloudflare_email_webhook(
     user_id = record.get("user_id")
 
     # 3. Match sender email with registered email (allowing prefix/alias matches)
-    # E.g. user+tag@gmail.com vs user@gmail.com or direct equality
     is_match = (
         clean_sender == expected_email or
         expected_email in clean_sender or
@@ -613,10 +635,9 @@ async def cloudflare_email_webhook(
 
     if not is_match:
         print(f"[Email Webhook] Sender mismatch: Clean sender '{clean_sender}' != expected '{expected_email}'")
-        # If token is 100% valid and tied to the user session, we can still accept it or log warning
-        # For security, we verify if clean_sender exists in users table or matches expected
         user_check = await execute_pg_query("SELECT id FROM users WHERE LOWER(email) = $1 OR id = $2", clean_sender, user_id)
         if not user_check:
+            record["last_error"] = f"Sender email mismatch: Received email from {clean_sender}, but expected registered email {expected_email}."
             raise HTTPException(
                 status_code=400,
                 detail=f"Sender email mismatch: Received from {clean_sender}, expected {expected_email}"
