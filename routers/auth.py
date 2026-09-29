@@ -449,11 +449,29 @@ async def change_password(
 
 # In-memory temporary token cache (Key: "SPAC2-XXXXXX" -> { "user_id": int, "email": str, "expires_at": float })
 _email_verification_tokens: Dict[str, Dict[str, Any]] = {}
+# In-memory temporary password reset token cache (Key: "RESET-XXXXXX" -> { "email": str, "hashed_new_password": str, "expires_at": float, "user_id": int, "last_error": Optional[str], "is_completed": bool })
+_password_reset_tokens: Dict[str, Dict[str, Any]] = {}
+
 WEBHOOK_SECRET_KEY = "spac2_super_secure_secret_2026"
 TARGET_VERIFY_EMAIL = "verify@spac2.com"
 
 
 class InitiateEmailVerifyResponse(BaseModel):
+    token: str
+    target_email: str
+    subject: str
+    body: str
+    mailto_link: str
+    expires_in_minutes: int
+
+
+class ForgotPasswordInitiateRequest(BaseModel):
+    email: str
+    new_password: str
+    confirm_password: Optional[str] = None
+
+
+class ForgotPasswordInitiateResponse(BaseModel):
     token: str
     target_email: str
     subject: str
@@ -512,7 +530,7 @@ async def initiate_email_verification(
     }
 
     subject = f"Verify Spac2 Account - {token_str}"
-    body = f"Spac2 Reverse Verification\nToken: {token_str}\n(Please click Send without changing the subject or body to verify your Spac2 account instantly)."
+    body = f"I confirm that I am the owner of this email account and authorize Spac2 email verification.\n\nToken: {token_str}"
     mailto_link = f"mailto:{TARGET_VERIFY_EMAIL}?subject={urllib.parse.quote(subject)}&body={urllib.parse.quote(body)}"
 
     return {
@@ -522,6 +540,101 @@ async def initiate_email_verification(
         "body": body,
         "mailto_link": mailto_link,
         "expires_in_minutes": 20
+    }
+
+
+@router.post("/forgot-password/initiate", response_model=ForgotPasswordInitiateResponse)
+async def initiate_forgot_password(req: ForgotPasswordInitiateRequest):
+    """Initiate a reverse-email password reset flow. Saves temporary hashed new password awaiting inbound email verification."""
+    clean_email = (req.email or "").strip().lower()
+    if not clean_email or not validate_email_format(clean_email):
+        raise HTTPException(status_code=400, detail="Please enter a valid email address.")
+
+    new_pw = (req.new_password or "").strip()
+    if len(new_pw) < 6:
+        raise HTTPException(status_code=400, detail="New password must be at least 6 characters.")
+
+    if req.confirm_password and req.confirm_password.strip() != new_pw:
+        raise HTTPException(status_code=400, detail="Passwords do not match.")
+
+    # Check if user exists in database
+    users = await execute_pg_query("SELECT id, user_id, email, username FROM users WHERE LOWER(email) = $1", clean_email)
+    if not users:
+        raise HTTPException(status_code=404, detail="No Spac2 account found with this email address.")
+
+    user = users[0]
+    user_id = user.get("id") or user.get("user_id")
+
+    # Hash the new pending password
+    hashed_pw = hash_password(new_pw)
+
+    # Generate 6-char hex token: RESET-XXXXXX
+    hex_code = secrets.token_hex(3).upper()
+    token_str = f"RESET-{hex_code}"
+
+    # Store in memory with 20 minutes TTL
+    _password_reset_tokens[token_str] = {
+        "user_id": user_id,
+        "email": clean_email,
+        "hashed_new_password": hashed_pw,
+        "expires_at": time.time() + (20 * 60),
+        "last_error": None,
+        "is_completed": False
+    }
+
+    subject = f"Reset Spac2 Password - {token_str}"
+    body = f"I confirm that I am the owner of this email account and authorize my Spac2 password reset.\n\nToken: {token_str}"
+    mailto_link = f"mailto:{TARGET_VERIFY_EMAIL}?subject={urllib.parse.quote(subject)}&body={urllib.parse.quote(body)}"
+
+    return {
+        "token": token_str,
+        "target_email": TARGET_VERIFY_EMAIL,
+        "subject": subject,
+        "body": body,
+        "mailto_link": mailto_link,
+        "expires_in_minutes": 20
+    }
+
+
+@router.get("/forgot-password/status")
+async def check_forgot_password_status(token: str = Query(...)):
+    """Poll status of a reverse-email password reset token."""
+    token_str = token.strip().upper()
+    rec = _password_reset_tokens.get(token_str)
+
+    if not rec:
+        return {
+            "is_completed": False,
+            "status": "not_found",
+            "message": "Reset request not found or already completed."
+        }
+
+    if rec.get("is_completed"):
+        return {
+            "is_completed": True,
+            "status": "completed",
+            "message": "Password reset successfully! You can now sign in with your new password."
+        }
+
+    if time.time() > rec["expires_at"]:
+        _password_reset_tokens.pop(token_str, None)
+        return {
+            "is_completed": False,
+            "status": "expired",
+            "message": "Password reset token has expired. Please submit a new request."
+        }
+
+    if rec.get("last_error"):
+        return {
+            "is_completed": False,
+            "status": "error",
+            "message": rec["last_error"]
+        }
+
+    return {
+        "is_completed": False,
+        "status": "pending",
+        "message": "Waiting for incoming password reset verification email."
     }
 
 
@@ -611,7 +724,56 @@ async def cloudflare_email_webhook(
 
     print(f"[Email Webhook] Received webhook for token '{token}' from sender '{clean_sender}' (raw: '{raw_sender}')")
 
-    # 2. Check token in active verification pool
+    # A. Check if this is a Password Reset Token (RESET-XXXXXX)
+    if token.startswith("RESET-"):
+        record = _password_reset_tokens.get(token)
+        if not record:
+            print(f"[Password Reset Webhook] Token '{token}' not found in active reset pool.")
+            raise HTTPException(status_code=404, detail="Password reset token not found or already completed.")
+
+        if time.time() > record["expires_at"]:
+            _password_reset_tokens.pop(token, None)
+            raise HTTPException(status_code=400, detail="Password reset token has expired.")
+
+        expected_email = (record.get("email") or "").strip().lower()
+        user_id = record.get("user_id")
+        hashed_new_pw = record.get("hashed_new_password")
+
+        is_match = (
+            clean_sender == expected_email or
+            expected_email in clean_sender or
+            clean_sender in expected_email or
+            clean_sender.split("@")[0] == expected_email.split("@")[0]
+        )
+
+        if not is_match:
+            print(f"[Password Reset Webhook] Sender mismatch: Clean sender '{clean_sender}' != expected '{expected_email}'")
+            user_check = await execute_pg_query("SELECT id FROM users WHERE LOWER(email) = $1 OR id = $2", clean_sender, user_id)
+            if not user_check:
+                record["last_error"] = f"Sender email mismatch: Received from {clean_sender}, but expected registered email {expected_email}."
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Sender email mismatch: Received from {clean_sender}, expected {expected_email}"
+                )
+
+        # Apply new password to database & mark email as verified
+        if user_id:
+            await execute_pg_query(
+                "UPDATE users SET password_hash = $1, is_verified = TRUE, email_verified = TRUE, updated_at = CURRENT_TIMESTAMP WHERE id = $2 OR user_id = $2 OR email = $3",
+                hashed_new_pw, user_id, expected_email
+            )
+        else:
+            await execute_pg_query(
+                "UPDATE users SET password_hash = $1, is_verified = TRUE, email_verified = TRUE, updated_at = CURRENT_TIMESTAMP WHERE email = $2",
+                hashed_new_pw, expected_email
+            )
+
+        # Mark token as completed
+        record["is_completed"] = True
+        print(f"[Password Reset Webhook] Successfully updated password for {expected_email} (User ID: {user_id})")
+        return {"success": True, "message": "Password updated successfully."}
+
+    # B. Email Verification Token (SPAC2-XXXXXX)
     record = _email_verification_tokens.get(token)
     if not record:
         print(f"[Email Webhook] Token '{token}' not found in active pool. Active tokens: {list(_email_verification_tokens.keys())}")
@@ -625,7 +787,7 @@ async def cloudflare_email_webhook(
     expected_email = (record.get("email") or "").strip().lower()
     user_id = record.get("user_id")
 
-    # 3. Match sender email with registered email (allowing prefix/alias matches)
+    # Match sender email with registered email
     is_match = (
         clean_sender == expected_email or
         expected_email in clean_sender or
@@ -643,7 +805,7 @@ async def cloudflare_email_webhook(
                 detail=f"Sender email mismatch: Received from {clean_sender}, expected {expected_email}"
             )
 
-    # 4. Update Database: Set is_verified and email_verified to TRUE
+    # Update Database: Set is_verified and email_verified to TRUE
     if user_id:
         await execute_pg_query(
             "UPDATE users SET is_verified = TRUE, email_verified = TRUE, updated_at = CURRENT_TIMESTAMP WHERE id = $1 OR user_id = $1 OR email = $2",
@@ -655,11 +817,11 @@ async def cloudflare_email_webhook(
             expected_email
         )
 
-    # 5. Clean up consumed token
+    # Clean up consumed token
     _email_verification_tokens.pop(token, None)
     print(f"[Email Webhook] Successfully verified account for {expected_email} (User ID: {user_id})")
 
-    # 6. Realtime Notification via WebSocket if user is connected
+    # Realtime Notification via WebSocket if user is connected
     try:
         ws_msg = json.dumps({
             "type": "EMAIL_VERIFIED",
