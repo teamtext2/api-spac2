@@ -402,7 +402,12 @@ async def api_admin_get_users(
     formatted_users = []
     for u in users:
         uid = u.get("user_id") or (10000 + u["id"])
+        email_val = (u.get("email") or "").strip()
         uname = (u.get("username") or "").strip()
+        if not uname:
+            uname = email_val.split("@")[0] if email_val and "@" in email_val else f"user_{uid}"
+
+        name_val = (u.get("name") or "").strip() or uname
         is_online = uname.lower() in active_connections if uname else False
         verified = bool(u.get("is_verified") or u.get("email_verified"))
 
@@ -419,8 +424,8 @@ async def api_admin_get_users(
             "db_id": u["id"],
             "user_id": uid,
             "username": uname,
-            "name": u.get("name") or "",
-            "email": u.get("email") or "",
+            "name": name_val,
+            "email": email_val,
             "bio": u.get("bio") or "",
             "is_verified": verified,
             "email_verified": verified,
