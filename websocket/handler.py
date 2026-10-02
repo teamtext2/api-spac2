@@ -17,7 +17,7 @@ from websocket.manager import (
     broadcast_user_status,
     send_to_user_by_email,
 )
-from auth.deps import verify_google_token
+from auth.deps import verify_auth_token
 from services.push import send_web_push
 from services.call_push import send_call_push
 from config import DEFAULT_AVATAR_URL
@@ -32,7 +32,7 @@ async def websocket_endpoint(websocket: WebSocket, username: str, token: str = Q
         email = f"{username}@spac2.com"
     print(f"[WS] Looked up email for @{username}: '{email}'")
 
-    is_verified = await verify_google_token(token, email)
+    is_verified = await verify_auth_token(token, email)
     if not is_verified:
         print(f"[WS] Connection rejected: unauthorized. Email: '{email}', Verified: {is_verified}")
         await websocket.accept()

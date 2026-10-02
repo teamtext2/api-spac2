@@ -5,7 +5,7 @@ import os
 from datetime import datetime, timezone
 from fastapi import APIRouter, HTTPException, Depends, Query
 from database.postgres import execute_pg_query
-from auth.deps import get_auth_token, verify_google_token
+from auth.deps import get_auth_token, verify_auth_token
 from models.schemas import MarkDeliveredRequest, MarkReadRequest, DeleteMessagesRequest, DeleteConversationRequest
 from websocket.manager import get_email_by_username, get_username_by_email
 from storage.r2 import (
@@ -37,7 +37,7 @@ async def api_get_undelivered_messages(username: str, token: str = Depends(get_a
     username = username.strip().lower()
 
     email = await get_email_by_username(username)
-    if not email or not await verify_google_token(token, email):
+    if not email or not await verify_auth_token(token, email):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     try:
@@ -87,7 +87,7 @@ async def api_get_undelivered_messages(username: str, token: str = Depends(get_a
 async def api_get_conversations(username: str, token: str = Depends(get_auth_token)):
     username = username.strip().lower()
     email = await get_email_by_username(username)
-    if not email or not await verify_google_token(token, email):
+    if not email or not await verify_auth_token(token, email):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     try:
@@ -305,7 +305,7 @@ async def api_sync_messages(username: str, since: float = 0.0, token: str = Depe
     username = username.strip().lower()
 
     email = await get_email_by_username(username)
-    if not email or not await verify_google_token(token, email):
+    if not email or not await verify_auth_token(token, email):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     try:
@@ -448,7 +448,7 @@ async def api_get_messages_history(
     partner = partner.strip().lower()
 
     email = await get_email_by_username(username)
-    if not email or not await verify_google_token(token, email):
+    if not email or not await verify_auth_token(token, email):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     try:
@@ -564,7 +564,7 @@ async def api_mark_delivered(req: MarkDeliveredRequest, token: str = Depends(get
     recipient = req.recipient.strip().lower()
 
     email = await get_email_by_username(recipient)
-    if not email or not await verify_google_token(token, email):
+    if not email or not await verify_auth_token(token, email):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     if not req.message_ids:
@@ -587,7 +587,7 @@ async def api_mark_read(req: MarkReadRequest, token: str = Depends(get_auth_toke
     username = req.username.strip().lower()
 
     email = await get_email_by_username(username)
-    if not email or not await verify_google_token(token, email):
+    if not email or not await verify_auth_token(token, email):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     if not req.message_ids:
@@ -610,7 +610,7 @@ async def api_delete_messages(req: DeleteMessagesRequest, token: str = Depends(g
     username = req.username.strip().lower()
 
     email = await get_email_by_username(username)
-    if not email or not await verify_google_token(token, email):
+    if not email or not await verify_auth_token(token, email):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     if not req.message_ids:
@@ -697,7 +697,7 @@ async def api_delete_conversation(req: DeleteConversationRequest, token: str = D
     friend_username = req.friend_username.strip().lower()
 
     email = await get_email_by_username(username)
-    if not email or not await verify_google_token(token, email):
+    if not email or not await verify_auth_token(token, email):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     try:

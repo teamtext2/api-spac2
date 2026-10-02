@@ -1,7 +1,7 @@
 import json
 from fastapi import APIRouter, HTTPException, Depends
 from database.postgres import execute_pg_query
-from auth.deps import get_auth_token, verify_google_token
+from auth.deps import get_auth_token, verify_auth_token
 from models.schemas import FriendRequest
 from websocket.manager import active_connections, get_email_by_username
 from config import DEFAULT_AVATAR_URL
@@ -18,7 +18,7 @@ async def api_add_friend(req: FriendRequest, token: str = Depends(get_auth_token
         raise HTTPException(status_code=400, detail="You cannot add yourself as a friend")
 
     email = await get_email_by_username(username)
-    if not email or not await verify_google_token(token, email):
+    if not email or not await verify_auth_token(token, email):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     user_res = await execute_pg_query("SELECT id, name, avatar FROM users WHERE username = $1", username)
@@ -69,7 +69,7 @@ async def api_get_friends(username: str, token: str = Depends(get_auth_token)):
     username = username.strip().lower()
 
     email = await get_email_by_username(username)
-    if not email or not await verify_google_token(token, email):
+    if not email or not await verify_auth_token(token, email):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     try:

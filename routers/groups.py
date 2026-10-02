@@ -3,7 +3,7 @@ import uuid
 import os
 from fastapi import APIRouter, HTTPException, Depends, Request
 from database.postgres import execute_pg_query
-from auth.deps import get_auth_token, verify_google_token
+from auth.deps import get_auth_token, verify_auth_token
 from storage.r2 import (
     process_and_upload_avatar,
     delete_r2_object,
@@ -61,7 +61,7 @@ async def api_create_group(payload: dict, token: str = Depends(get_auth_token), 
         raise HTTPException(status_code=400, detail="Group name and creator are required")
 
     email = await get_email_by_username(creator)
-    if not email or not await verify_google_token(token, email):
+    if not email or not await verify_auth_token(token, email):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     group_id = f"group_{uuid.uuid4().hex}"
@@ -132,7 +132,7 @@ async def api_get_group(group_id: str):
 async def api_get_user_groups(username: str, token: str = Depends(get_auth_token)):
     username = username.strip().lower()
     email = await get_email_by_username(username)
-    if not email or not await verify_google_token(token, email):
+    if not email or not await verify_auth_token(token, email):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     rows = await execute_pg_query(
@@ -167,7 +167,7 @@ async def api_leave_group(group_id: str, payload: dict, token: str = Depends(get
         raise HTTPException(status_code=400, detail="Username is required")
 
     email = await get_email_by_username(username)
-    if not email or not await verify_google_token(token, email):
+    if not email or not await verify_auth_token(token, email):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     member_check = await execute_pg_query(
@@ -216,7 +216,7 @@ async def api_add_group_members(group_id: str, payload: dict, token: str = Depen
         raise HTTPException(status_code=400, detail="Requester and new members are required")
 
     requester_email = await get_email_by_username(requester)
-    if not requester_email or not await verify_google_token(token, requester_email):
+    if not requester_email or not await verify_auth_token(token, requester_email):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     requester_check = await execute_pg_query(
@@ -277,7 +277,7 @@ async def api_kick_group_member(group_id: str, payload: dict, token: str = Depen
         raise HTTPException(status_code=400, detail="Requester and target_user are required")
 
     requester_email = await get_email_by_username(requester)
-    if not requester_email or not await verify_google_token(token, requester_email):
+    if not requester_email or not await verify_auth_token(token, requester_email):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     group_rows = await execute_pg_query("SELECT created_by, created_by_email FROM chat_groups WHERE id = $1", group_id)
@@ -348,7 +348,7 @@ async def api_update_group_avatar(group_id: str, payload: dict, token: str = Dep
         raise HTTPException(status_code=400, detail="Requester and avatar are required")
 
     email = await get_email_by_username(requester)
-    if not email or not await verify_google_token(token, email):
+    if not email or not await verify_auth_token(token, email):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     group_rows = await execute_pg_query("SELECT avatar, created_by FROM chat_groups WHERE id = $1", group_id)
@@ -396,7 +396,7 @@ async def api_rename_group(group_id: str, payload: dict, token: str = Depends(ge
         raise HTTPException(status_code=400, detail="Requester and new name are required")
 
     email = await get_email_by_username(requester)
-    if not email or not await verify_google_token(token, email):
+    if not email or not await verify_auth_token(token, email):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     group_rows = await execute_pg_query("SELECT created_by FROM chat_groups WHERE id = $1", group_id)
@@ -434,7 +434,7 @@ async def api_disband_group(group_id: str, payload: dict, token: str = Depends(g
         raise HTTPException(status_code=400, detail="Requester is required")
 
     email = await get_email_by_username(requester)
-    if not email or not await verify_google_token(token, email):
+    if not email or not await verify_auth_token(token, email):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     group_rows = await execute_pg_query("SELECT created_by FROM chat_groups WHERE id = $1", group_id)

@@ -2,7 +2,7 @@ import re
 from typing import Optional, List, Dict, Any
 from fastapi import APIRouter, HTTPException, Depends, Request, Response, Header
 from database.postgres import execute_pg_query
-from auth.deps import get_auth_token, verify_google_token, create_spac2_token, decode_spac2_token, create_text2_token, decode_text2_token
+from auth.deps import get_auth_token, verify_auth_token, create_spac2_token, decode_spac2_token, create_text2_token, decode_text2_token
 from models.schemas import UserProfile
 from services.user_service import save_profile, get_profile, get_email_by_username
 from websocket.manager import active_connections
@@ -389,7 +389,7 @@ async def api_save_profile(
         username = token_username or re.sub(r"[^a-z0-9_]", "", profile.email.split("@")[0].lower()) or "user"
         profile.username = username
 
-    if not await verify_google_token(token, profile.email):
+    if not await verify_auth_token(token, profile.email):
         raise HTTPException(status_code=401, detail="Unauthorized: Invalid or expired authentication session")
 
     try:

@@ -123,7 +123,6 @@ async def initialize_pg_schema():
                 status VARCHAR(50) DEFAULT 'online',
                 avatar TEXT,
                 password_hash VARCHAR(255),
-                google_id VARCHAR(255),
                 last_seen VARCHAR(255),
                 created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
@@ -131,7 +130,6 @@ async def initialize_pg_schema():
         """)
         await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS user_id BIGINT UNIQUE;")
         await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash VARCHAR(255);")
-        await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS google_id VARCHAR(255);")
         await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_seen VARCHAR(255);")
         await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_verified BOOLEAN DEFAULT FALSE;")
         await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN DEFAULT FALSE;")
@@ -148,8 +146,8 @@ async def initialize_pg_schema():
         if table_check:
             print("Migrating remaining legacy accounts from chat_users to central users table...")
             await conn.execute("""
-                INSERT INTO users (user_id, username, name, bio, email, status, avatar, google_id, last_seen, created_at)
-                SELECT COALESCE(user_id, 10000 + id), username, name, bio, email, status, avatar, google_id, last_seen, created_at
+                INSERT INTO users (user_id, username, name, bio, email, status, avatar, last_seen, created_at)
+                SELECT COALESCE(user_id, 10000 + id), username, name, bio, email, status, avatar, last_seen, created_at
                 FROM chat_users
                 ON CONFLICT (email) DO UPDATE 
                 SET username = EXCLUDED.username, 

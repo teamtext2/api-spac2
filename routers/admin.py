@@ -359,7 +359,7 @@ async def api_admin_get_users(
 
             users = await execute_pg_query(
                 f"""
-                SELECT id, user_id, username, name, email, bio, status, avatar, google_id, last_seen, created_at, updated_at, is_verified, email_verified
+                SELECT id, user_id, username, name, email, bio, status, avatar, last_seen, created_at, updated_at, is_verified, email_verified
                 FROM users
                 WHERE user_id = $1 OR id = $1 OR username ILIKE $2 OR email ILIKE $2 OR name ILIKE $2
                 ORDER BY {order_clause}
@@ -376,7 +376,7 @@ async def api_admin_get_users(
 
             users = await execute_pg_query(
                 f"""
-                SELECT id, user_id, username, name, email, bio, status, avatar, google_id, last_seen, created_at, updated_at, is_verified, email_verified
+                SELECT id, user_id, username, name, email, bio, status, avatar, last_seen, created_at, updated_at, is_verified, email_verified
                 FROM users
                 WHERE username ILIKE $1 OR email ILIKE $1 OR name ILIKE $1
                 ORDER BY {order_clause}
@@ -390,7 +390,7 @@ async def api_admin_get_users(
 
         users = await execute_pg_query(
             f"""
-            SELECT id, user_id, username, name, email, bio, status, avatar, google_id, last_seen, created_at, updated_at, is_verified, email_verified
+            SELECT id, user_id, username, name, email, bio, status, avatar, last_seen, created_at, updated_at, is_verified, email_verified
             FROM users
             ORDER BY {order_clause}
             LIMIT $1 OFFSET $2
@@ -433,7 +433,6 @@ async def api_admin_get_users(
             "is_online": is_online,
             "avatar": avatar_url,
             "avatar_url": avatar_url,
-            "google_id": u.get("google_id") or "",
             "last_seen": u.get("last_seen") or "",
             "created_at": created_at_str
         })
@@ -511,7 +510,6 @@ async def api_admin_get_single_user(identifier: str, admin: dict = Depends(requi
             "bio": u.get("bio") or "",
             "status": "online" if uname.lower() in active_connections else (u.get("status") or "offline"),
             "avatar": avatar_url,
-            "google_id": u.get("google_id") or "",
             "created_at": str(u.get("created_at") or ""),
             "updated_at": str(u.get("updated_at") or "")
         },

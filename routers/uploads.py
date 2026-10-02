@@ -8,7 +8,7 @@ from fastapi import APIRouter, HTTPException, Depends, File, UploadFile, Query, 
 from fastapi.responses import StreamingResponse, FileResponse
 import httpx
 from database.postgres import execute_pg_query
-from auth.deps import get_auth_token, verify_google_token
+from auth.deps import get_auth_token, verify_auth_token
 from websocket.manager import get_email_by_username
 from storage.r2 import (
     r2_client,
@@ -206,7 +206,7 @@ async def api_get_presigned_url(
 ):
     username = username.strip().lower()
     email = await get_email_by_username(username)
-    if not email or not await verify_google_token(token, email):
+    if not email or not await verify_auth_token(token, email):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     if not r2_client or not R2_BUCKET_NAME:

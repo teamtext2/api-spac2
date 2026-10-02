@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException, Depends
 from database.postgres import execute_pg_query
-from auth.deps import get_auth_token, verify_google_token
+from auth.deps import get_auth_token, verify_auth_token
 from models.schemas import (
     PushSubscriptionPayload,
     PushUnsubscribePayload,
@@ -25,7 +25,7 @@ async def save_push_subscription(payload: PushSubscriptionPayload):
     email = await get_email_by_username(payload.username)
     print(f"[PUSH] Looked up email for '{payload.username}': '{email}'")
 
-    is_verified = await verify_google_token(payload.token, email)
+    is_verified = await verify_auth_token(payload.token, email)
     print(f"[PUSH] Token verification result: {is_verified}")
 
     if not email or not is_verified:
@@ -53,7 +53,7 @@ async def save_push_subscription(payload: PushSubscriptionPayload):
 @router.post("/unsubscribe")
 async def remove_push_subscription(payload: PushUnsubscribePayload):
     email = await get_email_by_username(payload.username)
-    if not email or not await verify_google_token(payload.token, email):
+    if not email or not await verify_auth_token(payload.token, email):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     try:
@@ -94,7 +94,7 @@ async def register_device(payload: RegisterDevicePayload):
 @router.post("/link_device")
 async def link_device(payload: LinkDevicePayload):
     email = await get_email_by_username(payload.username)
-    if not email or not await verify_google_token(payload.token, email):
+    if not email or not await verify_auth_token(payload.token, email):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     try:

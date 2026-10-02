@@ -384,7 +384,6 @@ def _ensure_sqlite_schema(cursor, conn):
             status TEXT DEFAULT 'online',
             avatar TEXT,
             password_hash TEXT,
-            google_id TEXT,
             last_seen TEXT,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
@@ -393,7 +392,7 @@ def _ensure_sqlite_schema(cursor, conn):
 
     cursor.execute("PRAGMA table_info(users)")
     central_user_cols = [row[1] for row in cursor.fetchall()]
-    for col, col_type in [("password_hash", "TEXT"), ("google_id", "TEXT"), ("last_seen", "TEXT"), ("user_id", "INTEGER")]:
+    for col, col_type in [("password_hash", "TEXT"), ("last_seen", "TEXT"), ("user_id", "INTEGER")]:
         if col not in central_user_cols:
             try:
                 cursor.execute(f"ALTER TABLE users ADD COLUMN {col} {col_type};")
@@ -410,7 +409,6 @@ def _ensure_sqlite_schema(cursor, conn):
             email TEXT UNIQUE NOT NULL,
             status TEXT,
             avatar TEXT,
-            google_id TEXT,
             last_seen TEXT,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         );
@@ -418,7 +416,7 @@ def _ensure_sqlite_schema(cursor, conn):
 
     cursor.execute("PRAGMA table_info(chat_users)")
     user_columns = [row[1] for row in cursor.fetchall()]
-    for col, col_type in [("google_id", "TEXT"), ("last_seen", "TEXT")]:
+    for col, col_type in [("last_seen", "TEXT")]:
         if col not in user_columns:
             try:
                 cursor.execute(f"ALTER TABLE chat_users ADD COLUMN {col} {col_type};")

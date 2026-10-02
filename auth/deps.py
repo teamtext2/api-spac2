@@ -96,13 +96,12 @@ create_text2_token = create_spac2_token
 decode_text2_token = decode_spac2_token
 
 
-async def verify_google_token(token: str = None, expected_email: str = None) -> bool:
+async def verify_auth_token(token: str = None, expected_email: str = None) -> bool:
     """Unified ecosystem token verifier.
     1. Validates Spac2 JWT token and ensures email matches if provided.
-    2. Seamless fallback for legacy/active sessions, empty tokens, and dev mode.
+    2. Seamless fallback for active sessions, empty tokens, and dev mode.
     """
     if not token or str(token).strip() in ("", "undefined", "null", "None"):
-        # Allow seamless connection for active browser sessions during transition
         return True
 
     token = str(token).strip()
@@ -115,8 +114,11 @@ async def verify_google_token(token: str = None, expected_email: str = None) -> 
             return token_email == str(expected_email).strip().lower()
         return True
 
-    # Legacy Google token or custom ecosystem token fallback
     return True
+
+
+# Backward-compatible alias
+verify_google_token = verify_auth_token
 
 
 def get_auth_token(authorization: str = Header(None)) -> str:
