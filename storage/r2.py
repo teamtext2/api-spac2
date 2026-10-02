@@ -190,14 +190,153 @@ def process_and_upload_avatar(username: str, avatar_src: str, base_url: str = ""
     return avatar_src
 
 
+SYSTEM_DEFAULT_FILES = {
+    "avatar.png",
+    "avatar.jpg",
+    "avatar.jpeg",
+    "avatar.webp",
+    "apple-touch-icon.png",
+    "favicon.ico",
+    "favicon-16x16.png",
+    "favicon-32x32.png",
+    "android-chrome-192x192.png",
+    "android-chrome-512x512.png",
+}
+
+
+def clean_extract_r2_key(url_or_key: str) -> str:
+    """
+    Extract and normalize the clean R2 object key from any URL, path, or key string.
+    Handles all CDN domains (cdn2.spac2.com, cdn1.spac2.com, cdn.spac2.com, spac2.com, etc.),
+    local paths (/data/chat/..., /data/uploads/..., /data/avatar/...), query params, and hashes.
+    Returns empty string if it's a system default file or invalid.
+    """
+    if not url_or_key:
+        return ""
+    
+    clean_str = str(url_or_key).strip()
+    # Strip query parameters and fragment hashes
+    clean_str = clean_str.split("?")[0].split("#")[0].strip()
+
+    # Check for system default files that should never be deleted
+    filename = clean_str.split("/")[-1].lower()
+    if filename in SYSTEM_DEFAULT_FILES:
+        return ""
+
+    # Look for known R2 folder prefixes
+    for folder in ["avatar/", "chat/", "uploads/", "avatars/"]:
+        if folder in clean_str:
+            subpath = clean_str.split(folder)[-1]
+            subpath = subpath.lstrip("/")
+            # Normalize 'avatars/' folder to 'avatar/'
+            norm_folder = "avatar/" if folder in ("avatar/", "avatars/") else folder
+            key = f"{norm_folder}{subpath}"
+            return key
+
+    # If it's already a relative path matching our folders
+    for prefix in ["avatar/", "chat/", "uploads/"]:
+        if clean_str.startswith(prefix):
+            return clean_str
+
+    return ""
+
+
 def delete_r2_object(key: str):
-    """Delete an object from R2 by its key."""
+    """Delete an object from R2 by its key or URL safely."""
+    norm_key = clean_extract_r2_key(key) or key.strip().split("?")[0].split("#")[0]
+    if not norm_key or norm_key.split("/")[-1].lower() in SYSTEM_DEFAULT_FILES:
+        return
+
     if r2_client and R2_BUCKET_NAME:
         try:
-            r2_client.delete_object(Bucket=R2_BUCKET_NAME, Key=key)
-            print(f"Deleted R2 object: {key}")
+            r2_client.delete_object(Bucket=R2_BUCKET_NAME, Key=norm_key)
+            print(f"[R2 CLEANUP] Successfully deleted R2 object: {norm_key}")
         except Exception as e:
-            print(f"Failed to delete R2 object {key}: {e}")
+            print(f"[R2 CLEANUP] Failed to delete R2 object {norm_key}: {e}")
+
+
+def delete_media_url_from_r2_and_local(file_url: str) -> bool:
+    """
+    Delete a media file (avatar, chat image/file, upload) from both Cloudflare R2 and local disk storage.
+    """
+    if not file_url:
+        return False
+
+    key = clean_extract_r2_key(file_url)
+    deleted = False
+
+    # 1. Cloudflare R2 cleanup
+    if key:
+        delete_r2_object(key)
+        deleted = True
+
+    # 2. Local disk fallback cleanup
+    raw_path = str(file_url).split("?")[0].split("#")[0]
+    filename = raw_path.split("/")[-1].strip()
+    if filename and filename.lower() not in SYSTEM_DEFAULT_FILES:
+        for folder_name, dir_path in [
+            ("avatar", LOCAL_AVATARS_DIR),
+            ("chat", LOCAL_CHAT_DIR),
+            ("uploads", LOCAL_UPLOADS_DIR)
+        ]:
+            if os.path.exists(dir_path):
+                # Try matching by filename
+                local_path = os.path.join(dir_path, filename)
+                if os.path.isfile(local_path):
+                    try:
+                        os.remove(local_path)
+                        print(f"[LOCAL CLEANUP] Deleted local file: {local_path}")
+                        deleted = True
+                    except Exception as le:
+                        print(f"[LOCAL CLEANUP] Failed to remove local file {local_path}: {le}")
+
+    return deleted
+
+
+def delete_message_attachments_from_contents(contents) -> int:
+    """
+    Parse ALL media and attachment URLs (chat images, attachments, markdown, HTML, direct links)
+    from a list of message contents or a single content string and permanently delete them from Cloudflare R2 & local storage.
+    """
+    if isinstance(contents, str):
+        contents = [contents]
+    elif not contents:
+        return 0
+
+    import re
+    # Match [Attachment: name] (url)
+    attach_pattern = re.compile(r'(?:📎\s*)?\[Attachment:\s*[^\]]+\]\s*\((https?://[^\s\)]+|/[^\s\)]+)\)', re.IGNORECASE)
+    # Match markdown images ![alt](url)
+    md_img_pattern = re.compile(r'!\[.*?\]\((https?://[^\s\)]+|/[^\s\)]+)\)', re.IGNORECASE)
+    # Match html tags <img src="url">, <video src="url">, <source src="url">
+    html_pattern = re.compile(r'<(?:img|video|audio|source|a)[^>]+(?:src|href)=["\'](https?://[^"\'\s]+|/[^"\'\s]+)["\']', re.IGNORECASE)
+    # Direct CDN / storage URL pattern matching chat/, uploads/, avatar/
+    direct_url_pattern = re.compile(r'(?:https?://[^\s\)\"\'>]+|/data/)(?:chat|uploads|avatar)/[^\s\)\"\'>]+', re.IGNORECASE)
+
+    extracted_urls = set()
+
+    for content in contents:
+        if not content or not isinstance(content, str):
+            continue
+
+        for m in attach_pattern.finditer(content):
+            extracted_urls.add(m.group(1))
+
+        for m in md_img_pattern.finditer(content):
+            extracted_urls.add(m.group(1))
+
+        for m in html_pattern.finditer(content):
+            extracted_urls.add(m.group(1))
+
+        for m in direct_url_pattern.finditer(content):
+            extracted_urls.add(m.group(0))
+
+    deleted_count = 0
+    for u in extracted_urls:
+        if delete_media_url_from_r2_and_local(u):
+            deleted_count += 1
+
+    return deleted_count
 
 
 def delete_user_r2_and_local_files(username: str, avatar_url: str = "") -> dict:

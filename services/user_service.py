@@ -157,28 +157,12 @@ async def _upsert_profile(existing_users, profile_data, email, base_url):
     # Process avatar and upload to Cloudflare R2
     avatar_url = avatar
     if avatar != old_avatar:
-        if avatar.startswith("data:image/") or (avatar.startswith("http") and not (avatar.startswith(f"{R2_AVATAR_CDN_BASE}/") or avatar.startswith(f"{R2_CDN_BASE}/"))):
+        if avatar and (avatar.startswith("data:image/") or (avatar.startswith("http") and not (f"/avatar/" in avatar or f"/avatars/" in avatar))):
             avatar_url = process_and_upload_avatar(username, avatar, base_url)
 
-        # Clean up old avatar from R2
-        if old_avatar:
-            if old_avatar.startswith(f"{R2_AVATAR_CDN_BASE}/"):
-                old_key = old_avatar.replace(f"{R2_AVATAR_CDN_BASE}/", "")
-                delete_r2_object(old_key)
-            elif old_avatar.startswith(f"{R2_CDN_BASE}/"):
-                old_key = old_avatar.replace(f"{R2_CDN_BASE}/", "")
-                delete_r2_object(old_key)
-
-        # Clean up old local avatar
-        if old_avatar and ("/data/avatar/" in old_avatar or "/data/avatars/" in old_avatar):
-            try:
-                local_filename = old_avatar.split("/")[-1]
-                local_path = os.path.join(LOCAL_AVATARS_DIR, local_filename)
-                if os.path.exists(local_path):
-                    os.remove(local_path)
-                    print(f"Old local avatar {local_filename} deleted.")
-            except Exception as e:
-                print(f"Failed to delete old local avatar: {e}")
+        # Clean up old avatar from R2 and local disk storage
+        if old_avatar and old_avatar != avatar_url:
+            delete_media_url_from_r2_and_local(old_avatar)
 
     if existing_users:
         db_id = existing_users[0]["id"]

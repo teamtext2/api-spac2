@@ -4,7 +4,13 @@ import os
 from fastapi import APIRouter, HTTPException, Depends, Request
 from database.postgres import execute_pg_query
 from auth.deps import get_auth_token, verify_google_token
-from storage.r2 import process_and_upload_avatar, delete_r2_object, r2_client
+from storage.r2 import (
+    process_and_upload_avatar,
+    delete_r2_object,
+    r2_client,
+    delete_media_url_from_r2_and_local,
+    delete_message_attachments_from_contents,
+)
 from websocket.manager import active_connections, get_email_by_username, send_to_user_by_email
 from config import LOCAL_AVATARS_DIR, R2_CDN_BASE, R2_BUCKET_NAME
 
@@ -12,7 +18,7 @@ router = APIRouter(prefix="/api", tags=["groups"])
 
 
 async def perform_group_disband_cleanup(group_id: str, members_to_notify: list):
-    """Delete all group data and notify members via WebSocket."""
+    """Delete all group data, attachments, and avatar from Cloudflare R2 and notify members via WebSocket."""
     group_rows = await execute_pg_query("SELECT avatar FROM chat_groups WHERE id = $1", group_id)
     old_avatar = ""
     if group_rows:
@@ -20,21 +26,10 @@ async def perform_group_disband_cleanup(group_id: str, members_to_notify: list):
 
     msg_rows = await execute_pg_query("SELECT content FROM messages WHERE recipient_id = $1", group_id)
     contents = [r["content"] for r in msg_rows]
-    await _delete_message_attachments(contents)
+    delete_message_attachments_from_contents(contents)
 
-    if old_avatar and old_avatar.startswith(f"{R2_CDN_BASE}/"):
-        old_key = old_avatar.replace(f"{R2_CDN_BASE}/", "")
-        delete_r2_object(old_key)
-
-    if old_avatar and "/data/avatars/" in old_avatar:
-        try:
-            local_filename = old_avatar.split("/")[-1]
-            local_path = os.path.join(LOCAL_AVATARS_DIR, local_filename)
-            if os.path.exists(local_path):
-                os.remove(local_path)
-                print(f"Disband: Local group avatar {local_filename} deleted.")
-        except Exception as e:
-            print(f"Failed to delete local group avatar: {e}")
+    if old_avatar:
+        delete_media_url_from_r2_and_local(old_avatar)
 
     await execute_pg_query("DELETE FROM messages WHERE recipient_id = $1", group_id)
     await execute_pg_query("DELETE FROM chat_group_members WHERE group_id = $1", group_id)
@@ -51,32 +46,8 @@ async def perform_group_disband_cleanup(group_id: str, members_to_notify: list):
 
 
 async def _delete_message_attachments(contents: list):
-    """Parse attachment URLs from message content and delete them from R2/local."""
-    import re
-    url_pattern = re.compile(r'(?:📎\s*)?\[Attachment:\s*[^\]]+\]\s*\((https?://[^\s\)]+|/[^\s\)]+)\)', re.IGNORECASE)
-    LOCAL_UPLOADS = "./data/uploads"
-    for content in contents:
-        if not content:
-            continue
-        for match in url_pattern.finditer(content):
-            file_url = match.group(1)
-            if "uploads/" in file_url:
-                key = "uploads/" + file_url.split("uploads/")[-1]
-                if r2_client and R2_BUCKET_NAME:
-                    try:
-                        r2_client.delete_object(Bucket=R2_BUCKET_NAME, Key=key)
-                        print(f"Deleted R2 attachment: {key}")
-                    except Exception as re2:
-                        print(f"Failed to delete R2 attachment {key}: {re2}")
-            if "/data/uploads/" in file_url or "data/uploads" in file_url:
-                local_filename = file_url.split("/")[-1]
-                local_path = os.path.join(LOCAL_UPLOADS, local_filename)
-                if os.path.exists(local_path):
-                    try:
-                        os.remove(local_path)
-                        print(f"Deleted local fallback attachment: {local_path}")
-                    except Exception as le:
-                        print(f"Failed to delete local attachment {local_path}: {le}")
+    """Parse attachment URLs from message content and delete them from R2 and local storage."""
+    return delete_message_attachments_from_contents(contents)
 
 
 @router.post("/groups")
@@ -394,16 +365,8 @@ async def api_update_group_avatar(group_id: str, payload: dict, token: str = Dep
 
     await execute_pg_query("UPDATE chat_groups SET avatar = $1 WHERE id = $2", avatar_url, group_id)
 
-    if old_avatar and old_avatar.startswith(f"{R2_CDN_BASE}/"):
-        delete_r2_object(old_avatar.replace(f"{R2_CDN_BASE}/", ""))
-    if old_avatar and "/data/avatars/" in old_avatar:
-        try:
-            local_filename = old_avatar.split("/")[-1]
-            local_path = os.path.join(LOCAL_AVATARS_DIR, local_filename)
-            if os.path.exists(local_path):
-                os.remove(local_path)
-        except Exception as e:
-            print(f"Failed to delete old local group avatar: {e}")
+    if old_avatar and old_avatar != avatar_url:
+        delete_media_url_from_r2_and_local(old_avatar)
 
     member_rows = await execute_pg_query("SELECT username, email FROM chat_group_members WHERE group_id = $1", group_id)
     members = [r["username"] for r in member_rows if r.get("username")]

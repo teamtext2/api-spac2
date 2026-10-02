@@ -8,7 +8,12 @@ from database.postgres import execute_pg_query
 from auth.deps import get_auth_token, verify_google_token
 from models.schemas import MarkDeliveredRequest, MarkReadRequest, DeleteMessagesRequest, DeleteConversationRequest
 from websocket.manager import get_email_by_username, get_username_by_email
-from storage.r2 import r2_client, R2_BUCKET_NAME
+from storage.r2 import (
+    r2_client,
+    R2_BUCKET_NAME,
+    delete_message_attachments_from_contents,
+    delete_media_url_from_r2_and_local,
+)
 from config import DEFAULT_AVATAR_URL
 
 router = APIRouter(prefix="/api", tags=["messages"])
@@ -23,34 +28,8 @@ def _is_valid_uuid(val: str) -> bool:
 
 
 async def delete_message_attachments(contents: list):
-    """Parse attachment URLs from message content and delete them from R2/local."""
-    import re
-    url_pattern = re.compile(r'(?:📎\s*)?\[Attachment:\s*[^\]]+\]\s*\((https?://[^\s\)]+|/[^\s\)]+)\)', re.IGNORECASE)
-    from config import LOCAL_UPLOADS_DIR, LOCAL_CHAT_DIR
-    for content in contents:
-        if not content:
-            continue
-        for match in url_pattern.finditer(content):
-            file_url = match.group(1)
-            for folder in ["chat/", "uploads/", "avatar/"]:
-                if folder in file_url:
-                    key = folder + file_url.split(folder)[-1]
-                    if r2_client and R2_BUCKET_NAME:
-                        try:
-                            r2_client.delete_object(Bucket=R2_BUCKET_NAME, Key=key)
-                            print(f"Deleted R2 attachment: {key}")
-                        except Exception as e:
-                            print(f"Failed to delete R2 attachment {key}: {e}")
-                    
-                    target_dir = LOCAL_CHAT_DIR if folder == "chat/" else LOCAL_UPLOADS_DIR
-                    local_filename = file_url.split("/")[-1]
-                    local_path = os.path.join(target_dir, local_filename)
-                    if os.path.exists(local_path):
-                        try:
-                            os.remove(local_path)
-                            print(f"Deleted local fallback attachment: {local_path}")
-                        except Exception as e:
-                            print(f"Failed to delete local attachment {local_path}: {e}")
+    """Parse attachment URLs from message content and delete them from R2 and local storage."""
+    return delete_message_attachments_from_contents(contents)
 
 
 @router.get("/messages/undelivered/{username}")
@@ -639,28 +618,60 @@ async def api_delete_messages(req: DeleteMessagesRequest, token: str = Depends(g
     try:
         uuids = [uuid.UUID(mid) for mid in req.message_ids if _is_valid_uuid(mid)]
         if uuids:
+            # Query groups where the user is a member
+            group_rows = await execute_pg_query(
+                "SELECT group_id FROM chat_group_members WHERE LOWER(email) = $1 OR LOWER(username) = $2",
+                email.lower(), username.lower()
+            )
+            user_groups = [r["group_id"].strip().lower() for r in group_rows] if group_rows else []
+
+            # Retrieve messages matching IDs where user is sender, recipient, or a group member
             rows = await execute_pg_query(
-                "SELECT id, sender_id, recipient_id, content FROM messages WHERE (LOWER(sender_id) = $1 OR LOWER(recipient_id) = $1) AND id = ANY($2::uuid[])",
-                username, uuids
+                """
+                SELECT id, sender_id, recipient_id, content 
+                FROM messages 
+                WHERE (LOWER(sender_id) = $1 OR LOWER(recipient_id) = $1 OR LOWER(recipient_id) = ANY($3::varchar[])) 
+                  AND id = ANY($2::uuid[])
+                """,
+                username, uuids, user_groups
             )
             if rows:
+                # 1. Permanently purge all attachments/media (chat images, attachments, files) from Cloudflare R2 and local storage
                 await delete_message_attachments([row.get("content") or "" for row in rows])
 
-                # Gather affected peers
-                affected_peers = set()
+                # 2. Delete messages from database
+                del_uuids = [r["id"] for r in rows]
                 del_ids = [str(r["id"]) for r in rows]
-                for r in rows:
-                    s = r.get("sender_id", "").strip().lower()
-                    rec = r.get("recipient_id", "").strip().lower()
-                    if s: affected_peers.add(s)
-                    if rec: affected_peers.add(rec)
-
                 await execute_pg_query(
-                    "DELETE FROM messages WHERE (LOWER(sender_id) = $1 OR LOWER(recipient_id) = $1) AND id = ANY($2::uuid[])",
-                    username, uuids
+                    "DELETE FROM messages WHERE id = ANY($1::uuid[])",
+                    del_uuids
                 )
 
-                # Broadcast deletion to all connections of affected participants
+                # 3. Gather all affected peers (direct peers and all members of affected groups)
+                affected_peers = set()
+                affected_groups = set()
+                for r in rows:
+                    s = (r.get("sender_id") or "").strip().lower()
+                    rec = (r.get("recipient_id") or "").strip().lower()
+                    if s:
+                        affected_peers.add(s)
+                    if rec:
+                        if rec.startswith("group_"):
+                            affected_groups.add(rec)
+                        else:
+                            affected_peers.add(rec)
+
+                # Fetch all members for affected groups
+                if affected_groups:
+                    group_members_rows = await execute_pg_query(
+                        "SELECT username, email FROM chat_group_members WHERE LOWER(group_id) = ANY($1::varchar[])",
+                        list(affected_groups)
+                    )
+                    for gm in (group_members_rows or []):
+                        if gm.get("username"):
+                            affected_peers.add(gm["username"].strip().lower())
+
+                # 4. Broadcast realtime deletion to all connections of affected participants
                 from websocket.manager import active_connections
                 del_payload = json.dumps({
                     "type": "messages_deleted",
@@ -690,28 +701,59 @@ async def api_delete_conversation(req: DeleteConversationRequest, token: str = D
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     try:
-        rows = await execute_pg_query(
-            "SELECT content FROM messages WHERE (LOWER(sender_id) = $1 AND LOWER(recipient_id) = $2) OR (LOWER(sender_id) = $2 AND LOWER(recipient_id) = $1)",
-            username, friend_username
-        )
-        if rows:
-            await delete_message_attachments([row.get("content") or "" for row in rows])
+        is_group = friend_username.startswith("group_")
 
-        await execute_pg_query(
-            "DELETE FROM messages WHERE (LOWER(sender_id) = $1 AND LOWER(recipient_id) = $2) OR (LOWER(sender_id) = $2 AND LOWER(recipient_id) = $1)",
-            username, friend_username
-        )
-
-        user_res = await execute_pg_query("SELECT id FROM users WHERE LOWER(username) = $1", username)
-        friend_res = await execute_pg_query("SELECT id FROM users WHERE LOWER(username) = $1", friend_username)
-        if user_res and friend_res:
-            uid = user_res[0]["id"]
-            fid = friend_res[0]["id"]
-            id1, id2 = min(uid, fid), max(uid, fid)
-            await execute_pg_query(
-                "DELETE FROM chat_friends WHERE user_id = $1 AND friend_id = $2",
-                id1, id2
+        if is_group:
+            # Check membership
+            member_check = await execute_pg_query(
+                "SELECT role FROM chat_group_members WHERE LOWER(group_id) = $1 AND (LOWER(email) = $2 OR LOWER(username) = $3)",
+                friend_username, email.lower(), username.lower()
             )
+            if not member_check:
+                raise HTTPException(status_code=403, detail="You are not a member of this group")
+
+            rows = await execute_pg_query(
+                "SELECT content FROM messages WHERE LOWER(recipient_id) = $1",
+                friend_username
+            )
+            if rows:
+                await delete_message_attachments([row.get("content") or "" for row in rows])
+
+            await execute_pg_query(
+                "DELETE FROM messages WHERE LOWER(recipient_id) = $1",
+                friend_username
+            )
+
+            # Get group members for broadcast
+            gm_rows = await execute_pg_query(
+                "SELECT username FROM chat_group_members WHERE LOWER(group_id) = $1",
+                friend_username
+            )
+            peers_to_notify = [r["username"].strip().lower() for r in gm_rows if r.get("username")]
+        else:
+            rows = await execute_pg_query(
+                "SELECT content FROM messages WHERE (LOWER(sender_id) = $1 AND LOWER(recipient_id) = $2) OR (LOWER(sender_id) = $2 AND LOWER(recipient_id) = $1)",
+                username, friend_username
+            )
+            if rows:
+                await delete_message_attachments([row.get("content") or "" for row in rows])
+
+            await execute_pg_query(
+                "DELETE FROM messages WHERE (LOWER(sender_id) = $1 AND LOWER(recipient_id) = $2) OR (LOWER(sender_id) = $2 AND LOWER(recipient_id) = $1)",
+                username, friend_username
+            )
+
+            user_res = await execute_pg_query("SELECT id FROM users WHERE LOWER(username) = $1", username)
+            friend_res = await execute_pg_query("SELECT id FROM users WHERE LOWER(username) = $1", friend_username)
+            if user_res and friend_res:
+                uid = user_res[0]["id"]
+                fid = friend_res[0]["id"]
+                id1, id2 = min(uid, fid), max(uid, fid)
+                await execute_pg_query(
+                    "DELETE FROM chat_friends WHERE user_id = $1 AND friend_id = $2",
+                    id1, id2
+                )
+            peers_to_notify = [username, friend_username]
 
         # Broadcast conversation deletion to active connections
         from websocket.manager import active_connections
@@ -720,7 +762,7 @@ async def api_delete_conversation(req: DeleteConversationRequest, token: str = D
             "sender": username,
             "friend_username": friend_username
         })
-        for peer in [username, friend_username]:
+        for peer in peers_to_notify:
             if peer in active_connections:
                 for ws in list(active_connections[peer]):
                     try:
