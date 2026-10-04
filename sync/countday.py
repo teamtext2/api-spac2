@@ -8,6 +8,7 @@ from pydantic import BaseModel
 
 from auth.deps import get_auth_token, decode_spac2_token, create_spac2_token, decode_text2_token, create_text2_token
 from database.postgres import execute_pg_query
+from sync.engine import get_domain_max_rev, execute_sync_batch_atomic
 
 router = APIRouter(prefix="/api/sync/countday", tags=["sync_countday"])
 
@@ -24,6 +25,7 @@ class CountdayEventSyncItem(BaseModel):
 
 
 class CountdayKeepSyncRequest(BaseModel):
+    sync_batch_id: Optional[str] = None
     since_rev: Optional[int] = 0
     items: Optional[List[CountdayEventSyncItem]] = []
 
@@ -203,11 +205,7 @@ async def get_countday_delta_sync(
     user_id = await _resolve_user_id(token, x_user_id, x_user_email, x_user_name, response)
 
     try:
-        rev_res = await execute_pg_query(
-            "SELECT COALESCE(MAX(rev), 0) AS current_rev FROM user_sync_countday_events WHERE user_id = $1",
-            user_id
-        )
-        current_rev = int(rev_res[0]["current_rev"]) if rev_res and rev_res[0].get("current_rev") else 0
+        current_rev = await get_domain_max_rev(user_id, "countday")
 
         if since_rev > 0 and since_rev == current_rev:
             return {
@@ -255,72 +253,75 @@ async def sync_keep_countday_batch(
     x_user_name: Optional[str] = Header(None)
 ):
     """Google Keep / Countday Single-Trip Atomic Full Sync (Push + Pull).
-    1. Saves all client mutations (upserts/deletes) with next revision.
+    1. Saves all client mutations (upserts/deletes) atomically with next revision.
     2. Atomically queries and returns remote events updated by other devices since since_rev.
     """
     user_id = await _resolve_user_id(token, x_user_id, x_user_email, x_user_name, response)
 
     try:
-        # 1. Get current max revision
-        rev_res = await execute_pg_query(
-            "SELECT COALESCE(MAX(rev), 0) AS current_rev FROM user_sync_countday_events WHERE user_id = $1",
-            user_id
-        )
-        current_max_rev = int(rev_res[0]["current_rev"]) if rev_res and rev_res[0].get("current_rev") else 0
-        
+        has_mutations = bool(payload.items and len(payload.items) > 0)
         synced_event_ids = []
-        next_rev = current_max_rev
 
-        # 2. Push client mutations (if any)
-        if payload.items and len(payload.items) > 0:
-            now_ts = int(time.time() * 1000)
-            next_rev = current_max_rev + 1
-            for item in payload.items:
-                event_id = str(item.id).strip()
-                if not event_id:
-                    continue
+        async def _write_countday_mutations(next_rev: int, now_ts: int):
+            if payload.items and len(payload.items) > 0:
+                for item in payload.items:
+                    event_id = str(item.id).strip()
+                    if not event_id:
+                        continue
 
-                item_title = (item.title or "").strip()
-                item_date = (item.date or item.target_date or "").strip()
-                order_index = int(item.order_index if item.order_index is not None else (item.order or 0))
+                    item_title = (item.title or "").strip()
+                    item_date = (item.date or item.target_date or "").strip()
+                    order_index = int(item.order_index if item.order_index is not None else (item.order or 0))
 
-                # Backend Smart Deduplication: reuse existing event_id if duplicate signature
-                if not item.is_deleted and (item_title and item_date):
-                    try:
-                        existing_dup = await execute_pg_query(
-                            "SELECT event_id FROM user_sync_countday_events WHERE user_id = $1 AND title = $2 AND target_date = $3 AND is_deleted = FALSE LIMIT 1",
-                            user_id, item_title, item_date
+                    # Backend Smart Deduplication: reuse existing event_id if duplicate signature
+                    if not item.is_deleted and (item_title and item_date):
+                        try:
+                            existing_dup = await execute_pg_query(
+                                "SELECT event_id FROM user_sync_countday_events WHERE user_id = $1 AND title = $2 AND target_date = $3 AND is_deleted = FALSE LIMIT 1",
+                                user_id, item_title, item_date
+                            )
+                            if existing_dup and existing_dup[0].get("event_id"):
+                                event_id = str(existing_dup[0]["event_id"])
+                        except Exception:
+                            pass
+
+                    synced_event_ids.append(event_id)
+
+                    if item.is_deleted:
+                        await execute_pg_query(
+                            "INSERT INTO user_sync_countday_events (user_id, event_id, title, target_date, order_index, rev, is_deleted, updated_at) "
+                            "VALUES ($1, $2, '', '', 0, $3, TRUE, $4) "
+                            "ON CONFLICT (user_id, event_id) DO UPDATE SET "
+                            "title = '', target_date = '', is_deleted = TRUE, rev = EXCLUDED.rev, updated_at = EXCLUDED.updated_at",
+                            user_id, event_id, next_rev, now_ts
                         )
-                        if existing_dup and existing_dup[0].get("event_id"):
-                            event_id = str(existing_dup[0]["event_id"])
-                    except Exception:
-                        pass
+                    else:
+                        await execute_pg_query(
+                            "INSERT INTO user_sync_countday_events (user_id, event_id, title, target_date, order_index, rev, is_deleted, updated_at) "
+                            "VALUES ($1, $2, $3, $4, $5, $6, FALSE, $7) "
+                            "ON CONFLICT (user_id, event_id) DO UPDATE SET "
+                            "title = EXCLUDED.title, target_date = EXCLUDED.target_date, order_index = EXCLUDED.order_index, "
+                            "rev = EXCLUDED.rev, is_deleted = FALSE, updated_at = EXCLUDED.updated_at",
+                            user_id, event_id, item_title, item_date, order_index, next_rev, now_ts
+                        )
 
-                synced_event_ids.append(event_id)
+        # Atomic commit with idempotency & concurrency protection
+        sync_result = await execute_sync_batch_atomic(
+            user_id=user_id,
+            app_code="countday",
+            sync_batch_id=payload.sync_batch_id,
+            payload_data=payload,
+            has_mutations=has_mutations,
+            write_callback=_write_countday_mutations
+        )
 
-                if item.is_deleted:
-                    await execute_pg_query(
-                        "INSERT INTO user_sync_countday_events (user_id, event_id, title, target_date, order_index, rev, is_deleted, updated_at) "
-                        "VALUES ($1, $2, '', '', 0, $3, TRUE, $4) "
-                        "ON CONFLICT (user_id, event_id) DO UPDATE SET "
-                        "title = '', target_date = '', is_deleted = TRUE, rev = EXCLUDED.rev, updated_at = EXCLUDED.updated_at",
-                        user_id, event_id, next_rev, now_ts
-                    )
-                else:
-                    await execute_pg_query(
-                        "INSERT INTO user_sync_countday_events (user_id, event_id, title, target_date, order_index, rev, is_deleted, updated_at) "
-                        "VALUES ($1, $2, $3, $4, $5, $6, FALSE, $7) "
-                        "ON CONFLICT (user_id, event_id) DO UPDATE SET "
-                        "title = EXCLUDED.title, target_date = EXCLUDED.target_date, order_index = EXCLUDED.order_index, "
-                        "rev = EXCLUDED.rev, is_deleted = FALSE, updated_at = EXCLUDED.updated_at",
-                        user_id, event_id, item_title, item_date, order_index, next_rev, now_ts
-                    )
+        effective_rev = sync_result["current_rev"]
 
-        # 3. Pull remote updates (Atomic Pull)
+        # Pull remote updates (Atomic Pull)
         since_rev = payload.since_rev if payload.since_rev is not None else 0
         remote_items = []
 
-        if since_rev == 0 or since_rev > next_rev:
+        if since_rev == 0 or since_rev > effective_rev:
             # First sync on this device or client revision is ahead: return all active events on server
             rows = await execute_pg_query(
                 "SELECT event_id, title, target_date, order_index, rev, is_deleted, updated_at "
@@ -330,7 +331,7 @@ async def sync_keep_countday_batch(
                 user_id
             )
             remote_items = _format_countday_rows(rows)
-        elif since_rev < next_rev:
+        elif since_rev < effective_rev:
             # Return events updated by other devices (rev > since_rev)
             rows = await execute_pg_query(
                 "SELECT event_id, title, target_date, order_index, rev, is_deleted, updated_at "
@@ -343,10 +344,12 @@ async def sync_keep_countday_batch(
 
         return {
             "status": "success",
-            "current_rev": next_rev,
+            "current_rev": effective_rev,
+            "deduplicated": sync_result.get("deduplicated", False),
             "synced_count": len(synced_event_ids),
             "items": remote_items
         }
     except Exception as e:
         print(f"[KeepSyncCountday] Sync error for user {user_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Keep Sync Countday Error: {str(e)}")
+

@@ -7,6 +7,7 @@ from pydantic import BaseModel
 
 from auth.deps import get_auth_token, decode_spac2_token, create_spac2_token, decode_text2_token, create_text2_token
 from database.postgres import execute_pg_query
+from sync.engine import get_domain_max_rev, execute_sync_batch_atomic
 
 router = APIRouter(prefix="/api/sync/note", tags=["sync_note"])
 
@@ -22,6 +23,7 @@ class NoteSyncItem(BaseModel):
 
 
 class NoteKeepSyncRequest(BaseModel):
+    sync_batch_id: Optional[str] = None
     since_rev: Optional[int] = 0
     items: Optional[List[NoteSyncItem]] = []
 
@@ -253,11 +255,7 @@ async def get_note_delta_sync(
     user_id = await _resolve_user_id(token, x_user_id, x_user_email, x_user_name, response)
 
     try:
-        rev_res = await execute_pg_query(
-            "SELECT COALESCE(MAX(rev), 0) AS current_rev FROM user_sync_notes WHERE user_id = $1",
-            user_id
-        )
-        current_rev = int(rev_res[0]["current_rev"]) if rev_res and rev_res[0].get("current_rev") else 0
+        current_rev = await get_domain_max_rev(user_id, "note")
 
         if since_rev > 0 and since_rev == current_rev:
             return {
@@ -305,65 +303,65 @@ async def sync_keep_notes_batch(
     x_user_name: Optional[str] = Header(None)
 ):
     """Google Keep-Style Single-Trip Atomic Full Sync (Push + Pull).
-    1. Saves all client mutations (upserts/deletes) with next revision.
+    1. Saves all client mutations (upserts/deletes) atomically with next revision.
     2. Atomically queries and returns remote notes updated by other devices since since_rev.
     """
     user_id = await _resolve_user_id(token, x_user_id, x_user_email, x_user_name, response)
 
     try:
-        # 1. Get current max revision
-        rev_res = await execute_pg_query(
-            "SELECT COALESCE(MAX(rev), 0) AS current_rev FROM user_sync_notes WHERE user_id = $1",
-            user_id
-        )
-        current_max_rev = int(rev_res[0]["current_rev"]) if rev_res and rev_res[0].get("current_rev") else 0
-        
+        has_mutations = bool(payload.items and len(payload.items) > 0)
         synced_note_ids = []
-        next_rev = current_max_rev
 
-        # 2. Push client mutations (if any)
-        if payload.items and len(payload.items) > 0:
-            import time
-            now_ts = int(time.time() * 1000)
-            next_rev = current_max_rev + 1
-            for item in payload.items:
-                note_id = str(item.id).strip()
-                if not note_id or (note_id == '1' and item.title == 'Start taking note'):
-                    continue
+        async def _write_note_mutations(next_rev: int, now_ts: int):
+            if payload.items and len(payload.items) > 0:
+                for item in payload.items:
+                    note_id = str(item.id).strip()
+                    if not note_id or (note_id == '1' and item.title == 'Start taking note'):
+                        continue
 
-                item_title = (item.title or "").strip()
-                item_content = (item.content or "").strip()
-                normalized_color = _normalize_color(item.color)
-                color_json = json.dumps(normalized_color)
-                synced_note_ids.append(note_id)
+                    item_title = (item.title or "").strip()
+                    item_content = (item.content or "").strip()
+                    normalized_color = _normalize_color(item.color)
+                    color_json = json.dumps(normalized_color)
+                    synced_note_ids.append(note_id)
 
-                if item.is_deleted:
-                    await execute_pg_query(
-                        "INSERT INTO user_sync_notes (user_id, note_id, title, content, color, is_saved, date, rev, is_deleted, updated_at) "
-                        "VALUES ($1, $2, '', '', '{}'::jsonb, FALSE, '', $3, TRUE, $4) "
-                        "ON CONFLICT (user_id, note_id) DO UPDATE SET "
-                        "title = '', content = '', is_deleted = TRUE, rev = EXCLUDED.rev, updated_at = EXCLUDED.updated_at",
-                        user_id, note_id, next_rev, now_ts
-                    )
-                else:
+                    if item.is_deleted:
+                        await execute_pg_query(
+                            "INSERT INTO user_sync_notes (user_id, note_id, title, content, color, is_saved, date, rev, is_deleted, updated_at) "
+                            "VALUES ($1, $2, '', '', '{}'::jsonb, FALSE, '', $3, TRUE, $4) "
+                            "ON CONFLICT (user_id, note_id) DO UPDATE SET "
+                            "title = '', content = '', is_deleted = TRUE, rev = EXCLUDED.rev, updated_at = EXCLUDED.updated_at",
+                            user_id, note_id, next_rev, now_ts
+                        )
+                    else:
+                        await execute_pg_query(
+                            "INSERT INTO user_sync_notes (user_id, note_id, title, content, color, is_saved, date, rev, is_deleted, updated_at) "
+                            "VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, FALSE, $9) "
+                            "ON CONFLICT (user_id, note_id) DO UPDATE SET "
+                            "title = EXCLUDED.title, content = EXCLUDED.content, color = EXCLUDED.color, "
+                            "is_saved = EXCLUDED.is_saved, date = EXCLUDED.date, "
+                            "rev = EXCLUDED.rev, is_deleted = FALSE, updated_at = EXCLUDED.updated_at",
+                            user_id, note_id, item_title, item_content,
+                            color_json, bool(item.isSaved), item.date or "", next_rev, now_ts
+                        )
 
-                    await execute_pg_query(
-                        "INSERT INTO user_sync_notes (user_id, note_id, title, content, color, is_saved, date, rev, is_deleted, updated_at) "
-                        "VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, FALSE, $9) "
-                        "ON CONFLICT (user_id, note_id) DO UPDATE SET "
-                        "title = EXCLUDED.title, content = EXCLUDED.content, color = EXCLUDED.color, "
-                        "is_saved = EXCLUDED.is_saved, date = EXCLUDED.date, "
-                        "rev = EXCLUDED.rev, is_deleted = FALSE, updated_at = EXCLUDED.updated_at",
-                        user_id, note_id, item.title or "", item.content or "",
-                        color_json, bool(item.isSaved), item.date or "", next_rev, now_ts
-                    )
+        # Atomic commit with idempotency & concurrency protection
+        sync_result = await execute_sync_batch_atomic(
+            user_id=user_id,
+            app_code="note",
+            sync_batch_id=payload.sync_batch_id,
+            payload_data=payload,
+            has_mutations=has_mutations,
+            write_callback=_write_note_mutations
+        )
 
-        # 3. Pull remote updates (Atomic Pull)
+        effective_rev = sync_result["current_rev"]
+
+        # Pull remote updates (Atomic Pull)
         since_rev = payload.since_rev if payload.since_rev is not None else 0
         remote_items = []
 
-        if since_rev == 0 or since_rev > next_rev:
-            # First sync on this device or client revision is ahead: return all active notes on server
+        if since_rev == 0 or since_rev > effective_rev:
             rows = await execute_pg_query(
                 "SELECT note_id, title, content, color, is_saved, date, rev, is_deleted "
                 "FROM user_sync_notes "
@@ -372,8 +370,7 @@ async def sync_keep_notes_batch(
                 user_id
             )
             remote_items = _format_note_rows(rows)
-        elif since_rev < next_rev:
-            # Return notes updated by other devices (rev > since_rev)
+        elif since_rev < effective_rev:
             rows = await execute_pg_query(
                 "SELECT note_id, title, content, color, is_saved, date, rev, is_deleted "
                 "FROM user_sync_notes "
@@ -385,10 +382,12 @@ async def sync_keep_notes_batch(
 
         return {
             "status": "success",
-            "current_rev": next_rev,
+            "current_rev": effective_rev,
+            "deduplicated": sync_result.get("deduplicated", False),
             "synced_count": len(synced_note_ids),
             "items": remote_items
         }
     except Exception as e:
         print(f"[KeepSyncNote] Sync error for user {user_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Keep Sync Error: {str(e)}")
+

@@ -1,136 +1,173 @@
 import sqlite3
 import re
 import json
+import contextvars
+from contextlib import contextmanager
+from typing import Any, Optional
 from datetime import datetime, timezone
+
+_current_sqlite_conn: contextvars.ContextVar[Optional[Any]] = contextvars.ContextVar("_current_sqlite_conn", default=None)
+
+
+@contextmanager
+def sqlite_transaction():
+    """Transaction context manager for atomic SQLite fallback execution."""
+    conn = sqlite3.connect("local_mock_chat.db")
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    _ensure_sqlite_schema(cursor, conn)
+    tok = _current_sqlite_conn.set(conn)
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        _current_sqlite_conn.reset(tok)
+        conn.close()
 
 
 def execute_sqlite_query(query: str, *args):
     """SQLite fallback database handler. Mirrors the PostgreSQL API as closely as possible."""
+    active_conn = _current_sqlite_conn.get()
+    if active_conn:
+        cursor = active_conn.cursor()
+        return _dispatch_sqlite_query(cursor, active_conn, query, args, in_tx=True)
+
     with sqlite3.connect("local_mock_chat.db") as conn:
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
-
-        # Ensure tables and schema exist
         _ensure_sqlite_schema(cursor, conn)
+        return _dispatch_sqlite_query(cursor, conn, query, args, in_tx=False)
 
-        sql = query.strip()
 
-        if sql.startswith("INSERT INTO chat_friends"):
-            cursor.execute(
-                "INSERT OR IGNORE INTO chat_friends (user_id, friend_id, created_at) VALUES (?, ?, ?)",
-                [args[0], args[1], datetime.now(timezone.utc).isoformat()]
-            )
+def _dispatch_sqlite_query(cursor, conn, query: str, args, in_tx: bool = False):
+    sql = query.strip()
+
+    if sql.startswith("INSERT INTO chat_friends"):
+        cursor.execute(
+            "INSERT OR IGNORE INTO chat_friends (user_id, friend_id, created_at) VALUES (?, ?, ?)",
+            [args[0], args[1], datetime.now(timezone.utc).isoformat()]
+        )
+        if not in_tx:
             conn.commit()
-            return [{"success": True}]
+        return [{"success": True}]
 
-        elif "FROM chat_friends" in sql:
+    elif "FROM chat_friends" in sql:
+        cursor.execute(
+            "SELECT user_id, friend_id FROM chat_friends WHERE user_id = ? OR friend_id = ?",
+            [args[0], args[0]]
+        )
+        return [dict(r) for r in cursor.fetchall()]
+
+    elif sql.startswith("DELETE FROM chat_friends"):
+        cursor.execute(
+            "DELETE FROM chat_friends WHERE user_id = ? AND friend_id = ?",
+            [args[0], args[1]]
+        )
+        if not in_tx:
+            conn.commit()
+        return [{"success": True}]
+
+    elif "id = ANY($1::varchar[])" in sql:
+        ids = args[0]
+        if ids:
+            placeholders = ",".join(["?"] * len(ids))
             cursor.execute(
-                "SELECT user_id, friend_id FROM chat_friends WHERE user_id = ? OR friend_id = ?",
-                [args[0], args[0]]
+                f"SELECT id, name, avatar FROM chat_groups WHERE id IN ({placeholders})",
+                [str(i) for i in ids]
             )
             return [dict(r) for r in cursor.fetchall()]
+        return []
 
-        elif sql.startswith("DELETE FROM chat_friends"):
-            cursor.execute(
-                "DELETE FROM chat_friends WHERE user_id = ? AND friend_id = ?",
-                [args[0], args[1]]
-            )
+    elif sql.startswith("INSERT INTO messages"):
+        created_at_str = args[4].isoformat() if hasattr(args[4], "isoformat") else str(args[4])
+        reply_to = args[5] if len(args) > 5 else None
+        forwarded_from = args[6] if len(args) > 6 else None
+        cursor.execute(
+            "INSERT INTO messages (id, sender_id, recipient_id, content, created_at, delivered, reply_to, forwarded_from) VALUES (?, ?, ?, ?, ?, 0, ?, ?)",
+            [str(args[0]), args[1], args[2], args[3], created_at_str, reply_to, forwarded_from]
+        )
+        last_id = cursor.lastrowid
+        cursor.execute("UPDATE messages SET update_id = ? WHERE id = ?", [last_id, str(args[0])])
+        if not in_tx:
             conn.commit()
-            return [{"success": True}]
+        return [{"success": True, "update_id": last_id}]
 
-        elif "id = ANY($1::varchar[])" in sql:
-            ids = args[0]
-            if ids:
-                placeholders = ",".join(["?"] * len(ids))
-                cursor.execute(
-                    f"SELECT id, name, avatar FROM chat_groups WHERE id IN ({placeholders})",
-                    [str(i) for i in ids]
-                )
-                return [dict(r) for r in cursor.fetchall()]
-            return []
-
-        elif sql.startswith("INSERT INTO messages"):
-            created_at_str = args[4].isoformat() if hasattr(args[4], "isoformat") else str(args[4])
-            reply_to = args[5] if len(args) > 5 else None
-            forwarded_from = args[6] if len(args) > 6 else None
+    elif "ANY($1::uuid[])" in sql:
+        ids = args[0]
+        if ids:
+            placeholders = ",".join(["?"] * len(ids))
             cursor.execute(
-                "INSERT INTO messages (id, sender_id, recipient_id, content, created_at, delivered, reply_to, forwarded_from) VALUES (?, ?, ?, ?, ?, 0, ?, ?)",
-                [str(args[0]), args[1], args[2], args[3], created_at_str, reply_to, forwarded_from]
+                f"UPDATE messages SET delivered = 1 WHERE id IN ({placeholders})",
+                [str(i) for i in ids]
             )
-            last_id = cursor.lastrowid
-            cursor.execute("UPDATE messages SET update_id = ? WHERE id = ?", [last_id, str(args[0])])
-            conn.commit()
-            return [{"success": True, "update_id": last_id}]
-
-        elif "ANY($1::uuid[])" in sql:
-            ids = args[0]
-            if ids:
-                placeholders = ",".join(["?"] * len(ids))
-                cursor.execute(
-                    f"UPDATE messages SET delivered = 1 WHERE id IN ({placeholders})",
-                    [str(i) for i in ids]
-                )
+            if not in_tx:
                 conn.commit()
-            return [{"success": True}]
+        return [{"success": True}]
 
-        elif sql.startswith("UPDATE messages SET delivered = TRUE WHERE id = $1"):
-            cursor.execute("UPDATE messages SET delivered = 1 WHERE id = ?", [str(args[0])])
+    elif sql.startswith("UPDATE messages SET delivered = TRUE WHERE id = $1"):
+        cursor.execute("UPDATE messages SET delivered = 1 WHERE id = ?", [str(args[0])])
+        if not in_tx:
             conn.commit()
-            return [{"success": True}]
+        return [{"success": True}]
 
-        elif "jsonb_set" in sql:
-            sender, reaction, msg_uuid = args[0], args[1], args[2]
-            cursor.execute("SELECT reactions FROM messages WHERE id = ?", [str(msg_uuid)])
-            row = cursor.fetchone()
-            reactions_dict = {}
-            if row and row["reactions"]:
-                try:
-                    reactions_dict = json.loads(row["reactions"])
-                except Exception:
-                    pass
-            reactions_dict[sender] = reaction
-            cursor.execute(
-                "UPDATE messages SET reactions = ? WHERE id = ?",
-                [json.dumps(reactions_dict), str(msg_uuid)]
-            )
+    elif "jsonb_set" in sql:
+        sender, reaction, msg_uuid = args[0], args[1], args[2]
+        cursor.execute("SELECT reactions FROM messages WHERE id = ?", [str(msg_uuid)])
+        row = cursor.fetchone()
+        reactions_dict = {}
+        if row and row["reactions"]:
+            try:
+                reactions_dict = json.loads(row["reactions"])
+            except Exception:
+                pass
+        reactions_dict[sender] = reaction
+        cursor.execute(
+            "UPDATE messages SET reactions = ? WHERE id = ?",
+            [json.dumps(reactions_dict), str(msg_uuid)]
+        )
+        if not in_tx:
             conn.commit()
-            return [{"success": True}]
+        return [{"success": True}]
 
-        elif "COALESCE(reactions, '{}'::jsonb) - $1" in sql:
-            sender, msg_uuid = args[0], args[1]
-            cursor.execute("SELECT reactions FROM messages WHERE id = ?", [str(msg_uuid)])
-            row = cursor.fetchone()
-            reactions_dict = {}
-            if row and row["reactions"]:
-                try:
-                    reactions_dict = json.loads(row["reactions"])
-                except Exception:
-                    pass
-            if sender in reactions_dict:
-                del reactions_dict[sender]
-            cursor.execute(
-                "UPDATE messages SET reactions = ? WHERE id = ?",
-                [json.dumps(reactions_dict), str(msg_uuid)]
-            )
+    elif "COALESCE(reactions, '{}'::jsonb) - $1" in sql:
+        sender, msg_uuid = args[0], args[1]
+        cursor.execute("SELECT reactions FROM messages WHERE id = ?", [str(msg_uuid)])
+        row = cursor.fetchone()
+        reactions_dict = {}
+        if row and row["reactions"]:
+            try:
+                reactions_dict = json.loads(row["reactions"])
+            except Exception:
+                pass
+        if sender in reactions_dict:
+            del reactions_dict[sender]
+        cursor.execute(
+            "UPDATE messages SET reactions = ? WHERE id = ?",
+            [json.dumps(reactions_dict), str(msg_uuid)]
+        )
+        if not in_tx:
             conn.commit()
-            return [{"success": True}]
+        return [{"success": True}]
 
-        elif sql.startswith("SELECT reactions FROM messages"):
-            cursor.execute("SELECT reactions FROM messages WHERE id = ?", [str(args[0])])
-            row = cursor.fetchone()
-            return [dict(row)] if row else []
+    elif sql.startswith("SELECT reactions FROM messages"):
+        cursor.execute("SELECT reactions FROM messages WHERE id = ?", [str(args[0])])
+        row = cursor.fetchone()
+        return [dict(row)] if row else []
 
-        elif "recipient_id = ANY($3::varchar[])" in sql:
-            return _handle_sync_query(cursor, sql, args)
+    elif "recipient_id = ANY($3::varchar[])" in sql:
+        return _handle_sync_query(cursor, sql, args)
 
-        elif "recipient_id = $1 AND delivered = FALSE" in sql:
-            return _handle_undelivered_query(cursor, args)
+    elif "recipient_id = $1 AND delivered = FALSE" in sql:
+        return _handle_undelivered_query(cursor, args)
 
-        elif "created_at DESC LIMIT" in sql or "ORDER BY created_at DESC LIMIT" in sql:
-            return _handle_history_query(cursor, sql, args)
+    elif "created_at DESC LIMIT" in sql or "ORDER BY created_at DESC LIMIT" in sql:
+        return _handle_history_query(cursor, sql, args)
 
-        else:
-            return _handle_generic_query(cursor, conn, sql, args)
+    else:
+        return _handle_generic_query(cursor, conn, sql, args, in_tx=in_tx)
 
 
 def _handle_sync_query(cursor, sql, args):
@@ -268,10 +305,13 @@ def _handle_history_query(cursor, sql, args):
     return res
 
 
-def _handle_generic_query(cursor, conn, sql, args):
+def _handle_generic_query(cursor, conn, sql, args, in_tx: bool = False):
     """General fallback SQL translation from PostgreSQL syntax to SQLite."""
     sqlite_sql = sql
     sqlite_args = list(args)
+
+    # Translate GREATEST(a, b) -> MAX(a, b) for SQLite
+    sqlite_sql = re.sub(r'\bgreatest\b', 'MAX', sqlite_sql, flags=re.IGNORECASE)
 
     # Translate ILIKE to LIKE for SQLite compatibility
     sqlite_sql = re.sub(r'\bilike\b', 'LIKE', sqlite_sql, flags=re.IGNORECASE)
@@ -316,7 +356,8 @@ def _handle_generic_query(cursor, conn, sql, args):
             return [dict(r) for r in cursor.fetchall()]
         else:
             cursor.execute(sqlite_sql, sqlite_args)
-            conn.commit()
+            if not in_tx:
+                conn.commit()
             return [{"success": True}]
     except Exception as sqlite_err:
         print(f"[PG FALLBACK WARNING] Unhandled query mapping or SQLite error for: {sql}. Error: {sqlite_err}")
@@ -627,6 +668,29 @@ def _ensure_sqlite_schema(cursor, conn):
         );
     """)
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_sync_docs_user_rev ON user_sync_docs(user_id, rev);")
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS user_sync_counters (
+            user_id INTEGER NOT NULL,
+            app_code TEXT NOT NULL,
+            current_rev INTEGER NOT NULL DEFAULT 0,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (user_id, app_code)
+        );
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS user_sync_batches (
+            user_id INTEGER NOT NULL,
+            app_code TEXT NOT NULL,
+            sync_batch_id TEXT NOT NULL,
+            payload_hash TEXT NOT NULL,
+            rev INTEGER NOT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (user_id, app_code, sync_batch_id)
+        );
+    """)
+
 
 
 

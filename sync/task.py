@@ -8,6 +8,7 @@ from pydantic import BaseModel
 
 from auth.deps import get_auth_token, decode_spac2_token, create_spac2_token, decode_text2_token, create_text2_token
 from database.postgres import execute_pg_query
+from sync.engine import get_domain_max_rev, execute_sync_batch_atomic
 
 router = APIRouter(prefix="/api/sync/task", tags=["sync_task"])
 
@@ -36,6 +37,7 @@ class TaskItemSyncItem(BaseModel):
 
 
 class TaskKeepSyncRequest(BaseModel):
+    sync_batch_id: Optional[str] = None
     since_rev: Optional[int] = 0
     projects: Optional[List[TaskProjectSyncItem]] = []
     tasks: Optional[List[TaskItemSyncItem]] = []
@@ -331,7 +333,7 @@ async def get_task_delta_sync(
     user_id = await _resolve_user_id(token, x_user_id, x_user_email, x_user_name, response)
 
     try:
-        current_rev = await _get_current_max_rev(user_id)
+        current_rev = await get_domain_max_rev(user_id, "task")
 
         if since_rev > 0 and since_rev == current_rev:
             return {
@@ -395,100 +397,104 @@ async def sync_keep_tasks_batch(
     x_user_name: Optional[str] = Header(None)
 ):
     """Google Keep-Style Single-Trip Atomic Full Sync for Spac2 Task (Push + Pull).
-    1. Saves all client project & task mutations with next revision.
+    1. Saves all client project & task mutations atomically with next revision.
     2. Atomically queries and returns remote projects & tasks updated since since_rev.
     """
     user_id = await _resolve_user_id(token, x_user_id, x_user_email, x_user_name, response)
 
     try:
-        # 1. Get current max revision
-        current_max_rev = await _get_current_max_rev(user_id)
-        
-        has_mutations = (payload.projects and len(payload.projects) > 0) or (payload.tasks and len(payload.tasks) > 0)
-        next_rev = (current_max_rev + 1) if has_mutations else current_max_rev
-        now_ts = int(time.time() * 1000)
-
+        has_mutations = bool((payload.projects and len(payload.projects) > 0) or (payload.tasks and len(payload.tasks) > 0))
         synced_project_ids = []
         synced_task_ids = []
 
-        # 2. Process Project mutations
-        if payload.projects and len(payload.projects) > 0:
-            for p in payload.projects:
-                proj_id = str(p.id).strip()
-                if not proj_id or proj_id in ['proj-1', 'proj-2', 'proj-3']:
-                    continue
+        async def _write_mutations(next_rev: int, now_ts: int):
+            # 1. Process Project mutations
+            if payload.projects and len(payload.projects) > 0:
+                for p in payload.projects:
+                    proj_id = str(p.id).strip()
+                    if not proj_id or proj_id in ['proj-1', 'proj-2', 'proj-3']:
+                        continue
 
-                p_name = (p.name or "").strip()
-                color_dict = _normalize_project_color(p.color)
-                color_json = json.dumps(color_dict)
-                synced_project_ids.append(proj_id)
+                    p_name = (p.name or "").strip()
+                    color_dict = _normalize_project_color(p.color)
+                    color_json = json.dumps(color_dict)
+                    synced_project_ids.append(proj_id)
 
-                if p.is_deleted:
-                    await execute_pg_query(
-                        "INSERT INTO user_sync_task_projects (user_id, project_id, name, color, created_at_str, rev, is_deleted, updated_at) "
-                        "VALUES ($1, $2, '', '{}'::jsonb, '', $3, TRUE, $4) "
-                        "ON CONFLICT (user_id, project_id) DO UPDATE SET "
-                        "name = '', is_deleted = TRUE, rev = EXCLUDED.rev, updated_at = EXCLUDED.updated_at",
-                        user_id, proj_id, next_rev, now_ts
-                    )
-                    # Cascade: Also mark all child tasks of this deleted project as is_deleted = TRUE
-                    await execute_pg_query(
-                        "UPDATE user_sync_tasks SET is_deleted = TRUE, rev = $1, updated_at = $2 "
-                        "WHERE user_id = $3 AND project_id = $4 AND is_deleted = FALSE",
-                        next_rev, now_ts, user_id, proj_id
-                    )
-                else:
-                    await execute_pg_query(
-                        "INSERT INTO user_sync_task_projects (user_id, project_id, name, color, created_at_str, rev, is_deleted, updated_at) "
-                        "VALUES ($1, $2, $3, $4::jsonb, $5, $6, FALSE, $7) "
-                        "ON CONFLICT (user_id, project_id) DO UPDATE SET "
-                        "name = EXCLUDED.name, color = EXCLUDED.color, created_at_str = EXCLUDED.created_at_str, "
-                        "rev = EXCLUDED.rev, is_deleted = FALSE, updated_at = EXCLUDED.updated_at",
-                        user_id, proj_id, p_name, color_json, p.createdAt or "", next_rev, now_ts
-                    )
+                    if p.is_deleted:
+                        await execute_pg_query(
+                            "INSERT INTO user_sync_task_projects (user_id, project_id, name, color, created_at_str, rev, is_deleted, updated_at) "
+                            "VALUES ($1, $2, '', '{}'::jsonb, '', $3, TRUE, $4) "
+                            "ON CONFLICT (user_id, project_id) DO UPDATE SET "
+                            "name = '', is_deleted = TRUE, rev = EXCLUDED.rev, updated_at = EXCLUDED.updated_at",
+                            user_id, proj_id, next_rev, now_ts
+                        )
+                        await execute_pg_query(
+                            "UPDATE user_sync_tasks SET is_deleted = TRUE, rev = $1, updated_at = $2 "
+                            "WHERE user_id = $3 AND project_id = $4 AND is_deleted = FALSE",
+                            next_rev, now_ts, user_id, proj_id
+                        )
+                    else:
+                        await execute_pg_query(
+                            "INSERT INTO user_sync_task_projects (user_id, project_id, name, color, created_at_str, rev, is_deleted, updated_at) "
+                            "VALUES ($1, $2, $3, $4::jsonb, $5, $6, FALSE, $7) "
+                            "ON CONFLICT (user_id, project_id) DO UPDATE SET "
+                            "name = EXCLUDED.name, color = EXCLUDED.color, created_at_str = EXCLUDED.created_at_str, "
+                            "rev = EXCLUDED.rev, is_deleted = FALSE, updated_at = EXCLUDED.updated_at",
+                            user_id, proj_id, p_name, color_json, p.createdAt or "", next_rev, now_ts
+                        )
 
-        # 3. Process Task mutations
-        if payload.tasks and len(payload.tasks) > 0:
-            for t in payload.tasks:
-                task_id = str(t.id).strip()
-                if not task_id or task_id in ['task-1', 'task-2', 'task-3', 'task-4']:
-                    continue
+            # 2. Process Task mutations
+            if payload.tasks and len(payload.tasks) > 0:
+                for t in payload.tasks:
+                    task_id = str(t.id).strip()
+                    if not task_id or task_id in ['task-1', 'task-2', 'task-3', 'task-4']:
+                        continue
 
-                t_title = (t.title or "").strip()
-                t_proj_id = str(t.projectId or "").strip()
-                subtasks_json = json.dumps(t.subtasks or [])
-                synced_task_ids.append(task_id)
+                    t_title = (t.title or "").strip()
+                    t_proj_id = str(t.projectId or "").strip()
+                    subtasks_json = json.dumps(t.subtasks or [])
+                    synced_task_ids.append(task_id)
 
+                    if t.is_deleted:
+                        await execute_pg_query(
+                            "INSERT INTO user_sync_tasks (user_id, task_id, project_id, title, note, priority, due_date, completed, completed_at, subtasks, date, rev, is_deleted, updated_at) "
+                            "VALUES ($1, $2, '', '', '', 'normal', '', FALSE, '', '[]'::jsonb, '', $3, TRUE, $4) "
+                            "ON CONFLICT (user_id, task_id) DO UPDATE SET "
+                            "title = '', note = '', is_deleted = TRUE, rev = EXCLUDED.rev, updated_at = EXCLUDED.updated_at",
+                            user_id, task_id, next_rev, now_ts
+                        )
+                    else:
+                        await execute_pg_query(
+                            "INSERT INTO user_sync_tasks (user_id, task_id, project_id, title, note, priority, due_date, completed, completed_at, subtasks, date, rev, is_deleted, updated_at) "
+                            "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11, $12, FALSE, $13) "
+                            "ON CONFLICT (user_id, task_id) DO UPDATE SET "
+                            "project_id = EXCLUDED.project_id, title = EXCLUDED.title, note = EXCLUDED.note, "
+                            "priority = EXCLUDED.priority, due_date = EXCLUDED.due_date, completed = EXCLUDED.completed, "
+                            "completed_at = EXCLUDED.completed_at, subtasks = EXCLUDED.subtasks, date = EXCLUDED.date, "
+                            "rev = EXCLUDED.rev, is_deleted = FALSE, updated_at = EXCLUDED.updated_at",
+                            user_id, task_id, t_proj_id, t_title, t.note or "",
+                            t.priority or "normal", t.dueDate or "", bool(t.completed),
+                            t.completedAt or "", subtasks_json, t.createdAt or "", next_rev, now_ts
+                        )
 
-                if t.is_deleted:
-                    await execute_pg_query(
-                        "INSERT INTO user_sync_tasks (user_id, task_id, project_id, title, note, priority, due_date, completed, completed_at, subtasks, date, rev, is_deleted, updated_at) "
-                        "VALUES ($1, $2, '', '', '', 'normal', '', FALSE, '', '[]'::jsonb, '', $3, TRUE, $4) "
-                        "ON CONFLICT (user_id, task_id) DO UPDATE SET "
-                        "title = '', note = '', is_deleted = TRUE, rev = EXCLUDED.rev, updated_at = EXCLUDED.updated_at",
-                        user_id, task_id, next_rev, now_ts
-                    )
-                else:
-                    await execute_pg_query(
-                        "INSERT INTO user_sync_tasks (user_id, task_id, project_id, title, note, priority, due_date, completed, completed_at, subtasks, date, rev, is_deleted, updated_at) "
-                        "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11, $12, FALSE, $13) "
-                        "ON CONFLICT (user_id, task_id) DO UPDATE SET "
-                        "project_id = EXCLUDED.project_id, title = EXCLUDED.title, note = EXCLUDED.note, "
-                        "priority = EXCLUDED.priority, due_date = EXCLUDED.due_date, completed = EXCLUDED.completed, "
-                        "completed_at = EXCLUDED.completed_at, subtasks = EXCLUDED.subtasks, date = EXCLUDED.date, "
-                        "rev = EXCLUDED.rev, is_deleted = FALSE, updated_at = EXCLUDED.updated_at",
-                        user_id, task_id, t_proj_id, t_title, t.note or "",
-                        t.priority or "normal", t.dueDate or "", bool(t.completed),
-                        t.completedAt or "", subtasks_json, t.createdAt or "", next_rev, now_ts
-                    )
+        # Atomic commit with idempotency & concurrency protection
+        sync_result = await execute_sync_batch_atomic(
+            user_id=user_id,
+            app_code="task",
+            sync_batch_id=payload.sync_batch_id,
+            payload_data=payload,
+            has_mutations=has_mutations,
+            write_callback=_write_mutations
+        )
 
-        # 4. Pull Remote Updates
+        effective_rev = sync_result["current_rev"]
+
+        # Pull Remote Updates
         since_rev = payload.since_rev if payload.since_rev is not None else 0
         remote_projects = []
         remote_tasks = []
 
-        if since_rev == 0 or since_rev > next_rev:
-            # Full sync: return all active projects and tasks
+        if since_rev == 0 or since_rev > effective_rev:
             p_rows = await execute_pg_query(
                 "SELECT project_id, name, color, created_at_str, rev, is_deleted "
                 "FROM user_sync_task_projects "
@@ -505,8 +511,7 @@ async def sync_keep_tasks_batch(
             )
             remote_projects = _format_project_rows(p_rows)
             remote_tasks = _format_task_rows(t_rows)
-        elif since_rev < next_rev:
-            # Delta sync
+        elif since_rev < effective_rev:
             p_rows = await execute_pg_query(
                 "SELECT project_id, name, color, created_at_str, rev, is_deleted "
                 "FROM user_sync_task_projects "
@@ -526,7 +531,8 @@ async def sync_keep_tasks_batch(
 
         return {
             "status": "success",
-            "current_rev": next_rev,
+            "current_rev": effective_rev,
+            "deduplicated": sync_result.get("deduplicated", False),
             "synced_projects_count": len(synced_project_ids),
             "synced_tasks_count": len(synced_task_ids),
             "projects": remote_projects,
@@ -535,3 +541,4 @@ async def sync_keep_tasks_batch(
     except Exception as e:
         print(f"[KeepSyncTask] Batch sync error for user {user_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Task Keep Sync Error: {str(e)}")
+

@@ -1,8 +1,11 @@
+import contextvars
+from typing import Any, Optional
 import asyncpg
 from config import POSTGRES_HOST, POSTGRES_PORT, POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB
 from database.sqlite import execute_sqlite_query
 
 pg_pool = None
+_current_pg_conn: contextvars.ContextVar[Optional[Any]] = contextvars.ContextVar("_current_pg_conn", default=None)
 
 
 async def get_pg_pool():
@@ -10,8 +13,19 @@ async def get_pg_pool():
 
 
 async def execute_pg_query(query: str, *args):
-    """Execute a PostgreSQL query, falling back to SQLite for local development."""
+    """Execute a PostgreSQL query, binding to active transaction if present, falling back to SQLite for local development."""
     global pg_pool
+    # 1. Bind to active transaction connection if within an atomic batch transaction
+    active_conn = _current_pg_conn.get()
+    if active_conn:
+        if query.strip().upper().startswith("SELECT"):
+            records = await active_conn.fetch(query, *args)
+            return [dict(r) for r in records]
+        else:
+            await active_conn.execute(query, *args)
+            return [{"success": True}]
+
+    # 2. Acquire from pool for standalone query
     if pg_pool:
         try:
             async with pg_pool.acquire() as conn:
@@ -76,6 +90,8 @@ async def initialize_pg_schema():
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_recipient_id ON messages(recipient_id);")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_created_at ON messages(created_at);")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_update_id ON messages(update_id);")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_recipient_delivered ON messages(recipient_id, delivered);")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_pair ON messages(sender_id, recipient_id, created_at);")
 
         await conn.execute("""
             CREATE OR REPLACE FUNCTION bump_messages_update_id()
@@ -267,6 +283,11 @@ async def initialize_pg_schema():
                 UNIQUE (user_id, task_id)
             );
         """)
+        try:
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_sync_tasks_user_rev ON user_sync_tasks(user_id, rev);")
+        except Exception:
+            pass
+
         # ── App Cloud Sync: Calendar Events (Revision-Based Delta Sync) ────
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS user_sync_calendar_events (
@@ -289,6 +310,11 @@ async def initialize_pg_schema():
                 UNIQUE (user_id, event_id)
             );
         """)
+        try:
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_sync_calendar_events_user_rev ON user_sync_calendar_events(user_id, rev);")
+        except Exception:
+            pass
+
         # ── App Cloud Sync: Countday Events (Revision-Based Delta Sync) ─────
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS user_sync_countday_events (
@@ -347,6 +373,11 @@ async def initialize_pg_schema():
                 UNIQUE (user_id, project_id)
             );
         """)
+        try:
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_sync_table_projects_user_rev ON user_sync_table_projects(user_id, rev);")
+        except Exception:
+            pass
+
         # ── App Cloud Sync: Documents (Revision-Based Delta Sync) ───────────
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS user_sync_docs (
@@ -375,7 +406,104 @@ async def initialize_pg_schema():
         except Exception:
             pass
 
-        print("PostgreSQL schema initialized successfully!")
+        # ── Spac2 V2 Architecture: Domain-Scoped Revision Counters ─────────
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_sync_counters (
+                user_id BIGINT NOT NULL,
+                app_code VARCHAR(30) NOT NULL,
+                current_rev BIGINT NOT NULL DEFAULT 0,
+                updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (user_id, app_code)
+            );
+        """)
+        try:
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_sync_counters_user ON user_sync_counters(user_id);")
+        except Exception:
+            pass
+
+        # ── Spac2 V2 Architecture: Idempotency & Batch Commit Tracking ─────
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_sync_batches (
+                user_id BIGINT NOT NULL,
+                app_code VARCHAR(30) NOT NULL,
+                sync_batch_id UUID NOT NULL,
+                payload_hash VARCHAR(64) NOT NULL,
+                rev BIGINT NOT NULL,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (user_id, app_code, sync_batch_id)
+            );
+        """)
+        try:
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_sync_batches_user_app ON user_sync_batches(user_id, app_code);")
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_sync_batches_created ON user_sync_batches(created_at);")
+        except Exception:
+            pass
+
+        # ── Automated Seed & Reconcile: Initial Population from Existing Max Rev ─
+        try:
+            # Seed doc
+            await conn.execute("""
+                INSERT INTO user_sync_counters (user_id, app_code, current_rev, updated_at)
+                SELECT user_id, 'doc', COALESCE(MAX(rev), 0), CURRENT_TIMESTAMP 
+                FROM user_sync_docs GROUP BY user_id
+                ON CONFLICT (user_id, app_code) 
+                DO UPDATE SET current_rev = GREATEST(user_sync_counters.current_rev, EXCLUDED.current_rev), updated_at = CURRENT_TIMESTAMP;
+            """)
+            # Seed task (Unified task + task_projects domain)
+            await conn.execute("""
+                INSERT INTO user_sync_counters (user_id, app_code, current_rev, updated_at)
+                SELECT u.user_id, 'task', GREATEST(
+                    COALESCE((SELECT MAX(rev) FROM user_sync_tasks t WHERE t.user_id = u.user_id), 0),
+                    COALESCE((SELECT MAX(rev) FROM user_sync_task_projects p WHERE p.user_id = u.user_id), 0)
+                ), CURRENT_TIMESTAMP
+                FROM users u
+                ON CONFLICT (user_id, app_code) 
+                DO UPDATE SET current_rev = GREATEST(user_sync_counters.current_rev, EXCLUDED.current_rev), updated_at = CURRENT_TIMESTAMP;
+            """)
+            # Seed note
+            await conn.execute("""
+                INSERT INTO user_sync_counters (user_id, app_code, current_rev, updated_at)
+                SELECT user_id, 'note', COALESCE(MAX(rev), 0), CURRENT_TIMESTAMP 
+                FROM user_sync_notes GROUP BY user_id
+                ON CONFLICT (user_id, app_code) 
+                DO UPDATE SET current_rev = GREATEST(user_sync_counters.current_rev, EXCLUDED.current_rev), updated_at = CURRENT_TIMESTAMP;
+            """)
+            # Seed calendar
+            await conn.execute("""
+                INSERT INTO user_sync_counters (user_id, app_code, current_rev, updated_at)
+                SELECT user_id, 'calendar', COALESCE(MAX(rev), 0), CURRENT_TIMESTAMP 
+                FROM user_sync_calendar_events GROUP BY user_id
+                ON CONFLICT (user_id, app_code) 
+                DO UPDATE SET current_rev = GREATEST(user_sync_counters.current_rev, EXCLUDED.current_rev), updated_at = CURRENT_TIMESTAMP;
+            """)
+            # Seed mindmap
+            await conn.execute("""
+                INSERT INTO user_sync_counters (user_id, app_code, current_rev, updated_at)
+                SELECT user_id, 'mindmap', COALESCE(MAX(rev), 0), CURRENT_TIMESTAMP 
+                FROM user_sync_mindmap_projects GROUP BY user_id
+                ON CONFLICT (user_id, app_code) 
+                DO UPDATE SET current_rev = GREATEST(user_sync_counters.current_rev, EXCLUDED.current_rev), updated_at = CURRENT_TIMESTAMP;
+            """)
+            # Seed table
+            await conn.execute("""
+                INSERT INTO user_sync_counters (user_id, app_code, current_rev, updated_at)
+                SELECT user_id, 'table', COALESCE(MAX(rev), 0), CURRENT_TIMESTAMP 
+                FROM user_sync_table_projects GROUP BY user_id
+                ON CONFLICT (user_id, app_code) 
+                DO UPDATE SET current_rev = GREATEST(user_sync_counters.current_rev, EXCLUDED.current_rev), updated_at = CURRENT_TIMESTAMP;
+            """)
+            # Seed countday
+            await conn.execute("""
+                INSERT INTO user_sync_counters (user_id, app_code, current_rev, updated_at)
+                SELECT user_id, 'countday', COALESCE(MAX(rev), 0), CURRENT_TIMESTAMP 
+                FROM user_sync_countday_events GROUP BY user_id
+                ON CONFLICT (user_id, app_code) 
+                DO UPDATE SET current_rev = GREATEST(user_sync_counters.current_rev, EXCLUDED.current_rev), updated_at = CURRENT_TIMESTAMP;
+            """)
+        except Exception as seed_err:
+            print(f"[PostgresSchema] Notice during automatic seed reconcile: {seed_err}")
+
+        print("PostgreSQL schema and V2 Sync Counters initialized successfully!")
 
 
 

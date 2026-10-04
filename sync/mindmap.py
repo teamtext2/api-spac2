@@ -8,6 +8,7 @@ from pydantic import BaseModel
 
 from auth.deps import get_auth_token, decode_spac2_token, create_spac2_token, decode_text2_token, create_text2_token
 from database.postgres import execute_pg_query
+from sync.engine import get_domain_max_rev, execute_sync_batch_atomic
 
 router = APIRouter(prefix="/api/sync/mindmap", tags=["sync_mindmap"])
 
@@ -25,6 +26,7 @@ class MindmapProjectSyncItem(BaseModel):
 
 
 class MindmapKeepSyncRequest(BaseModel):
+    sync_batch_id: Optional[str] = None
     since_rev: Optional[int] = 0
     projects: Optional[List[MindmapProjectSyncItem]] = []
     items: Optional[List[MindmapProjectSyncItem]] = []
@@ -205,12 +207,22 @@ async def get_mindmap_delta_sync(
     """
     user_id = await _resolve_user_id(token, x_user_id, x_user_email, x_user_name, response)
 
+@router.get("")
+async def get_mindmap_delta_sync(
+    response: Response,
+    since_rev: int = Query(0),
+    token: str = Depends(get_auth_token),
+    x_user_id: Optional[str] = Header(None),
+    x_user_email: Optional[str] = Header(None),
+    x_user_name: Optional[str] = Header(None)
+):
+    """Google Keep / Mindmap-Style Lightweight Delta Pull.
+    Returns projects created/updated/deleted since since_rev.
+    """
+    user_id = await _resolve_user_id(token, x_user_id, x_user_email, x_user_name, response)
+
     try:
-        rev_res = await execute_pg_query(
-            "SELECT COALESCE(MAX(rev), 0) AS current_rev FROM user_sync_mindmap_projects WHERE user_id = $1",
-            user_id
-        )
-        current_rev = int(rev_res[0]["current_rev"]) if rev_res and rev_res[0].get("current_rev") else 0
+        current_rev = await get_domain_max_rev(user_id, "mindmap")
 
         if since_rev > 0 and since_rev == current_rev:
             return {
@@ -261,73 +273,72 @@ async def sync_keep_mindmap_batch(
     x_user_name: Optional[str] = Header(None)
 ):
     """Google Keep / Mindmap Single-Trip Atomic Full Sync (Push + Pull).
-    1. Saves all client mutations (upserts/deletes) with next revision.
+    1. Saves all client mutations (upserts/deletes) atomically with next revision.
     2. Atomically queries and returns remote projects updated by other devices since since_rev.
     """
     user_id = await _resolve_user_id(token, x_user_id, x_user_email, x_user_name, response)
 
     try:
-        # 1. Get current max revision
-        rev_res = await execute_pg_query(
-            "SELECT COALESCE(MAX(rev), 0) AS current_rev FROM user_sync_mindmap_projects WHERE user_id = $1",
-            user_id
-        )
-        current_max_rev = int(rev_res[0]["current_rev"]) if rev_res and rev_res[0].get("current_rev") else 0
-        
-        synced_project_ids = []
-        next_rev = current_max_rev
-
-        # Combine payload.projects and payload.items if both exist
         incoming_items = (payload.projects or []) + (payload.items or [])
-        # Deduplicate incoming items by id
         unique_incoming = {}
         for item in incoming_items:
             if item and item.id:
                 unique_incoming[str(item.id).strip()] = item
 
-        # 2. Push client mutations (if any)
-        if len(unique_incoming) > 0:
-            now_ts = int(time.time() * 1000)
-            next_rev = current_max_rev + 1
-            for proj_id, item in unique_incoming.items():
-                if not proj_id:
-                    continue
+        has_mutations = bool(len(unique_incoming) > 0)
+        synced_project_ids = []
 
-                item_name = (item.name or "").strip()
-                item_data = item.data if item.data is not None else {"nodes": [], "edges": [], "transform": {"x": 0, "y": 0, "scale": 1}}
-                if isinstance(item_data, str):
-                    data_json_str = item_data
-                else:
-                    data_json_str = json.dumps(item_data)
+        async def _write_mindmap_mutations(next_rev: int, now_ts: int):
+            if len(unique_incoming) > 0:
+                for proj_id, item in unique_incoming.items():
+                    if not proj_id:
+                        continue
 
-                created_at_str = str(item.createdAt or item.created_at or "").strip()
+                    item_name = (item.name or "").strip()
+                    item_data = item.data if item.data is not None else {"nodes": [], "edges": [], "transform": {"x": 0, "y": 0, "scale": 1}}
+                    if isinstance(item_data, str):
+                        data_json_str = item_data
+                    else:
+                        data_json_str = json.dumps(item_data)
 
-                synced_project_ids.append(proj_id)
+                    created_at_str = str(item.createdAt or item.created_at or "").strip()
+                    synced_project_ids.append(proj_id)
 
-                if item.is_deleted:
-                    await execute_pg_query(
-                        "INSERT INTO user_sync_mindmap_projects (user_id, project_id, name, data, created_at_str, rev, is_deleted, updated_at) "
-                        "VALUES ($1, $2, '', '{}'::jsonb, '', $3, TRUE, $4) "
-                        "ON CONFLICT (user_id, project_id) DO UPDATE SET "
-                        "name = '', data = '{}'::jsonb, is_deleted = TRUE, rev = EXCLUDED.rev, updated_at = EXCLUDED.updated_at",
-                        user_id, proj_id, next_rev, now_ts
-                    )
-                else:
-                    await execute_pg_query(
-                        "INSERT INTO user_sync_mindmap_projects (user_id, project_id, name, data, created_at_str, rev, is_deleted, updated_at) "
-                        "VALUES ($1, $2, $3, $4::jsonb, $5, $6, FALSE, $7) "
-                        "ON CONFLICT (user_id, project_id) DO UPDATE SET "
-                        "name = EXCLUDED.name, data = EXCLUDED.data, created_at_str = EXCLUDED.created_at_str, "
-                        "rev = EXCLUDED.rev, is_deleted = FALSE, updated_at = EXCLUDED.updated_at",
-                        user_id, proj_id, item_name, data_json_str, created_at_str, next_rev, now_ts
-                    )
+                    if item.is_deleted:
+                        await execute_pg_query(
+                            "INSERT INTO user_sync_mindmap_projects (user_id, project_id, name, data, created_at_str, rev, is_deleted, updated_at) "
+                            "VALUES ($1, $2, '', '{}'::jsonb, '', $3, TRUE, $4) "
+                            "ON CONFLICT (user_id, project_id) DO UPDATE SET "
+                            "name = '', data = '{}'::jsonb, is_deleted = TRUE, rev = EXCLUDED.rev, updated_at = EXCLUDED.updated_at",
+                            user_id, proj_id, next_rev, now_ts
+                        )
+                    else:
+                        await execute_pg_query(
+                            "INSERT INTO user_sync_mindmap_projects (user_id, project_id, name, data, created_at_str, rev, is_deleted, updated_at) "
+                            "VALUES ($1, $2, $3, $4::jsonb, $5, $6, FALSE, $7) "
+                            "ON CONFLICT (user_id, project_id) DO UPDATE SET "
+                            "name = EXCLUDED.name, data = EXCLUDED.data, created_at_str = EXCLUDED.created_at_str, "
+                            "rev = EXCLUDED.rev, is_deleted = FALSE, updated_at = EXCLUDED.updated_at",
+                            user_id, proj_id, item_name, data_json_str, created_at_str, next_rev, now_ts
+                        )
 
-        # 3. Pull remote updates (Atomic Pull)
+        # Atomic commit with idempotency & concurrency protection
+        sync_result = await execute_sync_batch_atomic(
+            user_id=user_id,
+            app_code="mindmap",
+            sync_batch_id=payload.sync_batch_id,
+            payload_data=payload,
+            has_mutations=has_mutations,
+            write_callback=_write_mindmap_mutations
+        )
+
+        effective_rev = sync_result["current_rev"]
+
+        # Pull remote updates (Atomic Pull)
         since_rev = payload.since_rev if payload.since_rev is not None else 0
         remote_projects = []
 
-        if since_rev == 0 or since_rev > next_rev:
-            # First sync on this device or client revision is ahead: return all active projects on server
+        if since_rev == 0 or since_rev > effective_rev:
             rows = await execute_pg_query(
                 "SELECT project_id, name, data, created_at_str, rev, is_deleted, created_at, updated_at "
                 "FROM user_sync_mindmap_projects "
@@ -336,8 +347,7 @@ async def sync_keep_mindmap_batch(
                 user_id
             )
             remote_projects = _format_mindmap_rows(rows)
-        elif since_rev < next_rev:
-            # Return projects updated by other devices (rev > since_rev)
+        elif since_rev < effective_rev:
             rows = await execute_pg_query(
                 "SELECT project_id, name, data, created_at_str, rev, is_deleted, created_at, updated_at "
                 "FROM user_sync_mindmap_projects "
@@ -349,7 +359,8 @@ async def sync_keep_mindmap_batch(
 
         return {
             "status": "success",
-            "current_rev": next_rev,
+            "current_rev": effective_rev,
+            "deduplicated": sync_result.get("deduplicated", False),
             "synced_count": len(synced_project_ids),
             "projects": remote_projects,
             "items": remote_projects
@@ -357,3 +368,4 @@ async def sync_keep_mindmap_batch(
     except Exception as e:
         print(f"[KeepSyncMindmap] Sync error for user {user_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Keep Sync Mindmap Error: {str(e)}")
+

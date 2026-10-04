@@ -8,6 +8,7 @@ from pydantic import BaseModel
 
 from auth.deps import get_auth_token, decode_spac2_token, create_spac2_token, decode_text2_token, create_text2_token
 from database.postgres import execute_pg_query
+from sync.engine import get_domain_max_rev, execute_sync_batch_atomic
 
 router = APIRouter(prefix="/api/sync/calendar", tags=["sync_calendar"])
 
@@ -33,6 +34,7 @@ class CalendarEventSyncItem(BaseModel):
 
 
 class CalendarKeepSyncRequest(BaseModel):
+    sync_batch_id: Optional[str] = None
     since_rev: Optional[int] = 0
     items: Optional[List[CalendarEventSyncItem]] = []
 
@@ -257,11 +259,7 @@ async def get_calendar_delta_sync(
     user_id = await _resolve_user_id(token, x_user_id, x_user_email, x_user_name, response)
 
     try:
-        rev_res = await execute_pg_query(
-            "SELECT COALESCE(MAX(rev), 0) AS current_rev FROM user_sync_calendar_events WHERE user_id = $1",
-            user_id
-        )
-        current_rev = int(rev_res[0]["current_rev"]) if rev_res and rev_res[0].get("current_rev") else 0
+        current_rev = await get_domain_max_rev(user_id, "calendar")
 
         if since_rev > 0 and since_rev == current_rev:
             return {
@@ -309,72 +307,74 @@ async def sync_keep_calendar_batch(
     x_user_name: Optional[str] = Header(None)
 ):
     """Google Keep / Calendar Single-Trip Atomic Full Sync (Push + Pull).
-    1. Saves all client mutations (upserts/deletes) with next revision.
+    1. Saves all client mutations (upserts/deletes) atomically with next revision.
     2. Atomically queries and returns remote events updated by other devices since since_rev.
     """
     user_id = await _resolve_user_id(token, x_user_id, x_user_email, x_user_name, response)
 
     try:
-        # 1. Get current max revision
-        rev_res = await execute_pg_query(
-            "SELECT COALESCE(MAX(rev), 0) AS current_rev FROM user_sync_calendar_events WHERE user_id = $1",
-            user_id
-        )
-        current_max_rev = int(rev_res[0]["current_rev"]) if rev_res and rev_res[0].get("current_rev") else 0
-        
+        has_mutations = bool(payload.items and len(payload.items) > 0)
         synced_event_ids = []
-        next_rev = current_max_rev
 
-        # 2. Push client mutations (if any)
-        if payload.items and len(payload.items) > 0:
-            now_ts = int(time.time() * 1000)
-            next_rev = current_max_rev + 1
-            for item in payload.items:
-                event_id = str(item.id).strip()
-                if not event_id:
-                    continue
+        async def _write_calendar_mutations(next_rev: int, now_ts: int):
+            if payload.items and len(payload.items) > 0:
+                for item in payload.items:
+                    event_id = str(item.id).strip()
+                    if not event_id:
+                        continue
 
-                item_title = (item.title or item.t or "").strip()
-                item_desc = (item.description or item.desc or "").strip()
-                item_date = (item.date or "").strip()
-                item_start = (item.startTime or item.start or "").strip()
-                item_end = (item.endTime or item.end or "").strip()
-                item_color_val = item.color if item.color is not None else item.c
-                normalized_color = _normalize_event_color(item_color_val)
-                color_json = json.dumps(normalized_color)
-                is_all_day = bool(item.isAllDay) if item.isAllDay is not None else (not item_start and not item_end)
-                location = (item.location or "").strip()
-                recurrence = (item.recurrence or "").strip()
+                    item_title = (item.title or item.t or "").strip()
+                    item_desc = (item.description or item.desc or "").strip()
+                    item_date = (item.date or "").strip()
+                    item_start = (item.startTime or item.start or "").strip()
+                    item_end = (item.endTime or item.end or "").strip()
+                    item_color_val = item.color if item.color is not None else item.c
+                    normalized_color = _normalize_event_color(item_color_val)
+                    color_json = json.dumps(normalized_color)
+                    is_all_day = bool(item.isAllDay) if item.isAllDay is not None else (not item_start and not item_end)
+                    location = (item.location or "").strip()
+                    recurrence = (item.recurrence or "").strip()
 
-                synced_event_ids.append(event_id)
+                    synced_event_ids.append(event_id)
 
-                if item.is_deleted:
-                    await execute_pg_query(
-                        "INSERT INTO user_sync_calendar_events (user_id, event_id, date, title, description, start_time, end_time, color, is_all_day, location, recurrence, rev, is_deleted, updated_at) "
-                        "VALUES ($1, $2, $3, '', '', '', '', '{}'::jsonb, FALSE, '', '', $4, TRUE, $5) "
-                        "ON CONFLICT (user_id, event_id) DO UPDATE SET "
-                        "title = '', description = '', is_deleted = TRUE, rev = EXCLUDED.rev, updated_at = EXCLUDED.updated_at",
-                        user_id, event_id, item_date, next_rev, now_ts
-                    )
-                else:
-                    await execute_pg_query(
-                        "INSERT INTO user_sync_calendar_events (user_id, event_id, date, title, description, start_time, end_time, color, is_all_day, location, recurrence, rev, is_deleted, updated_at) "
-                        "VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, $12, FALSE, $13) "
-                        "ON CONFLICT (user_id, event_id) DO UPDATE SET "
-                        "date = EXCLUDED.date, title = EXCLUDED.title, description = EXCLUDED.description, "
-                        "start_time = EXCLUDED.start_time, end_time = EXCLUDED.end_time, color = EXCLUDED.color, "
-                        "is_all_day = EXCLUDED.is_all_day, location = EXCLUDED.location, recurrence = EXCLUDED.recurrence, "
-                        "rev = EXCLUDED.rev, is_deleted = FALSE, updated_at = EXCLUDED.updated_at",
-                        user_id, event_id, item_date, item_title, item_desc,
-                        item_start, item_end, color_json, is_all_day, location, recurrence, next_rev, now_ts
-                    )
+                    if item.is_deleted:
+                        await execute_pg_query(
+                            "INSERT INTO user_sync_calendar_events (user_id, event_id, date, title, description, start_time, end_time, color, is_all_day, location, recurrence, rev, is_deleted, updated_at) "
+                            "VALUES ($1, $2, $3, '', '', '', '', '{}'::jsonb, FALSE, '', '', $4, TRUE, $5) "
+                            "ON CONFLICT (user_id, event_id) DO UPDATE SET "
+                            "title = '', description = '', is_deleted = TRUE, rev = EXCLUDED.rev, updated_at = EXCLUDED.updated_at",
+                            user_id, event_id, item_date, next_rev, now_ts
+                        )
+                    else:
+                        await execute_pg_query(
+                            "INSERT INTO user_sync_calendar_events (user_id, event_id, date, title, description, start_time, end_time, color, is_all_day, location, recurrence, rev, is_deleted, updated_at) "
+                            "VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, $12, FALSE, $13) "
+                            "ON CONFLICT (user_id, event_id) DO UPDATE SET "
+                            "date = EXCLUDED.date, title = EXCLUDED.title, description = EXCLUDED.description, "
+                            "start_time = EXCLUDED.start_time, end_time = EXCLUDED.end_time, color = EXCLUDED.color, "
+                            "is_all_day = EXCLUDED.is_all_day, location = EXCLUDED.location, recurrence = EXCLUDED.recurrence, "
+                            "rev = EXCLUDED.rev, is_deleted = FALSE, updated_at = EXCLUDED.updated_at",
+                            user_id, event_id, item_date, item_title, item_desc,
+                            item_start, item_end, color_json, is_all_day, location, recurrence, next_rev, now_ts
+                        )
 
-        # 3. Pull remote updates (Atomic Pull)
+        # Atomic commit with idempotency & concurrency protection
+        sync_result = await execute_sync_batch_atomic(
+            user_id=user_id,
+            app_code="calendar",
+            sync_batch_id=payload.sync_batch_id,
+            payload_data=payload,
+            has_mutations=has_mutations,
+            write_callback=_write_calendar_mutations
+        )
+
+        effective_rev = sync_result["current_rev"]
+
+        # Pull remote updates (Atomic Pull)
         since_rev = payload.since_rev if payload.since_rev is not None else 0
         remote_items = []
 
-        if since_rev == 0 or since_rev > next_rev:
-            # First sync on this device or client revision is ahead: return all active events on server
+        if since_rev == 0 or since_rev > effective_rev:
             rows = await execute_pg_query(
                 "SELECT event_id, date, title, description, start_time, end_time, color, is_all_day, location, recurrence, rev, is_deleted, updated_at "
                 "FROM user_sync_calendar_events "
@@ -383,8 +383,7 @@ async def sync_keep_calendar_batch(
                 user_id
             )
             remote_items = _format_calendar_rows(rows)
-        elif since_rev < next_rev:
-            # Return events updated by other devices (rev > since_rev)
+        elif since_rev < effective_rev:
             rows = await execute_pg_query(
                 "SELECT event_id, date, title, description, start_time, end_time, color, is_all_day, location, recurrence, rev, is_deleted, updated_at "
                 "FROM user_sync_calendar_events "
@@ -396,10 +395,12 @@ async def sync_keep_calendar_batch(
 
         return {
             "status": "success",
-            "current_rev": next_rev,
+            "current_rev": effective_rev,
+            "deduplicated": sync_result.get("deduplicated", False),
             "synced_count": len(synced_event_ids),
             "items": remote_items
         }
     except Exception as e:
         print(f"[KeepSyncCalendar] Sync error for user {user_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Keep Sync Calendar Error: {str(e)}")
+

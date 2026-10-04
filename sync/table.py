@@ -8,6 +8,7 @@ from pydantic import BaseModel
 
 from auth.deps import get_auth_token, decode_spac2_token, create_spac2_token, decode_text2_token, create_text2_token
 from database.postgres import execute_pg_query
+from sync.engine import get_domain_max_rev, execute_sync_batch_atomic
 
 router = APIRouter(prefix="/api/sync/table", tags=["sync_table"])
 
@@ -28,6 +29,7 @@ class TableProjectSyncItem(BaseModel):
 
 
 class TableKeepSyncRequest(BaseModel):
+    sync_batch_id: Optional[str] = None
     since_rev: Optional[int] = 0
     projects: Optional[List[TableProjectSyncItem]] = []
     items: Optional[List[TableProjectSyncItem]] = []
@@ -352,25 +354,9 @@ async def get_table_delta_sync(
     x_user_email: Optional[str] = Header(None),
     x_user_name: Optional[str] = Header(None)
 ):
-    """
-    Lightweight delta pull endpoint for checking cloud updates without push mutations.
-    """
+    """Google Keep / Workspace Style Lightweight Delta Pull for Table."""
     user_id = await _resolve_user_id(token, x_user_id, x_user_email, x_user_name, response)
-
-    rev_res = await execute_pg_query(
-        "SELECT COALESCE(MAX(rev), 0) AS current_rev FROM user_sync_table_projects WHERE user_id = $1",
-        user_id
-    )
-    current_max_rev = int(rev_res[0]["current_rev"]) if rev_res and rev_res[0].get("current_rev") else 0
-
-    if since_rev > 0 and since_rev == current_max_rev:
-        return {
-            "status": "success",
-            "current_rev": current_max_rev,
-            "synced_count": 0,
-            "projects": [],
-            "items": []
-        }
+    current_max_rev = await get_domain_max_rev(user_id, "table")
 
     if since_rev == 0 or since_rev > current_max_rev:
         rows = await execute_pg_query(
@@ -412,118 +398,116 @@ async def sync_table_projects_batch(
     """
     user_id = await _resolve_user_id(token, x_user_id, x_user_email, x_user_name, response)
     since_rev = payload.since_rev if payload.since_rev is not None else 0
-
-    # 1. Fetch current max revision for this user
-    rev_res = await execute_pg_query(
-        "SELECT COALESCE(MAX(rev), 0) AS current_rev FROM user_sync_table_projects WHERE user_id = $1",
-        user_id
-    )
-    current_max_rev = int(rev_res[0]["current_rev"]) if rev_res and rev_res[0].get("current_rev") else 0
+    current_max_rev = await get_domain_max_rev(user_id, "table")
 
     incoming_items = (payload.projects or []) + (payload.items or [])
+    has_mutations = bool(incoming_items and len(incoming_items) > 0)
     synced_project_ids = []
-    next_rev = current_max_rev
-    now_ts = int(time.time() * 1000)
 
-    # 2. Process outgoing dirty items pushed by client
-    if incoming_items:
-        next_rev = current_max_rev + 1
-        seen_batch_ids = set()
+    async def _write_table_mutations(next_rev: int, now_ts: int):
+        if incoming_items:
+            seen_batch_ids = set()
 
-        for item in incoming_items:
-            proj_id = str(item.id).strip()
-            if not proj_id or proj_id in seen_batch_ids:
-                continue
-            seen_batch_ids.add(proj_id)
+            for item in incoming_items:
+                proj_id = str(item.id).strip()
+                if not proj_id or proj_id in seen_batch_ids:
+                    continue
+                seen_batch_ids.add(proj_id)
 
-            item_name = (item.name or "").strip()
-            raw_data = item.data
+                item_name = (item.name or "").strip()
+                raw_data = item.data
 
-            if item.patches and not item.is_deleted:
-                # 🟢 Delta Patch Sync: Patch existing DB record directly (ultra-light payload ~150B)
-                try:
-                    ex_rows = await execute_pg_query(
-                        "SELECT name, data FROM user_sync_table_projects WHERE user_id = $1 AND project_id = $2 AND is_deleted = FALSE",
-                        user_id, proj_id
-                    )
-                    if ex_rows and ex_rows[0].get("data"):
-                        db_raw = ex_rows[0]["data"]
-                        db_name = ex_rows[0].get("name") or item_name or "Untitled Spreadsheet"
-                        db_obj = json.loads(db_raw) if isinstance(db_raw, str) else db_raw
-                        data_obj = _apply_cell_patches(db_obj, item.patches)
-                        if not item_name:
-                            item_name = db_name
-                    else:
-                        base_obj = {"sheets": [{"name": "Sheet 1", "data": [[""]], "colWidths": [], "rowHeights": [], "styles": {}, "merges": []}], "activeSheetIndex": 0}
-                        data_obj = _apply_cell_patches(base_obj, item.patches)
-                except Exception as patch_err:
-                    print(f"[TableSync] Notice: patch application fallback: {patch_err}")
-                    data_obj = {"sheets": [], "activeSheetIndex": 0}
-            else:
-                # 🟢 Full Snapshot Sync with Sparse Trimming
-                if isinstance(raw_data, str):
-                    try:
-                        data_obj = json.loads(raw_data)
-                    except Exception:
-                        data_obj = {"sheets": [], "activeSheetIndex": 0}
-                elif isinstance(raw_data, dict):
-                    data_obj = raw_data
-                else:
-                    data_obj = {"sheets": [], "activeSheetIndex": 0}
-
-                # Concurrent edit resolution: merge differential cells if other devices updated since client's rev
-                if not item.is_deleted and since_rev < current_max_rev:
+                if item.patches and not item.is_deleted:
+                    # 🟢 Delta Patch Sync: Patch existing DB record directly
                     try:
                         ex_rows = await execute_pg_query(
-                            "SELECT data FROM user_sync_table_projects WHERE user_id = $1 AND project_id = $2 AND is_deleted = FALSE",
+                            "SELECT name, data FROM user_sync_table_projects WHERE user_id = $1 AND project_id = $2 AND is_deleted = FALSE",
                             user_id, proj_id
                         )
                         if ex_rows and ex_rows[0].get("data"):
                             db_raw = ex_rows[0]["data"]
+                            db_name = ex_rows[0].get("name") or item_name or "Untitled Spreadsheet"
                             db_obj = json.loads(db_raw) if isinstance(db_raw, str) else db_raw
-                            data_obj = _merge_table_project_data(db_obj, data_obj)
-                    except Exception as merge_err:
-                        print(f"[TableSync] Notice: differential merge fallback: {merge_err}")
+                            data_obj = _apply_cell_patches(db_obj, item.patches)
+                            if not item_name:
+                                item_name = db_name
+                        else:
+                            base_obj = {"sheets": [{"name": "Sheet 1", "data": [[""]], "colWidths": [], "rowHeights": [], "styles": {}, "merges": []}], "activeSheetIndex": 0}
+                            data_obj = _apply_cell_patches(base_obj, item.patches)
+                    except Exception as patch_err:
+                        print(f"[TableSync] Notice: patch application fallback: {patch_err}")
+                        data_obj = {"sheets": [], "activeSheetIndex": 0}
+                else:
+                    # 🟢 Full Snapshot Sync
+                    if isinstance(raw_data, str):
+                        try:
+                            data_obj = json.loads(raw_data)
+                        except Exception:
+                            data_obj = {"sheets": [], "activeSheetIndex": 0}
+                    elif isinstance(raw_data, dict):
+                        data_obj = raw_data
+                    else:
+                        data_obj = {"sheets": [], "activeSheetIndex": 0}
 
-            data_json = json.dumps(data_obj)
-            last_edited_val = int(item.lastEdited or item.last_edited or item.updatedAt or item.updated_at or now_ts)
+                    # Concurrent edit resolution
+                    if not item.is_deleted and since_rev < current_max_rev:
+                        try:
+                            ex_rows = await execute_pg_query(
+                                "SELECT data FROM user_sync_table_projects WHERE user_id = $1 AND project_id = $2 AND is_deleted = FALSE",
+                                user_id, proj_id
+                            )
+                            if ex_rows and ex_rows[0].get("data"):
+                                db_raw = ex_rows[0]["data"]
+                                db_obj = json.loads(db_raw) if isinstance(db_raw, str) else db_raw
+                                data_obj = _merge_table_project_data(db_obj, data_obj)
+                        except Exception as merge_err:
+                            print(f"[TableSync] Notice: differential merge fallback: {merge_err}")
 
-            synced_project_ids.append(proj_id)
+                data_json = json.dumps(data_obj)
+                last_edited_val = int(item.lastEdited or item.last_edited or item.updatedAt or item.updated_at or now_ts)
+                synced_project_ids.append(proj_id)
 
-            if item.is_deleted:
-                # Soft-delete record with bumped rev to notify other devices
-                await execute_pg_query(
-                    "INSERT INTO user_sync_table_projects (user_id, project_id, name, data, last_edited, rev, is_deleted, updated_at) "
-                    "VALUES ($1, $2, '', '{}'::jsonb, 0, $3, TRUE, $4) "
-                    "ON CONFLICT (user_id, project_id) DO UPDATE SET "
-                    "name = '', data = '{}'::jsonb, is_deleted = TRUE, rev = EXCLUDED.rev, updated_at = EXCLUDED.updated_at",
-                    user_id, proj_id, next_rev, now_ts
-                )
-            else:
-                # Upsert active project
-                await execute_pg_query(
-                    "INSERT INTO user_sync_table_projects (user_id, project_id, name, data, last_edited, rev, is_deleted, updated_at) "
-                    "VALUES ($1, $2, $3, $4::jsonb, $5, $6, FALSE, $7) "
-                    "ON CONFLICT (user_id, project_id) DO UPDATE SET "
-                    "name = EXCLUDED.name, data = EXCLUDED.data, last_edited = EXCLUDED.last_edited, "
-                    "rev = EXCLUDED.rev, is_deleted = FALSE, updated_at = EXCLUDED.updated_at",
-                    user_id, proj_id, item_name or "Untitled Spreadsheet", data_json, last_edited_val, next_rev, now_ts
-                )
+                if item.is_deleted:
+                    await execute_pg_query(
+                        "INSERT INTO user_sync_table_projects (user_id, project_id, name, data, last_edited, rev, is_deleted, updated_at) "
+                        "VALUES ($1, $2, '', '{}'::jsonb, 0, $3, TRUE, $4) "
+                        "ON CONFLICT (user_id, project_id) DO UPDATE SET "
+                        "name = '', data = '{}'::jsonb, is_deleted = TRUE, rev = EXCLUDED.rev, updated_at = EXCLUDED.updated_at",
+                        user_id, proj_id, next_rev, now_ts
+                    )
+                else:
+                    await execute_pg_query(
+                        "INSERT INTO user_sync_table_projects (user_id, project_id, name, data, last_edited, rev, is_deleted, updated_at) "
+                        "VALUES ($1, $2, $3, $4::jsonb, $5, $6, FALSE, $7) "
+                        "ON CONFLICT (user_id, project_id) DO UPDATE SET "
+                        "name = EXCLUDED.name, data = EXCLUDED.data, last_edited = EXCLUDED.last_edited, "
+                        "rev = EXCLUDED.rev, is_deleted = FALSE, updated_at = EXCLUDED.updated_at",
+                        user_id, proj_id, item_name or "Untitled Spreadsheet", data_json, last_edited_val, next_rev, now_ts
+                    )
 
-    # 3. Pull delta changes for client (Atomic Pull)
-    since_rev = payload.since_rev if payload.since_rev is not None else 0
+    # Atomic commit with idempotency & concurrency protection
+    sync_result = await execute_sync_batch_atomic(
+        user_id=user_id,
+        app_code="table",
+        sync_batch_id=payload.sync_batch_id,
+        payload_data=payload,
+        has_mutations=has_mutations,
+        write_callback=_write_table_mutations
+    )
+
+    effective_rev = sync_result["current_rev"]
+
+    # Pull delta changes for client (Atomic Pull)
     remote_projects = []
 
-    if since_rev == 0 or since_rev > next_rev:
-        # Full sync: return all active projects
+    if since_rev == 0 or since_rev > effective_rev:
         rows = await execute_pg_query(
             "SELECT project_id, name, data, last_edited, rev, is_deleted, created_at, updated_at "
             "FROM user_sync_table_projects WHERE user_id = $1 AND is_deleted = FALSE ORDER BY rev ASC",
             user_id
         )
         remote_projects = _format_table_rows(rows)
-    elif since_rev < next_rev:
-        # Delta sync: return all changes since requested rev
+    elif since_rev < effective_rev:
         rows = await execute_pg_query(
             "SELECT project_id, name, data, last_edited, rev, is_deleted, created_at, updated_at "
             "FROM user_sync_table_projects WHERE user_id = $1 AND rev > $2 ORDER BY rev ASC",
@@ -533,8 +517,10 @@ async def sync_table_projects_batch(
 
     return {
         "status": "success",
-        "current_rev": next_rev,
+        "current_rev": effective_rev,
+        "deduplicated": sync_result.get("deduplicated", False),
         "synced_count": len(synced_project_ids),
         "projects": remote_projects,
         "items": remote_projects
     }
+

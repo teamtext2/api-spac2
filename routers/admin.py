@@ -709,7 +709,7 @@ async def api_admin_delete_user(
     # 1. Purge R2 Storage & Local Storage Files
     storage_result = delete_user_r2_and_local_files(username=username, avatar_url=avatar_url)
 
-    # 2. Purge 8 App Cloud Sync Tables
+    # 2. Purge App Cloud Sync Tables, Counters & Idempotency Batches
     sync_tables = [
         "user_sync_notes",
         "user_sync_tasks",
@@ -718,7 +718,9 @@ async def api_admin_delete_user(
         "user_sync_countday_events",
         "user_sync_mindmap_projects",
         "user_sync_table_projects",
-        "user_sync_docs"
+        "user_sync_docs",
+        "user_sync_counters",
+        "user_sync_batches"
     ]
     for table in sync_tables:
         try:

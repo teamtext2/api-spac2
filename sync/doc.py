@@ -8,6 +8,7 @@ from pydantic import BaseModel
 
 from auth.deps import get_auth_token, decode_spac2_token, create_spac2_token, decode_text2_token, create_text2_token
 from database.postgres import execute_pg_query
+from sync.engine import get_domain_max_rev, execute_sync_batch_atomic
 
 router = APIRouter(prefix="/api/sync/doc", tags=["sync_doc"])
 
@@ -37,6 +38,7 @@ class DocSyncItem(BaseModel):
 
 
 class DocKeepSyncRequest(BaseModel):
+    sync_batch_id: Optional[str] = None
     since_rev: Optional[int] = 0
     items: Optional[List[DocSyncItem]] = []
 
@@ -280,11 +282,7 @@ async def get_doc_delta_sync(
     await _ensure_doc_table()
 
     try:
-        rev_res = await execute_pg_query(
-            "SELECT COALESCE(MAX(rev), 0) AS current_rev FROM user_sync_docs WHERE user_id = $1",
-            user_id
-        )
-        current_rev = int(rev_res[0]["current_rev"]) if rev_res and rev_res[0].get("current_rev") else 0
+        current_rev = await get_domain_max_rev(user_id, "doc")
 
         if since_rev > 0 and since_rev == current_rev:
             return {
@@ -334,7 +332,7 @@ async def sync_keep_docs_batch(
     x_user_name: Optional[str] = Header(None)
 ):
     """Google Keep-Style Single-Trip Atomic Full Sync (Push + Pull).
-    1. Saves all client mutations (upserts/deletes) with next revision.
+    1. Saves all client mutations (upserts/deletes) atomically with next revision.
     2. Soft Delete Tombstone: frees heavy body/tabs content while retaining metadata for 30-day delta propagation.
     3. Auto-purges soft-deleted tombstones older than 30 days.
     4. Atomically queries and returns remote documents updated by other devices since since_rev.
@@ -343,88 +341,88 @@ async def sync_keep_docs_batch(
     await _ensure_doc_table()
 
     try:
-        # 1. Get current max revision
-        rev_res = await execute_pg_query(
-            "SELECT COALESCE(MAX(rev), 0) AS current_rev FROM user_sync_docs WHERE user_id = $1",
-            user_id
-        )
-        current_max_rev = int(rev_res[0]["current_rev"]) if rev_res and rev_res[0].get("current_rev") else 0
-
+        has_mutations = bool(payload.items and len(payload.items) > 0)
         synced_doc_ids = []
-        next_rev = current_max_rev
 
-        now_ts = int(time.time() * 1000)
+        async def _write_doc_mutations(next_rev: int, now_ts: int):
+            if payload.items and len(payload.items) > 0:
+                for item in payload.items:
+                    doc_id = str(item.id).strip()
+                    if not doc_id:
+                        continue
 
-        # 2. Push client mutations (if any)
-        if payload.items and len(payload.items) > 0:
-            next_rev = current_max_rev + 1
-            for item in payload.items:
-                doc_id = str(item.id).strip()
-                if not doc_id:
-                    continue
+                    item_title = (item.title or "").strip()
+                    item_body = item.body or ""
+                    preview_text = item.previewText or item.preview_text or ""
+                    word_count = item.wordCount if item.wordCount is not None else (item.word_count or 0)
+                    pinned = bool(item.pinned)
+                    in_trash = bool(item.inTrash if item.inTrash is not None else item.in_trash)
+                    target = int(item.target or 500)
+                    active_tab_id = item.activeTabId or item.active_tab_id or ""
 
-                item_title = (item.title or "").strip()
-                item_body = item.body or ""
-                preview_text = item.previewText or item.preview_text or ""
-                word_count = item.wordCount if item.wordCount is not None else (item.word_count or 0)
-                pinned = bool(item.pinned)
-                in_trash = bool(item.inTrash if item.inTrash is not None else item.in_trash)
-                target = int(item.target or 500)
-                active_tab_id = item.activeTabId or item.active_tab_id or ""
+                    tabs_val = _normalize_json_field(item.tabs, [])
+                    tabs_json = json.dumps(tabs_val)
 
-                tabs_val = _normalize_json_field(item.tabs, [])
-                tabs_json = json.dumps(tabs_val)
+                    history_val = _normalize_json_field(item.history, [])
+                    history_json = json.dumps(history_val)
 
-                history_val = _normalize_json_field(item.history, [])
-                history_json = json.dumps(history_val)
+                    item_updated_at = int(item.updated or item.updated_at or now_ts)
+                    synced_doc_ids.append(doc_id)
 
-                item_updated_at = int(item.updated or item.updated_at or now_ts)
-                synced_doc_ids.append(doc_id)
+                    if item.is_deleted:
+                        await execute_pg_query(
+                            "INSERT INTO user_sync_docs ("
+                            "   user_id, doc_id, title, body, preview_text, word_count, pinned, in_trash, "
+                            "   target, tabs, active_tab_id, history, rev, is_deleted, updated_at"
+                            ") VALUES ($1, $2, '', '', '', 0, FALSE, FALSE, 500, '[]'::jsonb, '', '[]'::jsonb, $3, TRUE, $4) "
+                            "ON CONFLICT (user_id, doc_id) DO UPDATE SET "
+                            "   title = '', body = '', preview_text = '', word_count = 0, pinned = FALSE, in_trash = FALSE, "
+                            "   tabs = '[]'::jsonb, history = '[]'::jsonb, is_deleted = TRUE, rev = EXCLUDED.rev, updated_at = EXCLUDED.updated_at",
+                            user_id, doc_id, next_rev, now_ts
+                        )
+                    else:
+                        await execute_pg_query(
+                            "INSERT INTO user_sync_docs ("
+                            "   user_id, doc_id, title, body, preview_text, word_count, pinned, in_trash, "
+                            "   target, tabs, active_tab_id, history, rev, is_deleted, updated_at"
+                            ") VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11, $12::jsonb, $13, FALSE, $14) "
+                            "ON CONFLICT (user_id, doc_id) DO UPDATE SET "
+                            "   title = EXCLUDED.title, body = EXCLUDED.body, preview_text = EXCLUDED.preview_text, "
+                            "   word_count = EXCLUDED.word_count, pinned = EXCLUDED.pinned, in_trash = EXCLUDED.in_trash, "
+                            "   target = EXCLUDED.target, tabs = EXCLUDED.tabs, active_tab_id = EXCLUDED.active_tab_id, "
+                            "   history = EXCLUDED.history, rev = EXCLUDED.rev, is_deleted = FALSE, updated_at = EXCLUDED.updated_at",
+                            user_id, doc_id, item_title, item_body, preview_text, word_count,
+                            pinned, in_trash, target, tabs_json, active_tab_id, history_json,
+                            next_rev, item_updated_at
+                        )
 
-                if item.is_deleted:
-                    # Soft Delete Tombstone: Clear heavy content, retain metadata for 30 days
-                    await execute_pg_query(
-                        "INSERT INTO user_sync_docs ("
-                        "   user_id, doc_id, title, body, preview_text, word_count, pinned, in_trash, "
-                        "   target, tabs, active_tab_id, history, rev, is_deleted, updated_at"
-                        ") VALUES ($1, $2, '', '', '', 0, FALSE, FALSE, 500, '[]'::jsonb, '', '[]'::jsonb, $3, TRUE, $4) "
-                        "ON CONFLICT (user_id, doc_id) DO UPDATE SET "
-                        "   title = '', body = '', preview_text = '', word_count = 0, pinned = FALSE, in_trash = FALSE, "
-                        "   tabs = '[]'::jsonb, history = '[]'::jsonb, is_deleted = TRUE, rev = EXCLUDED.rev, updated_at = EXCLUDED.updated_at",
-                        user_id, doc_id, next_rev, now_ts
-                    )
-                else:
-                    await execute_pg_query(
-                        "INSERT INTO user_sync_docs ("
-                        "   user_id, doc_id, title, body, preview_text, word_count, pinned, in_trash, "
-                        "   target, tabs, active_tab_id, history, rev, is_deleted, updated_at"
-                        ") VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11, $12::jsonb, $13, FALSE, $14) "
-                        "ON CONFLICT (user_id, doc_id) DO UPDATE SET "
-                        "   title = EXCLUDED.title, body = EXCLUDED.body, preview_text = EXCLUDED.preview_text, "
-                        "   word_count = EXCLUDED.word_count, pinned = EXCLUDED.pinned, in_trash = EXCLUDED.in_trash, "
-                        "   target = EXCLUDED.target, tabs = EXCLUDED.tabs, active_tab_id = EXCLUDED.active_tab_id, "
-                        "   history = EXCLUDED.history, rev = EXCLUDED.rev, is_deleted = FALSE, updated_at = EXCLUDED.updated_at",
-                        user_id, doc_id, item_title, item_body, preview_text, word_count,
-                        pinned, in_trash, target, tabs_json, active_tab_id, history_json,
-                        next_rev, item_updated_at
-                    )
+            # Auto-purge soft-deleted tombstones older than 30 days
+            try:
+                thirty_days_ago_ts = now_ts - (30 * 86400 * 1000)
+                await execute_pg_query(
+                    "DELETE FROM user_sync_docs WHERE user_id = $1 AND is_deleted = TRUE AND updated_at < $2",
+                    user_id, thirty_days_ago_ts
+                )
+            except Exception as purge_err:
+                print(f"[KeepSyncDoc] 30-day tombstone cleanup notice: {purge_err}")
 
-        # 3. 30-Day Tombstone Auto-Purge: Clean tombstones older than 30 days
-        try:
-            thirty_days_ago_ts = now_ts - (30 * 86400 * 1000)
-            await execute_pg_query(
-                "DELETE FROM user_sync_docs WHERE user_id = $1 AND is_deleted = TRUE AND updated_at < $2",
-                user_id, thirty_days_ago_ts
-            )
-        except Exception as purge_err:
-            print(f"[KeepSyncDoc] 30-day tombstone cleanup notice: {purge_err}")
+        # Atomic commit with idempotency & concurrency protection
+        sync_result = await execute_sync_batch_atomic(
+            user_id=user_id,
+            app_code="doc",
+            sync_batch_id=payload.sync_batch_id,
+            payload_data=payload,
+            has_mutations=has_mutations,
+            write_callback=_write_doc_mutations
+        )
 
-        # 4. Atomic Pull: Get remote updates
+        effective_rev = sync_result["current_rev"]
+
+        # Atomic Pull: Get remote updates
         since_rev = payload.since_rev if payload.since_rev is not None else 0
         remote_items = []
 
-        if since_rev == 0 or since_rev > next_rev:
-            # Full sync: all active documents
+        if since_rev == 0 or since_rev > effective_rev:
             rows = await execute_pg_query(
                 "SELECT doc_id, title, body, preview_text, word_count, pinned, in_trash, target, "
                 "tabs, active_tab_id, history, rev, is_deleted, updated_at "
@@ -434,8 +432,7 @@ async def sync_keep_docs_batch(
                 user_id
             )
             remote_items = _format_doc_rows(rows)
-        elif since_rev < next_rev:
-            # Delta sync
+        elif since_rev < effective_rev:
             rows = await execute_pg_query(
                 "SELECT doc_id, title, body, preview_text, word_count, pinned, in_trash, target, "
                 "tabs, active_tab_id, history, rev, is_deleted, updated_at "
@@ -448,7 +445,8 @@ async def sync_keep_docs_batch(
 
         return {
             "status": "success",
-            "current_rev": next_rev,
+            "current_rev": effective_rev,
+            "deduplicated": sync_result.get("deduplicated", False),
             "synced_count": len(synced_doc_ids),
             "items": remote_items
         }
@@ -456,3 +454,4 @@ async def sync_keep_docs_batch(
     except Exception as e:
         print(f"[KeepSyncDoc] Sync error for user {user_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to sync docs: {str(e)}")
+
