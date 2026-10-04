@@ -25,7 +25,7 @@ from config import DEFAULT_AVATAR_URL
 
 async def websocket_endpoint(websocket: WebSocket, username: str, token: str = Query(None)):
     username = username.strip().lower()
-    print(f"[WS] Connection attempt for @{username} with token: '{token}'")
+    print(f"[WS] Connection attempt for @{username} (token_present={bool(token)})")
 
     email = await get_email_by_username(username)
     if not email:
