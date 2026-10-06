@@ -491,7 +491,7 @@ async def sync_keep_notes_batch(
                             "   title = EXCLUDED.title, content = EXCLUDED.content, color = EXCLUDED.color, "
                             "   is_saved = EXCLUDED.is_saved, date = EXCLUDED.date, history = EXCLUDED.history, "
                             "   rev = EXCLUDED.rev, visibility = EXCLUDED.visibility, is_deleted = FALSE, deleted_at = NULL, updated_at = EXCLUDED.updated_at "
-                            "WHERE user_sync_notes.is_deleted = FALSE",
+                            "WHERE user_sync_notes.user_id = EXCLUDED.user_id",
                             target_owner_id, note_id, item_title, item_content,
                             color_json, bool(item.isSaved), item.date or "", history_json,
                             next_rev, item_visibility, item_updated_at

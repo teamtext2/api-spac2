@@ -177,20 +177,40 @@ async def update_resource_visibility(
             f"SELECT {user_col}, is_deleted FROM {table} WHERE {id_col} = $1 LIMIT 1",
             resource_id
         )
+        now_ts = int(time.time() * 1000)
+
         if not rows or len(rows) == 0:
-            raise HTTPException(status_code=404, detail="Resource not found")
+            # Resource created locally, insert initial row for owner
+            if app_code == "note":
+                await execute_pg_query(
+                    "INSERT INTO user_sync_notes (user_id, note_id, title, content, color, is_saved, date, history, rev, visibility, is_deleted, updated_at) "
+                    "VALUES ($1, $2, '', '', '{}'::jsonb, FALSE, '', '[]'::jsonb, 1, $3, FALSE, $4) "
+                    "ON CONFLICT (note_id) DO UPDATE SET visibility = EXCLUDED.visibility, is_deleted = FALSE, deleted_at = NULL, updated_at = EXCLUDED.updated_at",
+                    requester_id, resource_id, new_vis, now_ts
+                )
+            elif app_code == "doc":
+                await execute_pg_query(
+                    "INSERT INTO user_sync_docs (user_id, doc_id, title, content, word_count, is_pinned, is_deleted, rev, visibility, updated_at) "
+                    "VALUES ($1, $2, '', '', 0, FALSE, FALSE, 1, $3, $4) "
+                    "ON CONFLICT (doc_id) DO UPDATE SET visibility = EXCLUDED.visibility, is_deleted = FALSE, deleted_at = NULL, updated_at = EXCLUDED.updated_at",
+                    requester_id, resource_id, new_vis, now_ts
+                )
+            return {
+                "status": "success",
+                "app_code": app_code,
+                "resource_id": resource_id,
+                "visibility": new_vis,
+                "rev": 1,
+                "updated_at": now_ts
+            }
 
         item = rows[0]
-        if bool(item.get("is_deleted")):
-            raise HTTPException(status_code=404, detail="Resource not found")
-
         owner_id = int(item.get(user_col) or 0)
         if requester_id != owner_id:
             raise HTTPException(status_code=403, detail="Forbidden: Only the owner can change resource visibility.")
 
-        now_ts = int(time.time() * 1000)
         up_rows = await execute_pg_query(
-            f"UPDATE {table} SET visibility = $1, rev = rev + 1, updated_at = $2 WHERE {id_col} = $3 RETURNING rev",
+            f"UPDATE {table} SET visibility = $1, is_deleted = FALSE, deleted_at = NULL, rev = rev + 1, updated_at = $2 WHERE {id_col} = $3 RETURNING rev",
             new_vis, now_ts, resource_id
         )
         new_rev = int(up_rows[0].get("rev") or 1) if up_rows else 1
