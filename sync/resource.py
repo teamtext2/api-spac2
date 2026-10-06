@@ -262,6 +262,13 @@ async def update_resource_visibility(
                     "ON CONFLICT (task_id) DO UPDATE SET visibility = EXCLUDED.visibility, is_deleted = FALSE, deleted_at = NULL, updated_at = EXCLUDED.updated_at",
                     requester_id, resource_id, new_vis, now_ts
                 )
+            elif app_code == "mindmap":
+                await execute_pg_query(
+                    "INSERT INTO user_sync_mindmap_projects (user_id, project_id, name, data, created_at_str, rev, visibility, is_deleted, updated_at) "
+                    "VALUES ($1, $2, '', '{\"nodes\":[],\"edges\":[],\"transform\":{\"x\":0,\"y\":0,\"scale\":1}}'::jsonb, '', 1, $3, FALSE, $4) "
+                    "ON CONFLICT (project_id) DO UPDATE SET visibility = EXCLUDED.visibility, is_deleted = FALSE, deleted_at = NULL, updated_at = EXCLUDED.updated_at",
+                    requester_id, resource_id, new_vis, now_ts
+                )
 
             # Broadcast invalidation ping
             try:
