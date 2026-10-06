@@ -5,9 +5,15 @@ import json
 import hmac
 import hashlib
 import base64
+import platform
 from typing import Optional, List, Dict, Any
 from pydantic import BaseModel
 from fastapi import APIRouter, HTTPException, Depends, Header, Query, Request
+
+try:
+    import psutil
+except ImportError:
+    psutil = None
 
 from database.postgres import execute_pg_query
 from storage.r2 import (
@@ -288,6 +294,147 @@ async def api_admin_verify(admin: dict = Depends(require_hero_admin)):
     }
 
 
+# --- VPS & Infrastructure Metrics Helpers ---
+def format_uptime(seconds: float) -> str:
+    s = int(seconds)
+    days = s // 86400
+    hours = (s % 86400) // 3600
+    minutes = (s % 3600) // 60
+    secs = s % 60
+    parts = []
+    if days > 0:
+        parts.append(f"{days}d")
+    if hours > 0 or days > 0:
+        parts.append(f"{hours}h")
+    if minutes > 0 or (days == 0 and hours == 0):
+        parts.append(f"{minutes}m")
+    if days == 0 and hours == 0 and minutes < 5:
+        parts.append(f"{secs}s")
+    return " ".join(parts) if parts else "0s"
+
+
+def get_vps_metrics() -> dict:
+    if psutil is None:
+        return {
+            "available": False,
+            "message": "psutil module is not installed (run: pip install psutil)",
+            "os": platform.system(),
+            "cpu": {"percent": 0.0, "status": "normal", "cores_logical": 1, "cores_physical": 1, "load_avg": []},
+            "memory": {"percent": 0.0, "used_formatted": "0 MB", "total_formatted": "0 MB", "available_formatted": "0 MB", "status": "normal"},
+            "disk": {"percent": 0.0, "used_formatted": "0 GB", "total_formatted": "0 GB", "free_formatted": "0 GB", "status": "normal"},
+            "uptime": {"seconds": 0, "formatted": "N/A"},
+            "process": {"cpu_percent": 0.0, "memory_rss_formatted": "0 MB", "active_websockets": len(active_connections)},
+            "timestamp": int(time.time())
+        }
+
+    try:
+        # CPU Usage (non-blocking call)
+        cpu_percent = float(psutil.cpu_percent(interval=None))
+        cpu_count_logical = psutil.cpu_count(logical=True) or 1
+        cpu_count_physical = psutil.cpu_count(logical=False) or cpu_count_logical
+
+        load_avg = []
+        try:
+            if hasattr(os, "getloadavg"):
+                load_avg = [round(x, 2) for x in os.getloadavg()]
+            elif hasattr(psutil, "getloadavg"):
+                load_avg = [round(x, 2) for x in psutil.getloadavg()]
+        except Exception:
+            pass
+
+        # Memory (RAM)
+        vmem = psutil.virtual_memory()
+        swap = psutil.swap_memory()
+
+        # Disk Storage
+        try:
+            disk_path = '/' if os.name != 'nt' else os.path.splitdrive(os.getcwd())[0] + '\\'
+            disk = psutil.disk_usage(disk_path)
+        except Exception:
+            disk = psutil.disk_usage('/')
+
+        # Boot time & Uptime
+        boot_time = psutil.boot_time()
+        uptime_seconds = max(0, time.time() - boot_time)
+
+        # Process metrics
+        proc_cpu = 0.0
+        proc_mem = 0
+        proc_threads = 0
+        try:
+            proc = psutil.Process()
+            with proc.oneshot():
+                proc_cpu = proc.cpu_percent(interval=None)
+                proc_mem = proc.memory_info().rss
+                proc_threads = proc.num_threads()
+        except Exception:
+            pass
+
+        return {
+            "available": True,
+            "os": f"{platform.system()} {platform.release()}",
+            "hostname": platform.node(),
+            "cpu": {
+                "percent": round(cpu_percent, 1),
+                "cores_logical": cpu_count_logical,
+                "cores_physical": cpu_count_physical,
+                "load_avg": load_avg,
+                "status": "danger" if cpu_percent >= 85 else ("warning" if cpu_percent >= 65 else "normal")
+            },
+            "memory": {
+                "total_bytes": vmem.total,
+                "used_bytes": vmem.used,
+                "available_bytes": vmem.available,
+                "percent": round(vmem.percent, 1),
+                "total_formatted": format_bytes(vmem.total),
+                "used_formatted": format_bytes(vmem.used),
+                "available_formatted": format_bytes(vmem.available),
+                "status": "danger" if vmem.percent >= 85 else ("warning" if vmem.percent >= 70 else "normal")
+            },
+            "swap": {
+                "total_bytes": swap.total,
+                "used_bytes": swap.used,
+                "percent": round(swap.percent, 1),
+                "total_formatted": format_bytes(swap.total),
+                "used_formatted": format_bytes(swap.used)
+            },
+            "disk": {
+                "total_bytes": disk.total,
+                "used_bytes": disk.used,
+                "free_bytes": disk.free,
+                "percent": round(disk.percent, 1),
+                "total_formatted": format_bytes(disk.total),
+                "used_formatted": format_bytes(disk.used),
+                "free_formatted": format_bytes(disk.free),
+                "status": "danger" if disk.percent >= 90 else ("warning" if disk.percent >= 75 else "normal")
+            },
+            "uptime": {
+                "seconds": int(uptime_seconds),
+                "formatted": format_uptime(uptime_seconds)
+            },
+            "process": {
+                "cpu_percent": round(proc_cpu, 1),
+                "memory_rss_bytes": proc_mem,
+                "memory_rss_formatted": format_bytes(proc_mem),
+                "threads": proc_threads,
+                "active_websockets": len(active_connections)
+            },
+            "timestamp": int(time.time())
+        }
+    except Exception as e:
+        return {
+            "available": False,
+            "error": str(e),
+            "os": platform.system(),
+            "cpu": {"percent": 0.0, "status": "normal", "cores_logical": 1, "cores_physical": 1, "load_avg": []},
+            "memory": {"percent": 0.0, "used_formatted": "0 MB", "total_formatted": "0 MB", "available_formatted": "0 MB", "status": "normal"},
+            "disk": {"percent": 0.0, "used_formatted": "0 GB", "total_formatted": "0 GB", "free_formatted": "0 GB", "status": "normal"},
+            "uptime": {"seconds": 0, "formatted": "N/A"},
+            "process": {"cpu_percent": 0.0, "memory_rss_formatted": "0 MB", "active_websockets": len(active_connections)},
+            "timestamp": int(time.time())
+        }
+
+
 # --- In-Memory Caches for Hero Admin ---
 _stats_cache = {"data": None, "ts": 0}
 
@@ -322,6 +469,15 @@ async def api_admin_stats(admin: dict = Depends(require_hero_admin)):
             "system_status": "error",
             "error": str(e)
         }
+
+
+@router.get("/vps-status")
+async def api_admin_vps_status(admin: dict = Depends(require_hero_admin)):
+    """
+    Get live real-time VPS resource metrics (CPU %, RAM %, Disk %, Uptime, Process).
+    Ultra-lightweight execution for live dashboard telemetry polling.
+    """
+    return get_vps_metrics()
 
 
 @router.get("/users")
