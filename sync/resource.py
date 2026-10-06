@@ -103,12 +103,12 @@ async def get_resource_by_id(
             resource_id
         )
         if not rows or len(rows) == 0:
-            raise HTTPException(status_code=404, detail="Resource not found")
+            raise HTTPException(status_code=404, detail="NOT_FOUND")
 
         item = rows[0]
         is_deleted = bool(item.get("is_deleted"))
         if is_deleted:
-            raise HTTPException(status_code=404, detail="Resource not found")
+            raise HTTPException(status_code=404, detail="DELETED")
 
         owner_id = int(item.get(user_col) or 0)
         raw_visibility = str(item.get("visibility") or "private").lower().strip()
@@ -131,8 +131,8 @@ async def get_resource_by_id(
                 "data": item
             }
 
-        # 3. Private resource -> 404 for non-owners
-        raise HTTPException(status_code=404, detail="Resource not found")
+        # 3. Private resource -> 403 Forbidden for non-owners
+        raise HTTPException(status_code=403, detail="PERMISSION_DENIED")
 
     except HTTPException:
         raise
