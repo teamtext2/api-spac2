@@ -16,6 +16,9 @@ from websocket.manager import (
     get_email_by_username,
     broadcast_user_status,
     send_to_user_by_email,
+    subscribe_resource,
+    unsubscribe_resource,
+    cleanup_socket_subscriptions,
 )
 from auth.deps import verify_auth_token
 from services.push import send_web_push
@@ -45,19 +48,39 @@ async def websocket_endpoint(websocket: WebSocket, username: str, token: str = Q
 
     await websocket.accept()
 
+    # Resolve user_id for permission verification
+    current_user_id = None
+    try:
+        user_rows = await execute_pg_query(
+            "SELECT id, user_id FROM users WHERE LOWER(email) = $1 OR LOWER(username) = $2",
+            email, username
+        )
+        if user_rows and user_rows[0].get("user_id"):
+            current_user_id = int(user_rows[0]["user_id"])
+        elif user_rows and user_rows[0].get("id"):
+            current_user_id = int(10000 + user_rows[0]["id"])
+    except Exception:
+        pass
+
     # Register connection
     is_new_connection = False
     if username not in active_connections:
         active_connections[username] = set()
         is_new_connection = True
     active_connections[username].add(websocket)
-    connection_metadata[websocket] = {"visible": True, "last_seen": time.time()}
+    connection_metadata[websocket] = {
+        "username": username,
+        "email": email,
+        "user_id": current_user_id,
+        "visible": True,
+        "last_seen": time.time()
+    }
 
     # Update username <-> email cache
     username_to_email[username] = email
     email_to_username[email] = username
 
-    print(f"User connected: @{username} ({email}) (Total connections: {len(active_connections[username])})")
+    print(f"User connected: @{username} ({email}) (user_id={current_user_id}) (Total connections: {len(active_connections[username])})")
 
     # Flush buffered call signaling messages immediately
     if username in buffered_call_signals and buffered_call_signals[username]:
@@ -116,6 +139,30 @@ async def websocket_endpoint(websocket: WebSocket, username: str, token: str = Q
                     print(f"[VISIBILITY] User @{username} visibility updated to: {visible}")
                 continue
 
+            elif msg_type in ("subscribe", "resource_subscribe"):
+                resources = data.get("resources") or data.get("topics") or []
+                if not resources and data.get("resource_id") and data.get("app"):
+                    resources = [f"{data.get('app')}:{data.get('resource_id')}"]
+                if isinstance(resources, str):
+                    resources = [resources]
+                meta = connection_metadata.get(websocket, {})
+                await subscribe_resource(
+                    websocket,
+                    resources,
+                    user_id=meta.get("user_id") or current_user_id,
+                    user_email=email
+                )
+                continue
+
+            elif msg_type in ("unsubscribe", "resource_unsubscribe"):
+                resources = data.get("resources") or data.get("topics") or []
+                if not resources and data.get("resource_id") and data.get("app"):
+                    resources = [f"{data.get('app')}:{data.get('resource_id')}"]
+                if isinstance(resources, str):
+                    resources = [resources]
+                unsubscribe_resource(websocket, resources)
+                continue
+
             elif msg_type == "message":
                 await _handle_message(websocket, username, email, data, data_str)
 
@@ -132,15 +179,18 @@ async def websocket_endpoint(websocket: WebSocket, username: str, token: str = Q
                 await _handle_call_signal(websocket, username, data, data_str, msg_type)
 
     except WebSocketDisconnect:
+        cleanup_socket_subscriptions(websocket)
         await _cleanup_connection(websocket, username)
         print(f"User disconnected: @{username}")
     except Exception as e:
         print(f"Error in WebSocket session for @{username}: {e}")
+        cleanup_socket_subscriptions(websocket)
         await _cleanup_connection(websocket, username)
 
 
 async def _cleanup_connection(websocket: WebSocket, username: str):
     """Remove websocket from active connections and update user status."""
+    cleanup_socket_subscriptions(websocket)
     if username in active_connections:
         active_connections[username].discard(websocket)
         if not active_connections[username]:

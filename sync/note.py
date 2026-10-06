@@ -533,12 +533,32 @@ async def sync_keep_notes_batch(
             )
             remote_items = _format_note_rows(rows)
 
+        ack_count = len([r for r in mutation_results if r.get("status") == "ACK"])
+
+        # Broadcast lightweight invalidation ping to subscribed clients
+        if ack_count > 0:
+            for res_item in mutation_results:
+                if res_item.get("status") == "ACK":
+                    note_id_val = res_item.get("id")
+                    if note_id_val:
+                        try:
+                            import asyncio
+                            from websocket.manager import broadcast_resource_invalidation
+                            asyncio.create_task(broadcast_resource_invalidation(
+                                app="note",
+                                resource_id=str(note_id_val),
+                                rev=effective_rev,
+                                actor_email=_clean_str(x_user_email)
+                            ))
+                        except Exception as ping_err:
+                            print(f"[WS Ping Notice] {ping_err}")
+
         return {
             "status": "success",
             "current_rev": effective_rev,
             "deduplicated": sync_result.get("deduplicated", False),
             "results": mutation_results,
-            "synced_count": len([r for r in mutation_results if r.get("status") == "ACK"]),
+            "synced_count": ack_count,
             "items": remote_items
         }
     except Exception as e:

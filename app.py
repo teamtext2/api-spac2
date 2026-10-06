@@ -137,6 +137,8 @@ async def startup_event():
     await initialize_pg_pool()
     await initialize_pg_schema()
     asyncio.create_task(heartbeat_check_loop())
+    from websocket.manager import start_pg_invalidation_listener
+    asyncio.create_task(start_pg_invalidation_listener())
 
 
 # --- Health & Diagnostics ---

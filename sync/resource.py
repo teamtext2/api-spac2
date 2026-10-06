@@ -354,16 +354,30 @@ async def update_resource_visibility(
             raise HTTPException(status_code=403, detail="Forbidden: Only the owner can change resource visibility.")
 
         now_ts = int(time.time() * 1000)
-        await execute_pg_query(
-            f"UPDATE {table} SET visibility = $1, rev = rev + 1, updated_at = $2 WHERE {id_col} = $3",
+        up_rows = await execute_pg_query(
+            f"UPDATE {table} SET visibility = $1, rev = rev + 1, updated_at = $2 WHERE {id_col} = $3 RETURNING rev",
             new_vis, now_ts, resource_id
         )
+        new_rev = int(up_rows[0].get("rev") or 1) if up_rows else 1
+
+        try:
+            import asyncio
+            from websocket.manager import broadcast_resource_invalidation
+            asyncio.create_task(broadcast_resource_invalidation(
+                app=app_code,
+                resource_id=str(resource_id),
+                rev=new_rev,
+                actor_email=_clean_str(x_user_email)
+            ))
+        except Exception:
+            pass
 
         return {
             "status": "success",
             "app_code": app_code,
             "resource_id": resource_id,
             "visibility": new_vis,
+            "rev": new_rev,
             "updated_at": now_ts
         }
 
