@@ -58,14 +58,10 @@ Mục đích: Giới thiệu app, SEO Google       Mục đích: Trực tiếp m
 | :----------------------------------- | :-------------------- | :------------------- | :--------------------- | :-------------------------------------------- |
 | Khách chưa đăng nhập (Anonymous)     | `private`             | GET / Write          | **`404 Not Found`**    | Bị từ chối (Ẩn danh tài nguyên)               |
 | Khách chưa đăng nhập (Anonymous)     | `link_read`           | GET (Read)           | **`200 OK`**           | Chỉ xem (Read-only)                           |
-| Khách chưa đăng nhập (Anonymous)     | `link_read`           | Write (POST / PATCH) | **`401 Unauthorized`** | Bắt buộc đăng nhập để ghi                     |
-| Khách chưa đăng nhập (Anonymous)     | `link_edit`           | GET (Read)           | **`200 OK`**           | Xem tài liệu, UI báo yêu cầu đăng nhập để sửa |
-| Khách chưa đăng nhập (Anonymous)     | `link_edit`           | Write (POST / PATCH) | **`401 Unauthorized`** | Backend chặn ghi (Bắt buộc đăng nhập)         |
-| Người dùng đăng nhập (Authenticated) | `link_edit`           | GET / Sync Write     | **`200 OK`**           | Toàn quyền soạn thảo và đồng bộ hai chiều     |
-| Người dùng khác (Authenticated)      | `private` (Không ACL) | GET / Write          | **`404 Not Found`**    | Bị từ chối (Ẩn danh tài nguyên)               |
-| Người dùng khác có ACL `read`        | Bất kỳ                | GET (Read)           | **`200 OK`**           | Xem theo phân quyền                           |
-| Người dùng khác có ACL `read`        | Bất kỳ                | Write                | **`403 Forbidden`**    | Không có quyền ghi                            |
-| Người dùng khác có ACL `write`       | Bất kỳ                | GET / Sync Write     | **`200 OK`**           | Toàn quyền chỉnh sửa qua Unified Sync         |
+| Khách chưa đăng nhập (Anonymous)     | `link_read`           | Write (POST / PATCH) | **`401 Unauthorized`** | Bắt buộc đăng nhập (Chỉ xem)                  |
+| Người dùng khác (Authenticated)      | `private`             | GET / Write          | **`404 Not Found`**    | Bị từ chối (Ẩn danh tài nguyên)               |
+| Người dùng khác (Authenticated)      | `link_read`           | GET (Read)           | **`200 OK`**           | Chỉ xem (Read-only)                           |
+| Người dùng khác (Authenticated)      | `link_read`           | Write (POST / PATCH) | **`403 Forbidden`**    | Không có quyền sửa tài nguyên của người khác  |
 | Chủ sở hữu (Owner)                   | Bất kỳ                | GET / Write / Share  | **`200 OK`**           | Toàn quyền tài nguyên                         |
 | Bất kỳ ai                            | Đã xóa (`deleted_at`) | Bất kỳ               | **`404 Not Found`**    | Tài nguyên đã bị hủy                          |
 
@@ -78,8 +74,7 @@ Mục đích: Giới thiệu app, SEO Google       Mục đích: Trực tiếp m
    phục sinh rác.
 2. **Strict Optimistic Concurrency Control (OCC) & Explicit Status Protocol**:
    - Khi client gửi mutation mang `base_rev`:
-   - Nếu `base_rev < server_rev` (xung đột đồng thời giữa nhiều thiết bị/cộng
-     tác viên):
+   - Nếu `base_rev < server_rev` (xung đột đồng thời giữa nhiều thiết bị):
      - Server **tuyệt đối KHÔNG âm thầm ghi đè dữ liệu** (Không overwrite).
      - Server trả về trạng thái rõ ràng: `status: "CONFLICT"`,
        `error: "OCC_VERSION_MISMATCH"`, `server_rev: server_rev`.
@@ -103,12 +98,10 @@ Mục đích: Giới thiệu app, SEO Google       Mục đích: Trực tiếp m
 ## 5. Các Endpoint API Thống Nhất (Single Unified Sync Pipeline)
 
 - **`GET /api/sync/resource/{app_code}/{resource_id}`** (Headers: `noindex`,
-  `no-cache` - Trả về dữ liệu và role `owner` / `editor` / `viewer`)
+  `no-cache` - Trả về dữ liệu và role `owner` / `viewer`)
 - **`PATCH /api/sync/resource/{app_code}/{resource_id}/visibility`** (Chỉ
-  Owner/Admin có quyền - Hỗ trợ `private`, `link_read`, `link_edit`,
-  `restricted`)
-- **`POST /api/sync/{app_code}`** (**Single Unified Sync Pipeline duy nhất** cho
-  cả Owner và Collaborator - Single-trip atomic push + pull, Monotonic Rev, OCC
+  Owner có quyền - Hỗ trợ `private` <-> `link_read`)
+- **`POST /api/sync/{app_code}`** (**Single Unified Sync Pipeline duy nhất** - Single-trip atomic push + pull, Monotonic Rev, OCC
   Conflict Archiving, Idempotency SHA-256)
 
 ---

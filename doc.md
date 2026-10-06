@@ -51,7 +51,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_sync_docs_global_doc_id ON user_sync_docs(
 - `body`: Nội dung HTML chuẩn của tab tài liệu hiện hành.
 - `tabs`: Mảng JSON chứa danh sách các tab con (`[{ id, title, content, wordCount, target }]`).
 - `rev`: Số hiệu phiên bản đơn điệu tăng (Monotonic Revision), bắt đầu từ 1. Mỗi lần cập nhật sẽ tăng `rev = max_user_rev + 1`.
-- `visibility`: Trạng thái truy cập (`private`, `link_read`, `link_edit`). Mặc định luôn là `private`.
+- `visibility`: Trạng thái truy cập (`private`, `link_read`). Mặc định luôn là `private`.
 - `is_deleted` & `deleted_at`: Đánh dấu xóa mềm (Soft-delete) chống phục sinh rác khi client offline kết nối lại.
 
 ---
@@ -125,7 +125,7 @@ Content-Type: application/json
 
 ### 4.1. Lấy Tài Liệu Chia Sẻ (`GET /api/sync/resource/doc/{doc_id}`)
 - Nếu tài liệu có `visibility = 'private'`: Chỉ chủ sở hữu xem được, người lạ nhận `404 Not Found`.
-- Nếu tài liệu có `visibility = 'link_read'` hoặc `link_edit`: Bất kỳ ai có link đều đọc được.
+- Nếu tài liệu có `visibility = 'link_read'`: Bất kỳ ai có link đều đọc được (Read-only).
 - Phản hồi bao gồm cờ phân quyền:
 ```json
 {

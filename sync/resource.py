@@ -177,12 +177,12 @@ async def get_resource_by_id(
             return {
                 "status": "success",
                 "role": "owner",
-                "visibility": "link_read" if raw_visibility in ("link_read", "public", "link_edit") else "private",
+                "visibility": "link_read" if raw_visibility in ("link_read", "public") else "private",
                 "data": item
             }
 
         # 2. Public / Shared link check (Strictly View-Only)
-        if raw_visibility in ("link_read", "public", "link_edit"):
+        if raw_visibility in ("link_read", "public"):
             return {
                 "status": "success",
                 "role": "viewer",
@@ -226,7 +226,7 @@ async def update_resource_visibility(
     user_col = cfg["user_col"]
 
     raw_vis = payload.visibility.strip().lower()
-    new_vis = "link_read" if raw_vis in ("link_read", "public", "link_edit", "true", "1") else "private"
+    new_vis = "link_read" if raw_vis in ("link_read", "public", "true", "1") else "private"
 
     requester_id = await resolve_optional_user_id(token, x_user_id, x_user_email, x_user_name, response)
     if not requester_id:

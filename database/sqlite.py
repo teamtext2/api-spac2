@@ -728,17 +728,8 @@ def _ensure_sqlite_schema(cursor, conn):
         );
     """)
 
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS user_resource_acls (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            app_code TEXT NOT NULL,
-            resource_id TEXT NOT NULL,
-            user_id INTEGER NOT NULL,
-            permission TEXT DEFAULT 'read',
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE (app_code, resource_id, user_id)
-        );
-    """)
+    cursor.execute("DROP TABLE IF EXISTS user_resource_acls;")
+    cursor.execute("DROP TABLE IF EXISTS user_resource_activity;")
 
     # Check and add visibility and deleted_at to all sync tables in SQLite
     for t_name in ["user_sync_notes", "user_sync_task_projects", "user_sync_tasks", 

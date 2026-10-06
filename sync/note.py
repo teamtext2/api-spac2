@@ -412,24 +412,13 @@ async def sync_keep_notes_batch(
                         target_owner_id = owner_id
 
                         if not is_owner:
-                            # Verify Shared Edit permission (link_edit or ACL write/admin)
-                            row_vis = str(existing_row.get("visibility") or "private").lower().strip()
-                            can_edit = (row_vis == "link_edit")
-                            if not can_edit and row_vis == "restricted":
-                                acl_res = await execute_pg_query(
-                                    "SELECT permission FROM user_resource_acls WHERE app_code = 'note' AND resource_id = $1 AND user_id = $2",
-                                    note_id, user_id
-                                )
-                                if acl_res and acl_res[0].get("permission") in ("write", "admin"):
-                                    can_edit = True
-
-                            if not can_edit:
-                                mutation_results.append({
-                                    "id": raw_note_id,
-                                    "status": "REJECT",
-                                    "error": "PERMISSION_DENIED"
-                                })
-                                continue
+                            # Strict Owner-Only Policy: Non-owners cannot mutate another user's note
+                            mutation_results.append({
+                                "id": raw_note_id,
+                                "status": "REJECT",
+                                "error": "PERMISSION_DENIED"
+                            })
+                            continue
 
                     # 2. Strict Optimistic Concurrency Control (OCC) - DO NOT overwrite stale server data
                     if existing_row and not item.is_deleted:
@@ -451,13 +440,9 @@ async def sync_keep_notes_batch(
                     color_json = json.dumps(normalized_color)
                     item_updated_at = int(item.updated or item.updated_at or now_ts)
 
-                    # Visibility can only be updated by the owner
-                    if is_owner:
-                        item_visibility = str(item.visibility or (existing_row.get("visibility") if existing_row else "private")).lower().strip()
-                        if item_visibility not in ("private", "link_read", "link_edit", "restricted"):
-                            item_visibility = "private"
-                    else:
-                        item_visibility = str(existing_row.get("visibility") or "link_edit")
+                    # Visibility can only be updated by the owner: strictly 'private' or 'link_read'
+                    raw_vis = str(item.visibility or (existing_row.get("visibility") if existing_row else "private")).lower().strip()
+                    item_visibility = "link_read" if raw_vis in ("link_read", "public") else "private"
 
                     history_val = _normalize_json_field(item.history, [])
                     if not isinstance(history_val, list):

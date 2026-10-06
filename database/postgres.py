@@ -574,18 +574,9 @@ async def initialize_pg_schema():
             except Exception as tbl_alter_err:
                 print(f"[PostgresSchema] Notice altering {tbl} for resource contract: {tbl_alter_err}")
 
-        # ACL Table with Foreign Key & Single Optimal Unique Index
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS user_resource_acls (
-                id BIGSERIAL PRIMARY KEY,
-                app_code VARCHAR(30) NOT NULL,
-                resource_id VARCHAR(50) NOT NULL,
-                user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                permission VARCHAR(20) NOT NULL DEFAULT 'read',
-                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-                CONSTRAINT uq_resource_user_acl UNIQUE (app_code, resource_id, user_id)
-            );
-        """)
+        # Drop obsolete legacy ACL and activity tables
+        await conn.execute("DROP TABLE IF EXISTS user_resource_acls CASCADE;")
+        await conn.execute("DROP TABLE IF EXISTS user_resource_activity CASCADE;")
 
         print("PostgreSQL schema and V2 Sync Counters + Resource Contract v1.0 initialized successfully!")
 

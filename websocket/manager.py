@@ -33,7 +33,7 @@ async def check_resource_permission(
     """
     Validates if the requesting user has permission to subscribe to a resource.
     Ensures private resources cannot be monitored or probed by unauthorized users.
-    Contract V1: Visibility must be 'link_read' or 'link_edit', or user must be owner / have entry in user_resource_acls.
+    Contract V1: Visibility must be 'link_read', or user must be owner.
     """
     if not resource_id:
         return False
@@ -55,19 +55,9 @@ async def check_resource_permission(
             # 1. Owner access
             if user_id and doc.get("user_id") == user_id:
                 return True
-            # 2. Link shared access (Contract V1: link_read, link_edit)
-            if str(doc.get("visibility") or "").lower() in ("link_read", "link_edit"):
+            # 2. Link shared access (link_read)
+            if str(doc.get("visibility") or "").lower() in ("link_read", "public"):
                 return True
-            # 3. Explicit ACL entry (user_resource_acls table: read | write | admin)
-            if user_id:
-                acls = await execute_pg_query(
-                    "SELECT permission FROM user_resource_acls WHERE app_code = 'doc' AND resource_id = $1 AND user_id = $2",
-                    r_id, user_id
-                )
-                if acls and len(acls) > 0:
-                    perm = str(acls[0].get("permission") or "").lower()
-                    if perm in ("read", "write", "admin"):
-                        return True
             return False
 
         elif app_code == "note":
@@ -81,19 +71,9 @@ async def check_resource_permission(
             # 1. Owner access
             if user_id and note.get("user_id") == user_id:
                 return True
-            # 2. Link shared access (Contract V1: link_read, link_edit)
-            if str(note.get("visibility") or "").lower() in ("link_read", "link_edit"):
+            # 2. Link shared access (link_read)
+            if str(note.get("visibility") or "").lower() in ("link_read", "public"):
                 return True
-            # 3. Explicit ACL entry (user_resource_acls table: read | write | admin)
-            if user_id:
-                acls = await execute_pg_query(
-                    "SELECT permission FROM user_resource_acls WHERE app_code = 'note' AND resource_id = $1 AND user_id = $2",
-                    r_id, user_id
-                )
-                if acls and len(acls) > 0:
-                    perm = str(acls[0].get("permission") or "").lower()
-                    if perm in ("read", "write", "admin"):
-                        return True
             return False
 
     except Exception as e:
