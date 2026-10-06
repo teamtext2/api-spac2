@@ -22,7 +22,20 @@ RESOURCE_CONFIGS: Dict[str, Dict[str, str]] = {
 
 
 class SetVisibilityRequest(BaseModel):
-    visibility: str  # 'private' | 'link_read' | 'restricted'
+    visibility: str  # 'private' | 'link_read' | 'link_edit' | 'restricted'
+
+
+class UpdateResourceContentRequest(BaseModel):
+    title: Optional[str] = None
+    body: Optional[str] = None
+    preview_text: Optional[str] = None
+    previewText: Optional[str] = None
+    word_count: Optional[int] = None
+    wordCount: Optional[int] = None
+    tabs: Optional[Union[List[Dict[str, Any]], str]] = None
+    active_tab_id: Optional[str] = None
+    activeTabId: Optional[str] = None
+    target: Optional[int] = None
 
 
 def inject_resource_headers(response: Response) -> None:
@@ -80,13 +93,15 @@ async def get_resource_by_id(
     x_user_email: Optional[str] = Header(None),
 ):
     """
-    Spac2 Resource Contract v1.0 - Read Resource Endpoint
+    Spac2 Resource Contract v1.3 - Read Resource Endpoint
     1. Always sets noindex & no-cache headers.
     2. Validates existence & soft-deletion (returns 404 on deleted items).
     3. Authorization Matrix:
        - Owner -> 200 (role: owner)
+       - Authenticated + link_edit -> 200 (role: editor)
+       - Anonymous + link_edit -> 200 (role: viewer, requires_login_to_edit: true)
        - link_read -> 200 (role: viewer)
-       - restricted -> checks ACL -> 200 / 404 (Masking)
+       - restricted -> checks ACL -> 200 (role: editor | viewer)
        - private -> 404 (Masking)
     """
     inject_resource_headers(response)
@@ -126,16 +141,29 @@ async def get_resource_by_id(
                 "data": item
             }
 
-        # 2. Link Read check (Anonymous / Any User)
+        # 2. Link Edit check (Public collaboration)
+        if visibility == "link_edit":
+            # Authenticated users get editor role, Anonymous users get read-only viewer role
+            role = "editor" if requester_id else "viewer"
+            return {
+                "status": "success",
+                "role": role,
+                "visibility": "link_edit",
+                "requires_login_to_edit": not bool(requester_id),
+                "data": item
+            }
+
+        # 3. Link Read check (Public view only)
         if visibility == "link_read":
             return {
                 "status": "success",
                 "role": "viewer",
                 "visibility": "link_read",
+                "requires_login_to_edit": False,
                 "data": item
             }
 
-        # 3. Restricted ACL check
+        # 4. Restricted ACL check
         if visibility == "restricted" and requester_id:
             acl_rows = await execute_pg_query(
                 "SELECT permission FROM user_resource_acls WHERE app_code = $1 AND resource_id = $2 AND user_id = $3",
@@ -150,7 +178,7 @@ async def get_resource_by_id(
                     "data": item
                 }
 
-        # 4. Information Disclosure Masking: Always 404 for unauthorized access
+        # 5. Information Disclosure Masking: Always 404 for unauthorized access
         raise HTTPException(status_code=404, detail="Resource not found")
 
     except HTTPException:
@@ -171,9 +199,9 @@ async def update_resource_visibility(
     x_user_email: Optional[str] = Header(None),
 ):
     """
-    Spac2 Resource Contract v1.0 - Toggle Visibility Endpoint
+    Spac2 Resource Contract v1.3 - Toggle Visibility Endpoint
     Only the resource OWNER or ADMIN is authorized to change visibility.
-    Valid visibilities: 'private', 'link_read', 'restricted'.
+    Valid visibilities: 'private', 'link_read', 'link_edit', 'restricted'.
     Immediate effect upon commit with zero edge cache pollution.
     """
     inject_resource_headers(response)
@@ -187,8 +215,8 @@ async def update_resource_visibility(
     user_col = cfg["user_col"]
 
     new_vis = payload.visibility.strip().lower()
-    if new_vis not in ("private", "link_read", "restricted"):
-        raise HTTPException(status_code=400, detail="Invalid visibility state. Must be 'private', 'link_read', or 'restricted'.")
+    if new_vis not in ("private", "link_read", "link_edit", "restricted"):
+        raise HTTPException(status_code=400, detail="Invalid visibility state. Must be 'private', 'link_read', 'link_edit', or 'restricted'.")
 
     requester_id = await resolve_optional_user_id(token, x_user_id, x_user_email)
     if not requester_id:

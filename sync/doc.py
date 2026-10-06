@@ -34,6 +34,8 @@ class DocSyncItem(BaseModel):
     updated: Optional[Union[int, float, str]] = None
     created_at: Optional[Union[int, float, str]] = None
     updated_at: Optional[Union[int, float, str]] = None
+    rev: Optional[int] = None
+    base_rev: Optional[int] = None
     visibility: Optional[str] = "private"
     is_deleted: Optional[bool] = False
 
@@ -359,7 +361,7 @@ async def sync_keep_docs_batch(
 
     try:
         has_mutations = bool(payload.items and len(payload.items) > 0)
-        synced_doc_ids = []
+        mutation_results: List[Dict[str, Any]] = []
 
         async def _write_doc_mutations(next_rev: int, now_ts: int):
             if payload.items and len(payload.items) > 0:
@@ -371,39 +373,108 @@ async def sync_keep_docs_batch(
                     if not doc_id:
                         continue
 
+                    # 1. Look up existing doc to determine ownership & permissions
+                    existing_rows = await execute_pg_query(
+                        "SELECT user_id, rev, title, body, preview_text, word_count, pinned, in_trash, target, "
+                        "tabs, active_tab_id, history, visibility, is_deleted, updated_at "
+                        "FROM user_sync_docs WHERE doc_id = $1 LIMIT 1",
+                        doc_id
+                    )
+
+                    is_owner = True
+                    target_owner_id = user_id
+                    existing_row = None
+
+                    if existing_rows and len(existing_rows) > 0:
+                        existing_row = existing_rows[0]
+                        owner_id = int(existing_row["user_id"])
+                        is_owner = (owner_id == user_id)
+                        target_owner_id = owner_id
+
+                        if not is_owner:
+                            # Verify Shared Edit permission (link_edit or ACL write/admin)
+                            row_vis = str(existing_row.get("visibility") or "private").lower().strip()
+                            can_edit = (row_vis == "link_edit")
+                            if not can_edit and row_vis == "restricted":
+                                acl_res = await execute_pg_query(
+                                    "SELECT permission FROM user_resource_acls WHERE app_code = 'doc' AND resource_id = $1 AND user_id = $2",
+                                    doc_id, user_id
+                                )
+                                if acl_res and acl_res[0].get("permission") in ("write", "admin"):
+                                    can_edit = True
+
+                            if not can_edit:
+                                # Explicit REJECT: Client will retain mutation in outbox instead of silently discarding
+                                mutation_results.append({
+                                    "id": raw_doc_id,
+                                    "status": "REJECT",
+                                    "error": "PERMISSION_DENIED"
+                                })
+                                continue
+
+                    # 2. Strict Optimistic Concurrency Control (OCC) - DO NOT overwrite stale server data
+                    if existing_row and not item.is_deleted:
+                        server_rev = int(existing_row.get("rev") or 1)
+                        client_base_rev = item.base_rev if item.base_rev is not None else item.rev
+                        if client_base_rev is not None and client_base_rev > 0 and client_base_rev < server_rev:
+                            # Explicit Lightweight CONFLICT: Refuse overwrite.
+                            # Full server state is delivered naturally via standard pull response items
+                            mutation_results.append({
+                                "id": raw_doc_id,
+                                "status": "CONFLICT",
+                                "server_rev": server_rev,
+                                "server_updated_at": int(existing_row.get("updated_at") or now_ts),
+                                "error": "OCC_VERSION_MISMATCH"
+                            })
+                            continue
+
                     item_title = (item.title or "").strip()
                     item_body = item.body or ""
                     preview_text = item.previewText or item.preview_text or ""
                     word_count = item.wordCount if item.wordCount is not None else (item.word_count or 0)
-                    pinned = bool(item.pinned)
-                    in_trash = bool(item.inTrash if item.inTrash is not None else item.in_trash)
+                    pinned = bool(item.pinned) if is_owner else bool(existing_row.get("pinned") if existing_row else False)
+                    in_trash = bool(item.inTrash if item.inTrash is not None else item.in_trash) if is_owner else False
                     target = int(item.target or 500)
-                    active_tab_id = item.activeTabId or item.active_tab_id or ""
-                    item_visibility = str(item.visibility or "private").lower().strip()
-                    if item_visibility not in ("private", "link_read", "restricted"):
-                        item_visibility = "private"
+                    active_tab_id = item.activeTabId or item.active_tab_id or "tab-default"
+                    
+                    # Visibility can only be updated by the owner
+                    if is_owner:
+                        item_visibility = str(item.visibility or (existing_row.get("visibility") if existing_row else "private")).lower().strip()
+                        if item_visibility not in ("private", "link_read", "link_edit", "restricted"):
+                            item_visibility = "private"
+                    else:
+                        item_visibility = str(existing_row.get("visibility") or "link_edit")
 
                     tabs_val = _normalize_json_field(item.tabs, [])
                     tabs_json = json.dumps(tabs_val)
 
                     history_val = _normalize_json_field(item.history, [])
-                    history_json = json.dumps(history_val)
+                    if not isinstance(history_val, list):
+                        history_val = []
+                    history_json = json.dumps(history_val[-50:]) # Retain latest 50 history snapshots
 
                     item_updated_at = int(item.updated or item.updated_at or now_ts)
-                    synced_doc_ids.append(doc_id)
 
                     if item.is_deleted:
-                        await execute_pg_query(
-                            "INSERT INTO user_sync_docs ("
-                            "   user_id, doc_id, title, body, preview_text, word_count, pinned, in_trash, "
-                            "   target, tabs, active_tab_id, history, rev, visibility, is_deleted, deleted_at, updated_at"
-                            ") VALUES ($1, $2, '', '', '', 0, FALSE, FALSE, 500, '[]'::jsonb, '', '[]'::jsonb, $3, 'private', TRUE, CURRENT_TIMESTAMP, $4) "
-                            "ON CONFLICT (doc_id) DO UPDATE SET "
-                            "   title = '', body = '', preview_text = '', word_count = 0, pinned = FALSE, in_trash = FALSE, "
-                            "   tabs = '[]'::jsonb, history = '[]'::jsonb, is_deleted = TRUE, deleted_at = CURRENT_TIMESTAMP, rev = EXCLUDED.rev, updated_at = EXCLUDED.updated_at "
-                            "WHERE user_sync_docs.user_id = EXCLUDED.user_id",
-                            user_id, doc_id, next_rev, now_ts
-                        )
+                        if is_owner:
+                            await execute_pg_query(
+                                "INSERT INTO user_sync_docs ("
+                                "   user_id, doc_id, title, body, preview_text, word_count, pinned, in_trash, "
+                                "   target, tabs, active_tab_id, history, rev, visibility, is_deleted, deleted_at, updated_at"
+                                ") VALUES ($1, $2, '', '', '', 0, FALSE, FALSE, 500, '[]'::jsonb, '', '[]'::jsonb, $3, 'private', TRUE, CURRENT_TIMESTAMP, $4) "
+                                "ON CONFLICT (doc_id) DO UPDATE SET "
+                                "   title = '', body = '', preview_text = '', word_count = 0, pinned = FALSE, in_trash = FALSE, "
+                                "   tabs = '[]'::jsonb, history = '[]'::jsonb, is_deleted = TRUE, deleted_at = CURRENT_TIMESTAMP, rev = EXCLUDED.rev, updated_at = EXCLUDED.updated_at "
+                                "WHERE user_sync_docs.user_id = EXCLUDED.user_id",
+                                target_owner_id, doc_id, next_rev, now_ts
+                            )
+                            mutation_results.append({"id": raw_doc_id, "status": "ACK", "rev": next_rev})
+                        else:
+                            mutation_results.append({
+                                "id": raw_doc_id,
+                                "status": "REJECT",
+                                "error": "ONLY_OWNER_CAN_DELETE"
+                            })
                     else:
                         await execute_pg_query(
                             "INSERT INTO user_sync_docs ("
@@ -416,11 +487,12 @@ async def sync_keep_docs_batch(
                             "   target = EXCLUDED.target, tabs = EXCLUDED.tabs, active_tab_id = EXCLUDED.active_tab_id, "
                             "   history = EXCLUDED.history, rev = EXCLUDED.rev, visibility = EXCLUDED.visibility, "
                             "   is_deleted = FALSE, deleted_at = NULL, updated_at = EXCLUDED.updated_at "
-                            "WHERE user_sync_docs.user_id = EXCLUDED.user_id AND user_sync_docs.is_deleted = FALSE",
-                            user_id, doc_id, item_title, item_body, preview_text, word_count,
+                            "WHERE user_sync_docs.is_deleted = FALSE",
+                            target_owner_id, doc_id, item_title, item_body, preview_text, word_count,
                             pinned, in_trash, target, tabs_json, active_tab_id, history_json,
                             next_rev, item_visibility, item_updated_at
                         )
+                        mutation_results.append({"id": raw_doc_id, "status": "ACK", "rev": next_rev})
 
             # Auto-purge soft-deleted tombstones older than 30 days
             try:
@@ -469,11 +541,14 @@ async def sync_keep_docs_batch(
             )
             remote_items = _format_doc_rows(rows)
 
+        ack_count = len([r for r in mutation_results if r.get("status") == "ACK"])
+
         return {
             "status": "success",
             "current_rev": effective_rev,
             "deduplicated": sync_result.get("deduplicated", False),
-            "synced_count": len(synced_doc_ids),
+            "synced_count": ack_count,
+            "results": mutation_results,
             "items": remote_items
         }
 
