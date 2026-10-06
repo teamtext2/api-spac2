@@ -1,4 +1,5 @@
 import contextvars
+import time
 from typing import Any, Optional
 import asyncpg
 from config import POSTGRES_HOST, POSTGRES_PORT, POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB
@@ -195,11 +196,13 @@ async def initialize_pg_schema():
                 id VARCHAR(255) PRIMARY KEY,
                 name VARCHAR(255) NOT NULL,
                 avatar TEXT,
+                bio TEXT DEFAULT '',
                 created_by VARCHAR(255) NOT NULL,
                 created_by_email VARCHAR(255),
                 created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
             );
         """)
+        await conn.execute("ALTER TABLE chat_groups ADD COLUMN IF NOT EXISTS bio TEXT DEFAULT '';")
 
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS chat_group_members (

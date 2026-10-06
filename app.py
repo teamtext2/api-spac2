@@ -18,8 +18,29 @@ All business logic lives in the respective modules:
 """
 
 import asyncio
+import logging
 import os
+import re
 import sys
+
+# Mask sensitive parameters (like JWT tokens) in uvicorn access logs
+class TokenMaskingFilter(logging.Filter):
+    def filter(self, record):
+        try:
+            if hasattr(record, 'args') and record.args:
+                args = list(record.args)
+                for i, arg in enumerate(args):
+                    if isinstance(arg, str) and ('token=' in arg or 'password=' in arg or 'secret=' in arg):
+                        args[i] = re.sub(r'([?&](?:token|auth_token|secret|password)=)[^&\s]+', r'\1[FILTERED]', arg)
+                record.args = tuple(args)
+            if isinstance(record.msg, str) and ('token=' in record.msg or 'password=' in record.msg):
+                record.msg = re.sub(r'([?&](?:token|auth_token|secret|password)=)[^&\s]+', r'\1[FILTERED]', record.msg)
+        except Exception:
+            pass
+        return True
+
+logging.getLogger("uvicorn.access").addFilter(TokenMaskingFilter())
+logging.getLogger("uvicorn").addFilter(TokenMaskingFilter())
 
 # Ensure api directory is always in sys.path
 api_dir = os.path.dirname(os.path.abspath(__file__))
