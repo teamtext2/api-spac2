@@ -4,7 +4,8 @@ from typing import Optional, Dict, Any
 from fastapi import APIRouter, HTTPException, Depends, Header, Response
 from pydantic import BaseModel
 
-from auth.deps import get_auth_token, decode_spac2_token
+import asyncio
+from auth.deps import get_auth_token, decode_spac2_token, create_spac2_token
 from database.postgres import execute_pg_query
 
 router = APIRouter(prefix="/api/sync/resource", tags=["sync_resource"])
@@ -43,9 +44,16 @@ async def resolve_optional_user_id(
     token: Any = None,
     x_user_id: Any = None,
     x_user_email: Any = None,
+    x_user_name: Any = None,
+    response: Optional[Response] = None
 ) -> Optional[int]:
-    """Extract authenticated user_id if present, without failing for anonymous visitors."""
+    """Seamlessly resolve a stable, permanent user_id across all devices matching doc/note sync."""
     clean_token = _clean_str(token)
+    clean_id = _clean_str(x_user_id)
+    clean_email = _clean_str(x_user_email).lower()
+    clean_username = _clean_str(x_user_name).lower()
+
+    # 1. Primary: Verify Spac2 JWT Token
     if clean_token:
         payload = decode_spac2_token(clean_token)
         if payload and payload.get("user_id"):
@@ -54,18 +62,68 @@ async def resolve_optional_user_id(
             except (ValueError, TypeError):
                 pass
 
-    clean_id = _clean_str(x_user_id)
+    # 2. Secondary: Direct X-User-Id Header
     if clean_id and clean_id.isdigit() and int(clean_id) > 0:
-        return int(clean_id)
+        uid_val = int(clean_id)
+        if uid_val < 10000:
+            try:
+                rows = await execute_pg_query("SELECT id, user_id FROM users WHERE id = $1", uid_val)
+                if rows and rows[0].get("id"):
+                    return int(rows[0].get("user_id") or (10000 + rows[0]["id"]))
+            except Exception:
+                pass
+            return 10000 + uid_val
+        return uid_val
 
-    clean_email = _clean_str(x_user_email).lower()
+    # 3. Tertiary: Lookup in central users table by email
     if clean_email:
         try:
-            rows = await execute_pg_query("SELECT id, user_id FROM users WHERE LOWER(email) = $1", clean_email)
+            rows = await execute_pg_query(
+                "SELECT id, user_id, username, email FROM users WHERE LOWER(email) = $1", 
+                clean_email
+            )
             if rows and len(rows) > 0 and rows[0].get("id"):
-                return int(rows[0].get("user_id") or (10000 + rows[0]["id"]))
-        except Exception:
-            pass
+                row = rows[0]
+                db_id = row["id"]
+                uid = int(row.get("user_id") or (10000 + db_id))
+                return uid
+            else:
+                uname = clean_username or clean_email.split("@")[0]
+                try:
+                    await execute_pg_query(
+                        "INSERT INTO users (username, email, user_id, name, created_at, updated_at) "
+                        "VALUES ($1, $2, (SELECT COALESCE(MAX(user_id), 10000) + 1 FROM users), $3, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) "
+                        "ON CONFLICT (email) DO NOTHING",
+                        uname, clean_email, uname
+                    )
+                    prov_rows = await execute_pg_query("SELECT id, user_id, username, email FROM users WHERE LOWER(email) = $1", clean_email)
+                    if prov_rows and prov_rows[0].get("id"):
+                        prov_row = prov_rows[0]
+                        return int(prov_row.get("user_id") or (10000 + prov_row["id"]))
+                except Exception as prov_err:
+                    print(f"[ResourceResolveUser] Auto-provision notice: {prov_err}")
+        except Exception as err:
+            print(f"[ResourceResolveUser] Email lookup warning: {err}")
+
+    # 4. Quaternary: Lookup by username
+    if clean_username:
+        try:
+            rows = await execute_pg_query(
+                "SELECT id, user_id, username, email FROM users WHERE LOWER(username) = $1", 
+                clean_username
+            )
+            if rows and len(rows) > 0 and rows[0].get("id"):
+                row = rows[0]
+                return int(row.get("user_id") or (10000 + row["id"]))
+        except Exception as err:
+            print(f"[ResourceResolveUser] Username lookup warning: {err}")
+
+    # 5. Deterministic permanent fallback hash from email
+    if clean_email:
+        import hashlib
+        email_hash_int = int(hashlib.sha256(clean_email.encode("utf-8")).hexdigest()[:8], 16)
+        stable_id = 50000 + (email_hash_int % 40000)
+        return stable_id
 
     return None
 
@@ -78,6 +136,7 @@ async def get_resource_by_id(
     token: Optional[str] = Depends(get_auth_token),
     x_user_id: Optional[str] = Header(None),
     x_user_email: Optional[str] = Header(None),
+    x_user_name: Optional[str] = Header(None),
 ):
     """
     Standard Read-Only Resource Fetching Endpoint.
@@ -95,7 +154,7 @@ async def get_resource_by_id(
     id_col = cfg["id_col"]
     user_col = cfg["user_col"]
 
-    requester_id = await resolve_optional_user_id(token, x_user_id, x_user_email)
+    requester_id = await resolve_optional_user_id(token, x_user_id, x_user_email, x_user_name, response)
 
     try:
         rows = await execute_pg_query(
@@ -150,6 +209,7 @@ async def update_resource_visibility(
     token: Optional[str] = Depends(get_auth_token),
     x_user_id: Optional[str] = Header(None),
     x_user_email: Optional[str] = Header(None),
+    x_user_name: Optional[str] = Header(None),
 ):
     """
     Simplified Share Switch: Toggle between 'link_read' (public view link) and 'private' (disabled).
@@ -168,7 +228,7 @@ async def update_resource_visibility(
     raw_vis = payload.visibility.strip().lower()
     new_vis = "link_read" if raw_vis in ("link_read", "public", "link_edit", "true", "1") else "private"
 
-    requester_id = await resolve_optional_user_id(token, x_user_id, x_user_email)
+    requester_id = await resolve_optional_user_id(token, x_user_id, x_user_email, x_user_name, response)
     if not requester_id:
         raise HTTPException(status_code=401, detail="Authentication required to manage sharing settings.")
 
@@ -180,7 +240,7 @@ async def update_resource_visibility(
         now_ts = int(time.time() * 1000)
 
         if not rows or len(rows) == 0:
-            # Resource created locally, insert initial row for owner
+            # Resource created locally, insert initial row for owner with exact schema
             if app_code == "note":
                 await execute_pg_query(
                     "INSERT INTO user_sync_notes (user_id, note_id, title, content, color, is_saved, date, history, rev, visibility, is_deleted, updated_at) "
@@ -190,11 +250,31 @@ async def update_resource_visibility(
                 )
             elif app_code == "doc":
                 await execute_pg_query(
-                    "INSERT INTO user_sync_docs (user_id, doc_id, title, content, word_count, is_pinned, is_deleted, rev, visibility, updated_at) "
-                    "VALUES ($1, $2, '', '', 0, FALSE, FALSE, 1, $3, $4) "
+                    "INSERT INTO user_sync_docs (user_id, doc_id, title, body, preview_text, word_count, pinned, in_trash, target, tabs, active_tab_id, history, rev, visibility, is_deleted, updated_at) "
+                    "VALUES ($1, $2, '', '', '', 0, FALSE, FALSE, 500, '[]'::jsonb, 'tab-default', '[]'::jsonb, 1, $3, FALSE, $4) "
                     "ON CONFLICT (doc_id) DO UPDATE SET visibility = EXCLUDED.visibility, is_deleted = FALSE, deleted_at = NULL, updated_at = EXCLUDED.updated_at",
                     requester_id, resource_id, new_vis, now_ts
                 )
+            elif app_code == "task":
+                await execute_pg_query(
+                    "INSERT INTO user_sync_tasks (user_id, task_id, text, completed, created_at, rev, visibility, is_deleted, updated_at) "
+                    "VALUES ($1, $2, '', FALSE, CURRENT_TIMESTAMP, 1, $3, FALSE, $4) "
+                    "ON CONFLICT (task_id) DO UPDATE SET visibility = EXCLUDED.visibility, is_deleted = FALSE, deleted_at = NULL, updated_at = EXCLUDED.updated_at",
+                    requester_id, resource_id, new_vis, now_ts
+                )
+
+            # Broadcast invalidation ping
+            try:
+                from websocket.manager import broadcast_resource_invalidation
+                asyncio.create_task(broadcast_resource_invalidation(
+                    app=app_code,
+                    resource_id=str(resource_id),
+                    rev=1,
+                    actor_email=_clean_str(x_user_email)
+                ))
+            except Exception:
+                pass
+
             return {
                 "status": "success",
                 "app_code": app_code,
@@ -215,6 +295,18 @@ async def update_resource_visibility(
         )
         new_rev = int(up_rows[0].get("rev") or 1) if up_rows else 1
 
+        # Broadcast invalidation ping to synchronize other connected devices (PC/Phone)
+        try:
+            from websocket.manager import broadcast_resource_invalidation
+            asyncio.create_task(broadcast_resource_invalidation(
+                app=app_code,
+                resource_id=str(resource_id),
+                rev=new_rev,
+                actor_email=_clean_str(x_user_email)
+            ))
+        except Exception:
+            pass
+
         return {
             "status": "success",
             "app_code": app_code,
@@ -229,3 +321,4 @@ async def update_resource_visibility(
     except Exception as e:
         print(f"[ResourceEndpoint] Error setting visibility for {app_code}/{resource_id}: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
+
