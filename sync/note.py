@@ -1,24 +1,71 @@
 from __future__ import annotations
 import json
 import hashlib
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Union
 from fastapi import APIRouter, HTTPException, Depends, Query, Header, Response
 from pydantic import BaseModel
 
 from auth.deps import get_auth_token, decode_spac2_token, create_spac2_token, decode_text2_token, create_text2_token
 from database.postgres import execute_pg_query
-from sync.engine import get_domain_max_rev, execute_sync_batch_atomic
+from sync.engine import get_domain_max_rev, execute_sync_batch_atomic, resolve_canonical_id
 
 router = APIRouter(prefix="/api/sync/note", tags=["sync_note"])
+
+_table_initialized = False
+
+
+async def _ensure_note_table():
+    global _table_initialized
+    if _table_initialized:
+        return
+    try:
+        await execute_pg_query("""
+            CREATE TABLE IF NOT EXISTS user_sync_notes (
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                note_id VARCHAR(100) NOT NULL,
+                title TEXT DEFAULT '',
+                content TEXT DEFAULT '',
+                color JSONB DEFAULT '{}',
+                is_saved BOOLEAN DEFAULT FALSE,
+                date TEXT DEFAULT '',
+                history JSONB DEFAULT '[]',
+                rev BIGINT NOT NULL DEFAULT 1,
+                visibility VARCHAR(20) NOT NULL DEFAULT 'private',
+                is_deleted BOOLEAN DEFAULT FALSE,
+                deleted_at TIMESTAMP WITH TIME ZONE DEFAULT NULL,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                updated_at BIGINT DEFAULT 0,
+                CONSTRAINT uq_sync_notes_note_id UNIQUE (note_id)
+            );
+        """)
+        try:
+            await execute_pg_query("ALTER TABLE user_sync_notes ADD COLUMN IF NOT EXISTS rev BIGINT NOT NULL DEFAULT 1;")
+            await execute_pg_query("ALTER TABLE user_sync_notes ADD COLUMN IF NOT EXISTS history JSONB DEFAULT '[]';")
+            await execute_pg_query("ALTER TABLE user_sync_notes ADD COLUMN IF NOT EXISTS visibility VARCHAR(20) NOT NULL DEFAULT 'private';")
+            await execute_pg_query("ALTER TABLE user_sync_notes ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP WITH TIME ZONE DEFAULT NULL;")
+            await execute_pg_query("CREATE INDEX IF NOT EXISTS idx_sync_notes_user_rev ON user_sync_notes(user_id, rev);")
+            await execute_pg_query("CREATE UNIQUE INDEX IF NOT EXISTS idx_sync_notes_global_note_id ON user_sync_notes(note_id);")
+        except Exception:
+            pass
+        _table_initialized = True
+    except Exception as e:
+        print(f"[NOTE SYNC] Warning initializing user_sync_notes table: {e}")
 
 
 class NoteSyncItem(BaseModel):
     id: str
     title: Optional[str] = ""
     content: Optional[str] = ""
-    color: Optional[Dict[str, Any]] = None
+    color: Optional[Union[Dict[str, Any], str]] = None
     isSaved: Optional[bool] = False
     date: Optional[str] = ""
+    rev: Optional[int] = 1
+    base_rev: Optional[int] = None
+    visibility: Optional[str] = "private"
+    history: Optional[Union[List[Dict[str, Any]], str]] = None
+    updated: Optional[int] = None
+    updated_at: Optional[int] = None
     is_deleted: Optional[bool] = False
 
 
@@ -32,6 +79,22 @@ def _clean_str(val: Any) -> str:
     if isinstance(val, str):
         return val.strip()
     return ""
+
+
+def _normalize_json_field(val: Any, default_val: Any) -> Any:
+    if val is None:
+        return default_val
+    if isinstance(val, (dict, list)):
+        return val
+    if isinstance(val, str):
+        s = val.strip()
+        if not s:
+            return default_val
+        try:
+            return json.loads(s)
+        except Exception:
+            return default_val
+    return default_val
 
 
 async def _resolve_user_id(
@@ -226,6 +289,8 @@ def _format_note_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
         seen_ids.add(note_id)
         color_val = _normalize_color(r.get("color"))
+        visibility = str(r.get("visibility") or "private").lower().strip()
+        history_val = _normalize_json_field(r.get("history"), [])
 
         items_list.append({
             "id": note_id,
@@ -235,6 +300,10 @@ def _format_note_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "isSaved": bool(r.get("is_saved")),
             "date": date_str,
             "rev": int(r.get("rev") or 1),
+            "visibility": visibility,
+            "history": history_val,
+            "updated": int(r.get("updated_at") or 0),
+            "updated_at": int(r.get("updated_at") or 0),
             "is_deleted": is_deleted
         })
     return items_list
@@ -252,6 +321,7 @@ async def get_note_delta_sync(
     """Google Keep-Style Lightweight Delta Pull.
     Returns notes created/updated/deleted since since_rev.
     """
+    await _ensure_note_table()
     user_id = await _resolve_user_id(token, x_user_id, x_user_email, x_user_name, response)
 
     try:
@@ -267,7 +337,7 @@ async def get_note_delta_sync(
         if since_rev == 0 or since_rev > current_rev:
             # Full active notes pull
             rows = await execute_pg_query(
-                "SELECT note_id, title, content, color, is_saved, date, rev, is_deleted "
+                "SELECT note_id, title, content, color, is_saved, date, history, rev, visibility, is_deleted, updated_at "
                 "FROM user_sync_notes "
                 "WHERE user_id = $1 AND is_deleted = FALSE "
                 "ORDER BY rev ASC",
@@ -276,7 +346,7 @@ async def get_note_delta_sync(
         else:
             # Delta pull
             rows = await execute_pg_query(
-                "SELECT note_id, title, content, color, is_saved, date, rev, is_deleted "
+                "SELECT note_id, title, content, color, is_saved, date, history, rev, visibility, is_deleted, updated_at "
                 "FROM user_sync_notes "
                 "WHERE user_id = $1 AND rev > $2 "
                 "ORDER BY rev ASC",
@@ -303,47 +373,130 @@ async def sync_keep_notes_batch(
     x_user_name: Optional[str] = Header(None)
 ):
     """Google Keep-Style Single-Trip Atomic Full Sync (Push + Pull).
-    1. Saves all client mutations (upserts/deletes) atomically with next revision.
+    1. Saves all client mutations (upserts/deletes) atomically with next revision and OCC checks.
     2. Atomically queries and returns remote notes updated by other devices since since_rev.
     """
+    await _ensure_note_table()
     user_id = await _resolve_user_id(token, x_user_id, x_user_email, x_user_name, response)
 
     try:
         has_mutations = bool(payload.items and len(payload.items) > 0)
-        synced_note_ids = []
+        mutation_results: List[Dict[str, Any]] = []
 
         async def _write_note_mutations(next_rev: int, now_ts: int):
             if payload.items and len(payload.items) > 0:
                 for item in payload.items:
-                    note_id = str(item.id).strip()
-                    if not note_id or (note_id == '1' and item.title == 'Start taking note'):
+                    raw_note_id = str(item.id).strip()
+                    if not raw_note_id or (raw_note_id == '1' and item.title == 'Start taking note'):
                         continue
+
+                    note_id = await resolve_canonical_id(user_id, "note", raw_note_id)
+                    if not note_id:
+                        continue
+
+                    # 1. Ownership & Permissions lookup
+                    existing_rows = await execute_pg_query(
+                        "SELECT user_id, rev, title, content, color, is_saved, date, history, visibility, is_deleted, updated_at "
+                        "FROM user_sync_notes WHERE note_id = $1 LIMIT 1",
+                        note_id
+                    )
+
+                    is_owner = True
+                    target_owner_id = user_id
+                    existing_row = None
+
+                    if existing_rows and len(existing_rows) > 0:
+                        existing_row = existing_rows[0]
+                        owner_id = int(existing_row["user_id"])
+                        is_owner = (owner_id == user_id)
+                        target_owner_id = owner_id
+
+                        if not is_owner:
+                            # Verify Shared Edit permission (link_edit or ACL write/admin)
+                            row_vis = str(existing_row.get("visibility") or "private").lower().strip()
+                            can_edit = (row_vis == "link_edit")
+                            if not can_edit and row_vis == "restricted":
+                                acl_res = await execute_pg_query(
+                                    "SELECT permission FROM user_resource_acls WHERE app_code = 'note' AND resource_id = $1 AND user_id = $2",
+                                    note_id, user_id
+                                )
+                                if acl_res and acl_res[0].get("permission") in ("write", "admin"):
+                                    can_edit = True
+
+                            if not can_edit:
+                                mutation_results.append({
+                                    "id": raw_note_id,
+                                    "status": "REJECT",
+                                    "error": "PERMISSION_DENIED"
+                                })
+                                continue
+
+                    # 2. Strict Optimistic Concurrency Control (OCC) - DO NOT overwrite stale server data
+                    if existing_row and not item.is_deleted:
+                        server_rev = int(existing_row.get("rev") or 1)
+                        client_base_rev = item.base_rev if item.base_rev is not None else item.rev
+                        if client_base_rev is not None and client_base_rev > 0 and client_base_rev < server_rev:
+                            mutation_results.append({
+                                "id": raw_note_id,
+                                "status": "CONFLICT",
+                                "server_rev": server_rev,
+                                "server_updated_at": int(existing_row.get("updated_at") or now_ts),
+                                "error": "OCC_VERSION_MISMATCH"
+                            })
+                            continue
 
                     item_title = (item.title or "").strip()
                     item_content = (item.content or "").strip()
                     normalized_color = _normalize_color(item.color)
                     color_json = json.dumps(normalized_color)
-                    synced_note_ids.append(note_id)
+                    item_updated_at = int(item.updated or item.updated_at or now_ts)
+
+                    # Visibility can only be updated by the owner
+                    if is_owner:
+                        item_visibility = str(item.visibility or (existing_row.get("visibility") if existing_row else "private")).lower().strip()
+                        if item_visibility not in ("private", "link_read", "link_edit", "restricted"):
+                            item_visibility = "private"
+                    else:
+                        item_visibility = str(existing_row.get("visibility") or "link_edit")
+
+                    history_val = _normalize_json_field(item.history, [])
+                    if not isinstance(history_val, list):
+                        history_val = []
+                    history_json = json.dumps(history_val[-30:]) # Retain latest 30 snapshots
 
                     if item.is_deleted:
-                        await execute_pg_query(
-                            "INSERT INTO user_sync_notes (user_id, note_id, title, content, color, is_saved, date, rev, is_deleted, updated_at) "
-                            "VALUES ($1, $2, '', '', '{}'::jsonb, FALSE, '', $3, TRUE, $4) "
-                            "ON CONFLICT (user_id, note_id) DO UPDATE SET "
-                            "title = '', content = '', is_deleted = TRUE, rev = EXCLUDED.rev, updated_at = EXCLUDED.updated_at",
-                            user_id, note_id, next_rev, now_ts
-                        )
+                        if is_owner:
+                            await execute_pg_query(
+                                "INSERT INTO user_sync_notes ("
+                                "   user_id, note_id, title, content, color, is_saved, date, history, rev, visibility, is_deleted, deleted_at, updated_at"
+                                ") VALUES ($1, $2, '', '', '{}'::jsonb, FALSE, '', '[]'::jsonb, $3, 'private', TRUE, CURRENT_TIMESTAMP, $4) "
+                                "ON CONFLICT (note_id) DO UPDATE SET "
+                                "   title = '', content = '', is_deleted = TRUE, deleted_at = CURRENT_TIMESTAMP, rev = EXCLUDED.rev, updated_at = EXCLUDED.updated_at "
+                                "WHERE user_sync_notes.user_id = EXCLUDED.user_id",
+                                target_owner_id, note_id, next_rev, now_ts
+                            )
+                            mutation_results.append({"id": raw_note_id, "status": "ACK", "rev": next_rev})
+                        else:
+                            mutation_results.append({
+                                "id": raw_note_id,
+                                "status": "REJECT",
+                                "error": "ONLY_OWNER_CAN_DELETE"
+                            })
                     else:
                         await execute_pg_query(
-                            "INSERT INTO user_sync_notes (user_id, note_id, title, content, color, is_saved, date, rev, is_deleted, updated_at) "
-                            "VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, FALSE, $9) "
-                            "ON CONFLICT (user_id, note_id) DO UPDATE SET "
-                            "title = EXCLUDED.title, content = EXCLUDED.content, color = EXCLUDED.color, "
-                            "is_saved = EXCLUDED.is_saved, date = EXCLUDED.date, "
-                            "rev = EXCLUDED.rev, is_deleted = FALSE, updated_at = EXCLUDED.updated_at",
-                            user_id, note_id, item_title, item_content,
-                            color_json, bool(item.isSaved), item.date or "", next_rev, now_ts
+                            "INSERT INTO user_sync_notes ("
+                            "   user_id, note_id, title, content, color, is_saved, date, history, rev, visibility, is_deleted, deleted_at, updated_at"
+                            ") VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8::jsonb, $9, $10, FALSE, NULL, $11) "
+                            "ON CONFLICT (note_id) DO UPDATE SET "
+                            "   title = EXCLUDED.title, content = EXCLUDED.content, color = EXCLUDED.color, "
+                            "   is_saved = EXCLUDED.is_saved, date = EXCLUDED.date, history = EXCLUDED.history, "
+                            "   rev = EXCLUDED.rev, visibility = EXCLUDED.visibility, is_deleted = FALSE, deleted_at = NULL, updated_at = EXCLUDED.updated_at "
+                            "WHERE user_sync_notes.is_deleted = FALSE",
+                            target_owner_id, note_id, item_title, item_content,
+                            color_json, bool(item.isSaved), item.date or "", history_json,
+                            next_rev, item_visibility, item_updated_at
                         )
+                        mutation_results.append({"id": raw_note_id, "status": "ACK", "rev": next_rev})
 
         # Atomic commit with idempotency & concurrency protection
         sync_result = await execute_sync_batch_atomic(
@@ -363,7 +516,7 @@ async def sync_keep_notes_batch(
 
         if since_rev == 0 or since_rev > effective_rev:
             rows = await execute_pg_query(
-                "SELECT note_id, title, content, color, is_saved, date, rev, is_deleted "
+                "SELECT note_id, title, content, color, is_saved, date, history, rev, visibility, is_deleted, updated_at "
                 "FROM user_sync_notes "
                 "WHERE user_id = $1 AND is_deleted = FALSE "
                 "ORDER BY rev ASC",
@@ -372,7 +525,7 @@ async def sync_keep_notes_batch(
             remote_items = _format_note_rows(rows)
         elif since_rev < effective_rev:
             rows = await execute_pg_query(
-                "SELECT note_id, title, content, color, is_saved, date, rev, is_deleted "
+                "SELECT note_id, title, content, color, is_saved, date, history, rev, visibility, is_deleted, updated_at "
                 "FROM user_sync_notes "
                 "WHERE user_id = $1 AND rev > $2 "
                 "ORDER BY rev ASC",
@@ -384,10 +537,10 @@ async def sync_keep_notes_batch(
             "status": "success",
             "current_rev": effective_rev,
             "deduplicated": sync_result.get("deduplicated", False),
-            "synced_count": len(synced_note_ids),
+            "results": mutation_results,
+            "synced_count": len([r for r in mutation_results if r.get("status") == "ACK"]),
             "items": remote_items
         }
     except Exception as e:
         print(f"[KeepSyncNote] Sync error for user {user_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Keep Sync Error: {str(e)}")
-
