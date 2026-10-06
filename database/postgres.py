@@ -509,7 +509,82 @@ async def initialize_pg_schema():
         except Exception as seed_err:
             print(f"[PostgresSchema] Notice during automatic seed reconcile: {seed_err}")
 
-        print("PostgreSQL schema and V2 Sync Counters initialized successfully!")
+        # ── Spac2 Resource Architecture Contract v1.0 (Visibility, Global Unique, ACLs) ───
+        sync_tables_cfg = [
+            ("user_sync_docs", "doc_id"),
+            ("user_sync_notes", "note_id"),
+            ("user_sync_tasks", "task_id"),
+            ("user_sync_task_projects", "project_id"),
+            ("user_sync_calendar_events", "event_id"),
+            ("user_sync_countday_events", "event_id"),
+            ("user_sync_mindmap_projects", "project_id"),
+            ("user_sync_table_projects", "project_id"),
+        ]
+
+        # ── Spac2 Legacy ID Aliasing & Remapping Table ────────────────────────
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_resource_id_aliases (
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                app_code VARCHAR(30) NOT NULL,
+                legacy_id VARCHAR(100) NOT NULL,
+                canonical_id VARCHAR(100) NOT NULL,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                CONSTRAINT uq_user_legacy_alias UNIQUE (user_id, app_code, legacy_id)
+            );
+        """)
+
+        for tbl, id_col in sync_tables_cfg:
+            try:
+                await conn.execute(f"ALTER TABLE {tbl} ADD COLUMN IF NOT EXISTS visibility VARCHAR(20) NOT NULL DEFAULT 'private';")
+                await conn.execute(f"ALTER TABLE {tbl} ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP WITH TIME ZONE DEFAULT NULL;")
+                
+                # ── Safe Historical Collision Resolution with Backward Compatible Aliasing ───
+                # Find duplicates, generate clean UUIDs, record in alias table, and update
+                app_code_name = tbl.replace("user_sync_", "").replace("_events", "").replace("_projects", "").replace("s", "")
+                if app_code_name == "doc":
+                    app_code_name = "doc"
+                elif app_code_name == "task":
+                    app_code_name = "task"
+
+                dup_rows = await conn.fetch(f"""
+                    SELECT t2.id, t2.user_id, t2.{id_col} AS raw_id
+                    FROM {tbl} t2
+                    JOIN {tbl} t3 ON t2.{id_col} = t3.{id_col} AND t2.user_id != t3.user_id AND t2.id > t3.id
+                """)
+                for dup in dup_rows:
+                    row_db_id = dup["id"]
+                    u_id = dup["user_id"]
+                    old_id = dup["raw_id"]
+                    new_canonical = f"{old_id}_{u_id}_{int(time.time())}"
+                    try:
+                        await conn.execute("""
+                            INSERT INTO user_resource_id_aliases (user_id, app_code, legacy_id, canonical_id, created_at)
+                            VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)
+                            ON CONFLICT (user_id, app_code, legacy_id) DO NOTHING;
+                        """, u_id, app_code_name, old_id, new_canonical)
+                        await conn.execute(f"UPDATE {tbl} SET {id_col} = $1 WHERE id = $2;", new_canonical, row_db_id)
+                    except Exception as alias_err:
+                        print(f"[PostgresSchema] Notice recording alias for {tbl} row {row_db_id}: {alias_err}")
+
+                await conn.execute(f"CREATE UNIQUE INDEX IF NOT EXISTS idx_{tbl}_global_{id_col} ON {tbl} ({id_col});")
+            except Exception as tbl_alter_err:
+                print(f"[PostgresSchema] Notice altering {tbl} for resource contract: {tbl_alter_err}")
+
+        # ACL Table with Foreign Key & Single Optimal Unique Index
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_resource_acls (
+                id BIGSERIAL PRIMARY KEY,
+                app_code VARCHAR(30) NOT NULL,
+                resource_id VARCHAR(50) NOT NULL,
+                user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                permission VARCHAR(20) NOT NULL DEFAULT 'read',
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                CONSTRAINT uq_resource_user_acl UNIQUE (app_code, resource_id, user_id)
+            );
+        """)
+
+        print("PostgreSQL schema and V2 Sync Counters + Resource Contract v1.0 initialized successfully!")
 
 
 

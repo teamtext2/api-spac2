@@ -268,3 +268,23 @@ async def execute_sync_batch_atomic(
             "deduplicated": False
         }
 
+
+async def resolve_canonical_id(user_id: int, app_code: str, client_id: str) -> str:
+    """
+    Spac2 Legacy ID Remapping Engine.
+    Maps legacy client-scoped IDs to globally unique canonical IDs seamlessly.
+    """
+    clean_id = str(client_id).strip()
+    if not clean_id:
+        return ""
+    try:
+        rows = await execute_pg_query(
+            "SELECT canonical_id FROM user_resource_id_aliases WHERE user_id = $1 AND app_code = $2 AND legacy_id = $3 LIMIT 1",
+            user_id, app_code.strip().lower(), clean_id
+        )
+        if rows and len(rows) > 0 and rows[0].get("canonical_id"):
+            return str(rows[0]["canonical_id"]).strip()
+    except Exception:
+        pass
+    return clean_id
+

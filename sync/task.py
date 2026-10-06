@@ -437,9 +437,10 @@ async def sync_keep_tasks_batch(
                         await execute_pg_query(
                             "INSERT INTO user_sync_task_projects (user_id, project_id, name, color, created_at_str, rev, is_deleted, updated_at) "
                             "VALUES ($1, $2, $3, $4::jsonb, $5, $6, FALSE, $7) "
-                            "ON CONFLICT (user_id, project_id) DO UPDATE SET "
+                            "ON CONFLICT (project_id) DO UPDATE SET "
                             "name = EXCLUDED.name, color = EXCLUDED.color, created_at_str = EXCLUDED.created_at_str, "
-                            "rev = EXCLUDED.rev, is_deleted = FALSE, updated_at = EXCLUDED.updated_at",
+                            "rev = EXCLUDED.rev, is_deleted = FALSE, updated_at = EXCLUDED.updated_at "
+                            "WHERE user_sync_task_projects.user_id = EXCLUDED.user_id AND user_sync_task_projects.is_deleted = FALSE",
                             user_id, proj_id, p_name, color_json, p.createdAt or "", next_rev, now_ts
                         )
 
@@ -459,22 +460,24 @@ async def sync_keep_tasks_batch(
                         await execute_pg_query(
                             "INSERT INTO user_sync_tasks (user_id, task_id, project_id, title, note, priority, due_date, completed, completed_at, subtasks, date, rev, is_deleted, updated_at) "
                             "VALUES ($1, $2, '', '', '', 'normal', '', FALSE, '', '[]'::jsonb, '', $3, TRUE, $4) "
-                            "ON CONFLICT (user_id, task_id) DO UPDATE SET "
-                            "title = '', note = '', is_deleted = TRUE, rev = EXCLUDED.rev, updated_at = EXCLUDED.updated_at",
+                            "ON CONFLICT (task_id) DO UPDATE SET "
+                            "title = '', note = '', is_deleted = TRUE, rev = EXCLUDED.rev, updated_at = EXCLUDED.updated_at "
+                            "WHERE user_sync_tasks.user_id = EXCLUDED.user_id",
                             user_id, task_id, next_rev, now_ts
                         )
                     else:
                         await execute_pg_query(
                             "INSERT INTO user_sync_tasks (user_id, task_id, project_id, title, note, priority, due_date, completed, completed_at, subtasks, date, rev, is_deleted, updated_at) "
                             "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11, $12, FALSE, $13) "
-                            "ON CONFLICT (user_id, task_id) DO UPDATE SET "
-                            "project_id = EXCLUDED.project_id, title = EXCLUDED.title, note = EXCLUDED.note, "
-                            "priority = EXCLUDED.priority, due_date = EXCLUDED.due_date, completed = EXCLUDED.completed, "
-                            "completed_at = EXCLUDED.completed_at, subtasks = EXCLUDED.subtasks, date = EXCLUDED.date, "
-                            "rev = EXCLUDED.rev, is_deleted = FALSE, updated_at = EXCLUDED.updated_at",
-                            user_id, task_id, t_proj_id, t_title, t.note or "",
-                            t.priority or "normal", t.dueDate or "", bool(t.completed),
-                            t.completedAt or "", subtasks_json, t.createdAt or "", next_rev, now_ts
+                            "ON CONFLICT (task_id) DO UPDATE SET "
+                            "title = EXCLUDED.title, note = EXCLUDED.note, priority = EXCLUDED.priority, "
+                            "due_date = EXCLUDED.due_date, completed = EXCLUDED.completed, completed_at = EXCLUDED.completed_at, "
+                            "subtasks = EXCLUDED.subtasks, date = EXCLUDED.date, rev = EXCLUDED.rev, "
+                            "is_deleted = FALSE, updated_at = EXCLUDED.updated_at "
+                            "WHERE user_sync_tasks.user_id = EXCLUDED.user_id AND user_sync_tasks.is_deleted = FALSE",
+                            user_id, task_id, t_proj_id, t_title, t.note or "", t.priority or "normal",
+                            t.dueDate or "", bool(t.completed), t.completedAt or "", subtasks_json,
+                            t.createdAt or "", next_rev, now_ts
                         )
 
         # Atomic commit with idempotency & concurrency protection

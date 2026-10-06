@@ -310,11 +310,32 @@ def _handle_generic_query(cursor, conn, sql, args, in_tx: bool = False):
     sqlite_sql = sql
     sqlite_args = list(args)
 
+    # Handle ALTER TABLE ADD COLUMN IF NOT EXISTS in SQLite
+    alter_match = re.match(r'ALTER\s+TABLE\s+([a-zA-Z0-9_]+)\s+ADD\s+COLUMN\s+(?:IF\s+NOT\s+EXISTS\s+)?([a-zA-Z0-9_]+)\s+([^;]+)', sqlite_sql, re.IGNORECASE)
+    if alter_match:
+        tbl_name = alter_match.group(1)
+        col_name = alter_match.group(2)
+        col_type = alter_match.group(3).replace('VARCHAR(20)', 'TEXT').replace('TIMESTAMP WITH TIME ZONE', 'TEXT')
+        try:
+            cursor.execute(f"PRAGMA table_info({tbl_name})")
+            existing_cols = [row[1] for row in cursor.fetchall()]
+            if col_name not in existing_cols:
+                cursor.execute(f"ALTER TABLE {tbl_name} ADD COLUMN {col_name} {col_type};")
+                if not in_tx:
+                    conn.commit()
+            return [{"success": True}]
+        except Exception as e:
+            return [{"success": True}]
+
     # Translate GREATEST(a, b) -> MAX(a, b) for SQLite
     sqlite_sql = re.sub(r'\bgreatest\b', 'MAX', sqlite_sql, flags=re.IGNORECASE)
 
     # Translate ILIKE to LIKE for SQLite compatibility
     sqlite_sql = re.sub(r'\bilike\b', 'LIKE', sqlite_sql, flags=re.IGNORECASE)
+
+    # Replace TRUE and FALSE literals
+    sqlite_sql = re.sub(r'\bTRUE\b', '1', sqlite_sql)
+    sqlite_sql = re.sub(r'\bFALSE\b', '0', sqlite_sql)
 
     # Translate = ANY($X::type[]) -> IN (?, ?, ...)
     any_matches = list(re.finditer(
@@ -349,6 +370,9 @@ def _handle_generic_query(cursor, conn, sql, args, in_tx: bool = False):
     if param_indices:
         sqlite_args = [args[idx] for idx in param_indices if idx < len(args)]
         sqlite_sql = re.sub(r'\$\d+', '?', sqlite_sql)
+
+    # Convert Python boolean args to 1 / 0 for SQLite parameter binding
+    sqlite_args = [1 if x is True else (0 if x is False else x) for x in sqlite_args]
 
     try:
         if sqlite_sql.strip().upper().startswith("SELECT"):
@@ -661,10 +685,12 @@ def _ensure_sqlite_schema(cursor, conn):
             active_tab_id TEXT DEFAULT 'tab-default',
             history TEXT DEFAULT '[]',
             rev INTEGER NOT NULL DEFAULT 1,
+            visibility TEXT DEFAULT 'private',
             is_deleted INTEGER DEFAULT 0,
+            deleted_at TEXT DEFAULT NULL,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             updated_at INTEGER DEFAULT 0,
-            UNIQUE (user_id, doc_id)
+            UNIQUE (doc_id)
         );
     """)
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_sync_docs_user_rev ON user_sync_docs(user_id, rev);")
@@ -690,6 +716,43 @@ def _ensure_sqlite_schema(cursor, conn):
             PRIMARY KEY (user_id, app_code, sync_batch_id)
         );
     """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS user_resource_id_aliases (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            app_code TEXT NOT NULL,
+            legacy_id TEXT NOT NULL,
+            canonical_id TEXT NOT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE (user_id, app_code, legacy_id)
+        );
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS user_resource_acls (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            app_code TEXT NOT NULL,
+            resource_id TEXT NOT NULL,
+            user_id INTEGER NOT NULL,
+            permission TEXT DEFAULT 'read',
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE (app_code, resource_id, user_id)
+        );
+    """)
+
+    # Check and add visibility and deleted_at to all sync tables in SQLite
+    for t_name in ["user_sync_notes", "user_sync_task_projects", "user_sync_tasks", 
+                   "user_sync_calendar_events", "user_sync_countday_events", 
+                   "user_sync_mindmap_projects", "user_sync_table_projects", "user_sync_docs"]:
+        try:
+            cursor.execute(f"PRAGMA table_info({t_name})")
+            t_cols = [r[1] for r in cursor.fetchall()]
+            if "visibility" not in t_cols:
+                cursor.execute(f"ALTER TABLE {t_name} ADD COLUMN visibility TEXT DEFAULT 'private';")
+            if "deleted_at" not in t_cols:
+                cursor.execute(f"ALTER TABLE {t_name} ADD COLUMN deleted_at TEXT DEFAULT NULL;")
+        except Exception:
+            pass
 
 
 
