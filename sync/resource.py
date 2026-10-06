@@ -95,7 +95,7 @@ async def _ensure_activity_table():
                 last_active TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
                 CONSTRAINT uq_resource_activity UNIQUE (app_code, resource_id, user_id, action)
             );
-            CREATE INDEX IF NOT EXISTS idx_res_act_lookup ON user_resource_activity(app_code, resource_id);
+            CREATE INDEX IF NOT EXISTS idx_res_act_lookup ON user_resource_activity(app_code, resource_id, last_active);
         """)
     except Exception as e:
         print(f"[ResourceActivity] Table init notice: {e}")
@@ -104,6 +104,12 @@ async def _ensure_activity_table():
 async def _get_resource_collaborators(app_code: str, resource_id: str, owner_id: int) -> List[Dict[str, Any]]:
     await _ensure_activity_table()
     try:
+        # 1. Auto-purge transient activity records older than 30 minutes to keep database compact & zero-cost
+        await execute_pg_query(
+            "DELETE FROM user_resource_activity WHERE last_active < NOW() - INTERVAL '30 minutes'"
+        )
+
+        # 2. Query only activity within the last 30 minutes
         rows = await execute_pg_query("""
             SELECT a.user_id, a.action, EXTRACT(EPOCH FROM a.last_active) * 1000 AS last_active_ts,
                    COALESCE(u.name, u.username, 'Collaborator') AS name,
@@ -111,21 +117,41 @@ async def _get_resource_collaborators(app_code: str, resource_id: str, owner_id:
                    COALESCE(u.username, '') AS username
             FROM user_resource_activity a
             LEFT JOIN users u ON (u.user_id = a.user_id OR u.id = a.user_id)
-            WHERE a.app_code = $1 AND a.resource_id = $2
+            WHERE a.app_code = $1 AND a.resource_id = $2 AND a.last_active >= NOW() - INTERVAL '30 minutes'
             ORDER BY a.last_active DESC
-            LIMIT 20
+            LIMIT 15
         """, app_code, resource_id)
 
-        collabs = []
+        # 3. Always look up and place document Owner at top
+        owner_rows = await execute_pg_query("""
+            SELECT COALESCE(name, username, 'Owner') AS name, COALESCE(email, '') AS email, COALESCE(username, '') AS username
+            FROM users WHERE user_id = $1 OR id = $1 LIMIT 1
+        """, owner_id)
+        owner_name = owner_rows[0].get("name") if (owner_rows and len(owner_rows) > 0) else "Owner"
+        owner_email = owner_rows[0].get("email") if (owner_rows and len(owner_rows) > 0) else ""
+        owner_username = owner_rows[0].get("username") if (owner_rows and len(owner_rows) > 0) else ""
+
+        collabs = [{
+            "user_id": owner_id,
+            "name": owner_name,
+            "email": owner_email,
+            "username": owner_username,
+            "action": "owner",
+            "is_owner": True,
+            "last_active": int(time.time() * 1000)
+        }]
+
         for r in (rows or []):
             uid = int(r.get("user_id") or 0)
+            if uid == owner_id:
+                continue
             collabs.append({
                 "user_id": uid,
                 "name": r.get("name") or "Collaborator",
                 "email": r.get("email") or "",
                 "username": r.get("username") or "",
                 "action": r.get("action") or "view",
-                "is_owner": (uid == owner_id),
+                "is_owner": False,
                 "last_active": int(r.get("last_active_ts") or 0)
             })
         return collabs

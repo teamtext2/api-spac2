@@ -499,6 +499,9 @@ async def sync_keep_docs_batch(
                                 VALUES ('doc', $1, $2, 'edit', CURRENT_TIMESTAMP)
                                 ON CONFLICT (app_code, resource_id, user_id, action) DO UPDATE SET last_active = CURRENT_TIMESTAMP
                             """, doc_id, user_id)
+                            await execute_pg_query(
+                                "DELETE FROM user_resource_activity WHERE last_active < NOW() - INTERVAL '30 minutes'"
+                            )
                         except Exception:
                             pass
 
