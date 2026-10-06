@@ -493,6 +493,14 @@ async def sync_keep_docs_batch(
                             next_rev, item_visibility, item_updated_at
                         )
                         mutation_results.append({"id": raw_doc_id, "status": "ACK", "rev": next_rev})
+                        try:
+                            await execute_pg_query("""
+                                INSERT INTO user_resource_activity (app_code, resource_id, user_id, action, last_active)
+                                VALUES ('doc', $1, $2, 'edit', CURRENT_TIMESTAMP)
+                                ON CONFLICT (app_code, resource_id, user_id, action) DO UPDATE SET last_active = CURRENT_TIMESTAMP
+                            """, doc_id, user_id)
+                        except Exception:
+                            pass
 
             # Auto-purge soft-deleted tombstones older than 30 days
             try:

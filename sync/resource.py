@@ -83,6 +83,57 @@ async def resolve_optional_user_id(
     return None
 
 
+async def _ensure_activity_table():
+    try:
+        await execute_pg_query("""
+            CREATE TABLE IF NOT EXISTS user_resource_activity (
+                id BIGSERIAL PRIMARY KEY,
+                app_code VARCHAR(30) NOT NULL,
+                resource_id VARCHAR(100) NOT NULL,
+                user_id BIGINT NOT NULL,
+                action VARCHAR(20) NOT NULL DEFAULT 'view',
+                last_active TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                CONSTRAINT uq_resource_activity UNIQUE (app_code, resource_id, user_id, action)
+            );
+            CREATE INDEX IF NOT EXISTS idx_res_act_lookup ON user_resource_activity(app_code, resource_id);
+        """)
+    except Exception as e:
+        print(f"[ResourceActivity] Table init notice: {e}")
+
+
+async def _get_resource_collaborators(app_code: str, resource_id: str, owner_id: int) -> List[Dict[str, Any]]:
+    await _ensure_activity_table()
+    try:
+        rows = await execute_pg_query("""
+            SELECT a.user_id, a.action, EXTRACT(EPOCH FROM a.last_active) * 1000 AS last_active_ts,
+                   COALESCE(u.name, u.username, 'Collaborator') AS name,
+                   COALESCE(u.email, '') AS email,
+                   COALESCE(u.username, '') AS username
+            FROM user_resource_activity a
+            LEFT JOIN users u ON (u.user_id = a.user_id OR u.id = a.user_id)
+            WHERE a.app_code = $1 AND a.resource_id = $2
+            ORDER BY a.last_active DESC
+            LIMIT 20
+        """, app_code, resource_id)
+
+        collabs = []
+        for r in (rows or []):
+            uid = int(r.get("user_id") or 0)
+            collabs.append({
+                "user_id": uid,
+                "name": r.get("name") or "Collaborator",
+                "email": r.get("email") or "",
+                "username": r.get("username") or "",
+                "action": r.get("action") or "view",
+                "is_owner": (uid == owner_id),
+                "last_active": int(r.get("last_active_ts") or 0)
+            })
+        return collabs
+    except Exception as e:
+        print(f"[ResourceCollaborators] Fetch notice: {e}")
+        return []
+
+
 @router.get("/{app_code}/{resource_id}")
 async def get_resource_by_id(
     app_code: str,
@@ -93,16 +144,7 @@ async def get_resource_by_id(
     x_user_email: Optional[str] = Header(None),
 ):
     """
-    Spac2 Resource Contract v1.3 - Read Resource Endpoint
-    1. Always sets noindex & no-cache headers.
-    2. Validates existence & soft-deletion (returns 404 on deleted items).
-    3. Authorization Matrix:
-       - Owner -> 200 (role: owner)
-       - Authenticated + link_edit -> 200 (role: editor)
-       - Anonymous + link_edit -> 200 (role: viewer, requires_login_to_edit: true)
-       - link_read -> 200 (role: viewer)
-       - restricted -> checks ACL -> 200 (role: editor | viewer)
-       - private -> 404 (Masking)
+    Spac2 Resource Contract v1.4 - Read Resource & Collaborators
     """
     inject_resource_headers(response)
     app_code = app_code.strip().lower()
@@ -132,24 +174,39 @@ async def get_resource_by_id(
         owner_id = int(item.get(user_col) or 0)
         visibility = str(item.get("visibility") or "private").lower().strip()
 
+        # Log viewing activity for authenticated users
+        if requester_id:
+            await _ensure_activity_table()
+            try:
+                await execute_pg_query("""
+                    INSERT INTO user_resource_activity (app_code, resource_id, user_id, action, last_active)
+                    VALUES ($1, $2, $3, 'view', CURRENT_TIMESTAMP)
+                    ON CONFLICT (app_code, resource_id, user_id, action) DO UPDATE SET last_active = CURRENT_TIMESTAMP
+                """, app_code, resource_id, requester_id)
+            except Exception:
+                pass
+
+        collaborators = await _get_resource_collaborators(app_code, resource_id, owner_id)
+
         # 1. Owner check
         if requester_id and requester_id == owner_id:
             return {
                 "status": "success",
                 "role": "owner",
                 "visibility": visibility,
+                "collaborators": collaborators,
                 "data": item
             }
 
         # 2. Link Edit check (Public collaboration)
         if visibility == "link_edit":
-            # Authenticated users get editor role, Anonymous users get read-only viewer role
             role = "editor" if requester_id else "viewer"
             return {
                 "status": "success",
                 "role": role,
                 "visibility": "link_edit",
                 "requires_login_to_edit": not bool(requester_id),
+                "collaborators": collaborators,
                 "data": item
             }
 
@@ -160,6 +217,7 @@ async def get_resource_by_id(
                 "role": "viewer",
                 "visibility": "link_read",
                 "requires_login_to_edit": False,
+                "collaborators": collaborators,
                 "data": item
             }
 
@@ -175,6 +233,7 @@ async def get_resource_by_id(
                     "status": "success",
                     "role": "editor" if perm in ("write", "admin") else "viewer",
                     "visibility": "restricted",
+                    "collaborators": collaborators,
                     "data": item
                 }
 
@@ -188,6 +247,39 @@ async def get_resource_by_id(
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
+@router.get("/{app_code}/{resource_id}/collaborators")
+async def get_collaborators_endpoint(
+    app_code: str,
+    resource_id: str,
+    response: Response,
+    token: Optional[str] = Depends(get_auth_token),
+    x_user_id: Optional[str] = Header(None),
+    x_user_email: Optional[str] = Header(None),
+):
+    """Retrieve real-time active collaborators and viewer list for document."""
+    inject_resource_headers(response)
+    app_code = app_code.strip().lower()
+    cfg = RESOURCE_CONFIGS.get(app_code)
+    if not cfg:
+        raise HTTPException(status_code=404, detail="Resource not found")
+
+    table = cfg["table"]
+    id_col = cfg["id_col"]
+    user_col = cfg["user_col"]
+
+    rows = await execute_pg_query(f"SELECT {user_col} FROM {table} WHERE {id_col} = $1 LIMIT 1", resource_id)
+    if not rows:
+        raise HTTPException(status_code=404, detail="Resource not found")
+
+    owner_id = int(rows[0].get(user_col) or 0)
+    collabs = await _get_resource_collaborators(app_code, resource_id, owner_id)
+    return {
+        "status": "success",
+        "resource_id": resource_id,
+        "collaborators": collabs
+    }
+
+
 @router.patch("/{app_code}/{resource_id}/visibility")
 async def update_resource_visibility(
     app_code: str,
@@ -199,10 +291,7 @@ async def update_resource_visibility(
     x_user_email: Optional[str] = Header(None),
 ):
     """
-    Spac2 Resource Contract v1.3 - Toggle Visibility Endpoint
-    Only the resource OWNER or ADMIN is authorized to change visibility.
-    Valid visibilities: 'private', 'link_read', 'link_edit', 'restricted'.
-    Immediate effect upon commit with zero edge cache pollution.
+    Spac2 Resource Contract v1.4 - Toggle Visibility with Atomic Rev Increment
     """
     inject_resource_headers(response)
     app_code = app_code.strip().lower()
@@ -216,7 +305,7 @@ async def update_resource_visibility(
 
     new_vis = payload.visibility.strip().lower()
     if new_vis not in ("private", "link_read", "link_edit", "restricted"):
-        raise HTTPException(status_code=400, detail="Invalid visibility state. Must be 'private', 'link_read', 'link_edit', or 'restricted'.")
+        raise HTTPException(status_code=400, detail="Invalid visibility state.")
 
     requester_id = await resolve_optional_user_id(token, x_user_id, x_user_email)
     if not requester_id:
@@ -240,7 +329,7 @@ async def update_resource_visibility(
 
         now_ts = int(time.time() * 1000)
         await execute_pg_query(
-            f"UPDATE {table} SET visibility = $1, updated_at = $2 WHERE {id_col} = $3",
+            f"UPDATE {table} SET visibility = $1, rev = rev + 1, updated_at = $2 WHERE {id_col} = $3",
             new_vis, now_ts, resource_id
         )
 
