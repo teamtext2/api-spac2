@@ -539,11 +539,10 @@ async def initialize_pg_schema():
 
         for tbl, id_col in sync_tables_cfg:
             try:
-                await conn.execute(f"ALTER TABLE {tbl} ADD COLUMN IF NOT EXISTS visibility VARCHAR(20) NOT NULL DEFAULT 'private';")
+                await conn.execute(f"ALTER TABLE {tbl} DROP COLUMN IF EXISTS visibility CASCADE;")
                 await conn.execute(f"ALTER TABLE {tbl} ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP WITH TIME ZONE DEFAULT NULL;")
                 
                 # ── Safe Historical Collision Resolution with Backward Compatible Aliasing ───
-                # Find duplicates, generate clean UUIDs, record in alias table, and update
                 app_code_name = tbl.replace("user_sync_", "").replace("_events", "").replace("_projects", "").replace("s", "")
                 if app_code_name == "doc":
                     app_code_name = "doc"
@@ -578,7 +577,7 @@ async def initialize_pg_schema():
         await conn.execute("DROP TABLE IF EXISTS user_resource_acls CASCADE;")
         await conn.execute("DROP TABLE IF EXISTS user_resource_activity CASCADE;")
 
-        print("PostgreSQL schema and V2 Sync Counters + Resource Contract v1.0 initialized successfully!")
+        print("PostgreSQL schema and V2 Sync Counters initialized successfully!")
 
 
 

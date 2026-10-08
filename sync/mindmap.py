@@ -29,7 +29,6 @@ async def _ensure_mindmap_table():
                 data JSONB DEFAULT '{"nodes": [], "edges": [], "transform": {"x": 0, "y": 0, "scale": 1}}',
                 created_at_str TEXT DEFAULT '',
                 rev BIGINT NOT NULL DEFAULT 1,
-                visibility VARCHAR(20) NOT NULL DEFAULT 'private',
                 is_deleted BOOLEAN DEFAULT FALSE,
                 deleted_at TIMESTAMP WITH TIME ZONE DEFAULT NULL,
                 created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
@@ -38,7 +37,7 @@ async def _ensure_mindmap_table():
             );
         """)
         try:
-            await execute_pg_query("ALTER TABLE user_sync_mindmap_projects ADD COLUMN IF NOT EXISTS visibility VARCHAR(20) NOT NULL DEFAULT 'private';")
+            await execute_pg_query("ALTER TABLE user_sync_mindmap_projects DROP COLUMN IF EXISTS visibility CASCADE;")
             await execute_pg_query("ALTER TABLE user_sync_mindmap_projects ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP WITH TIME ZONE DEFAULT NULL;")
             await execute_pg_query("CREATE INDEX IF NOT EXISTS idx_sync_mindmap_user_rev ON user_sync_mindmap_projects(user_id, rev);")
             await execute_pg_query("CREATE UNIQUE INDEX IF NOT EXISTS idx_sync_mindmap_global_project_id ON user_sync_mindmap_projects(project_id);")
@@ -60,7 +59,7 @@ class MindmapProjectSyncItem(BaseModel):
     updated_at: Optional[Union[str, int, float]] = None
     rev: Optional[int] = 1
     base_rev: Optional[int] = None
-    visibility: Optional[str] = "private"
+    visibility: Optional[str] = None
     is_deleted: Optional[bool] = False
 
 
@@ -224,7 +223,6 @@ def _format_mindmap_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         created_at_str = str(r.get("created_at_str") or "").strip()
         updated_at_ts = int(r.get("updated_at") or 0)
         rev = int(r.get("rev") or 1)
-        visibility = str(r.get("visibility") or "private").lower().strip()
         is_deleted = bool(r.get("is_deleted"))
 
         seen_ids.add(proj_id)
@@ -237,7 +235,6 @@ def _format_mindmap_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "updatedAt": updated_at_ts,
             "updated_at": updated_at_ts,
             "rev": rev,
-            "visibility": visibility,
             "is_deleted": is_deleted
         })
     return projects_list
@@ -273,7 +270,7 @@ async def get_mindmap_delta_sync(
         if since_rev == 0 or since_rev > current_rev:
             # Full active projects pull
             rows = await execute_pg_query(
-                "SELECT project_id, name, data, created_at_str, rev, visibility, is_deleted, created_at, updated_at "
+                "SELECT project_id, name, data, created_at_str, rev, is_deleted, created_at, updated_at "
                 "FROM user_sync_mindmap_projects "
                 "WHERE user_id = $1 AND is_deleted = FALSE "
                 "ORDER BY updated_at DESC, rev ASC",
@@ -282,7 +279,7 @@ async def get_mindmap_delta_sync(
         else:
             # Delta pull
             rows = await execute_pg_query(
-                "SELECT project_id, name, data, created_at_str, rev, visibility, is_deleted, created_at, updated_at "
+                "SELECT project_id, name, data, created_at_str, rev, is_deleted, created_at, updated_at "
                 "FROM user_sync_mindmap_projects "
                 "WHERE user_id = $1 AND rev > $2 "
                 "ORDER BY updated_at DESC, rev ASC",
@@ -342,7 +339,7 @@ async def sync_keep_mindmap_batch(
 
                     # 1. Ownership & Permissions lookup
                     existing_rows = await execute_pg_query(
-                        "SELECT user_id, rev, name, data, created_at_str, visibility, is_deleted, updated_at "
+                        "SELECT user_id, rev, name, data, created_at_str, is_deleted, updated_at "
                         "FROM user_sync_mindmap_projects WHERE project_id = $1 LIMIT 1",
                         proj_id
                     )
@@ -390,16 +387,12 @@ async def sync_keep_mindmap_batch(
                     created_at_str = str(item.createdAt or item.created_at or "").strip()
                     item_updated_at = int(item.updatedAt or item.updated_at or now_ts)
 
-                    # Visibility can only be updated by the owner: strictly 'private' or 'link_read'
-                    raw_vis = str(item.visibility or (existing_row.get("visibility") if existing_row else "private")).lower().strip()
-                    item_visibility = "link_read" if raw_vis in ("link_read", "public") else "private"
-
                     if item.is_deleted:
                         if is_owner:
                             await execute_pg_query(
                                 "INSERT INTO user_sync_mindmap_projects ("
-                                "   user_id, project_id, name, data, created_at_str, rev, visibility, is_deleted, deleted_at, updated_at"
-                                ") VALUES ($1, $2, '', '{\"nodes\":[],\"edges\":[],\"transform\":{\"x\":0,\"y\":0,\"scale\":1}}'::jsonb, '', $3, 'private', TRUE, CURRENT_TIMESTAMP, $4) "
+                                "   user_id, project_id, name, data, created_at_str, rev, is_deleted, deleted_at, updated_at"
+                                ") VALUES ($1, $2, '', '{\"nodes\":[],\"edges\":[],\"transform\":{\"x\":0,\"y\":0,\"scale\":1}}'::jsonb, '', $3, TRUE, CURRENT_TIMESTAMP, $4) "
                                 "ON CONFLICT (project_id) DO UPDATE SET "
                                 "   name = '', data = '{\"nodes\":[],\"edges\":[],\"transform\":{\"x\":0,\"y\":0,\"scale\":1}}'::jsonb, "
                                 "   is_deleted = TRUE, deleted_at = CURRENT_TIMESTAMP, rev = EXCLUDED.rev, updated_at = EXCLUDED.updated_at "
@@ -416,13 +409,13 @@ async def sync_keep_mindmap_batch(
                     else:
                         await execute_pg_query(
                             "INSERT INTO user_sync_mindmap_projects ("
-                            "   user_id, project_id, name, data, created_at_str, rev, visibility, is_deleted, deleted_at, updated_at"
-                            ") VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7, FALSE, NULL, $8) "
+                            "   user_id, project_id, name, data, created_at_str, rev, is_deleted, deleted_at, updated_at"
+                            ") VALUES ($1, $2, $3, $4::jsonb, $5, $6, FALSE, NULL, $7) "
                             "ON CONFLICT (project_id) DO UPDATE SET "
                             "   name = EXCLUDED.name, data = EXCLUDED.data, created_at_str = EXCLUDED.created_at_str, "
-                            "   rev = EXCLUDED.rev, visibility = EXCLUDED.visibility, is_deleted = FALSE, deleted_at = NULL, updated_at = EXCLUDED.updated_at "
+                            "   rev = EXCLUDED.rev, is_deleted = FALSE, deleted_at = NULL, updated_at = EXCLUDED.updated_at "
                             "WHERE user_sync_mindmap_projects.user_id = EXCLUDED.user_id AND user_sync_mindmap_projects.is_deleted = FALSE",
-                            target_owner_id, proj_id, item_name, data_json_str, created_at_str, next_rev, item_visibility, item_updated_at
+                            target_owner_id, proj_id, item_name, data_json_str, created_at_str, next_rev, item_updated_at
                         )
                         mutation_results.append({"id": raw_proj_id, "status": "ACK", "rev": next_rev})
 
@@ -454,7 +447,7 @@ async def sync_keep_mindmap_batch(
 
         if since_rev == 0 or since_rev > effective_rev:
             rows = await execute_pg_query(
-                "SELECT project_id, name, data, created_at_str, rev, visibility, is_deleted, created_at, updated_at "
+                "SELECT project_id, name, data, created_at_str, rev, is_deleted, created_at, updated_at "
                 "FROM user_sync_mindmap_projects "
                 "WHERE user_id = $1 AND is_deleted = FALSE "
                 "ORDER BY updated_at DESC, rev ASC",
@@ -463,7 +456,7 @@ async def sync_keep_mindmap_batch(
             remote_projects = _format_mindmap_rows(rows)
         elif since_rev < effective_rev:
             rows = await execute_pg_query(
-                "SELECT project_id, name, data, created_at_str, rev, visibility, is_deleted, created_at, updated_at "
+                "SELECT project_id, name, data, created_at_str, rev, is_deleted, created_at, updated_at "
                 "FROM user_sync_mindmap_projects "
                 "WHERE user_id = $1 AND rev > $2 "
                 "ORDER BY updated_at DESC, rev ASC",

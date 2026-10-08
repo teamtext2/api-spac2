@@ -36,7 +36,7 @@ class DocSyncItem(BaseModel):
     updated_at: Optional[Union[int, float, str]] = None
     rev: Optional[int] = None
     base_rev: Optional[int] = None
-    visibility: Optional[str] = "private"
+    visibility: Optional[str] = None
     is_deleted: Optional[bool] = False
 
 
@@ -70,7 +70,6 @@ async def _ensure_doc_table():
                 active_tab_id VARCHAR(100) DEFAULT 'tab-default',
                 history JSONB DEFAULT '[]',
                 rev BIGINT NOT NULL DEFAULT 1,
-                visibility VARCHAR(20) NOT NULL DEFAULT 'private',
                 is_deleted BOOLEAN DEFAULT FALSE,
                 deleted_at TIMESTAMP WITH TIME ZONE DEFAULT NULL,
                 created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
@@ -79,7 +78,7 @@ async def _ensure_doc_table():
             );
         """)
         try:
-            await execute_pg_query("ALTER TABLE user_sync_docs ADD COLUMN IF NOT EXISTS visibility VARCHAR(20) NOT NULL DEFAULT 'private';")
+            await execute_pg_query("ALTER TABLE user_sync_docs DROP COLUMN IF EXISTS visibility CASCADE;")
             await execute_pg_query("ALTER TABLE user_sync_docs ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP WITH TIME ZONE DEFAULT NULL;")
             await execute_pg_query("CREATE INDEX IF NOT EXISTS idx_sync_docs_user_rev ON user_sync_docs(user_id, rev);")
             await execute_pg_query("CREATE UNIQUE INDEX IF NOT EXISTS idx_sync_docs_global_doc_id ON user_sync_docs(doc_id);")
@@ -247,7 +246,6 @@ def _format_doc_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         active_tab_id = str(r.get("active_tab_id") or "")
         history = _normalize_json_field(r.get("history"), [])
         rev = int(r.get("rev") or 1)
-        visibility = str(r.get("visibility") or "private").lower().strip()
         is_deleted = bool(r.get("is_deleted"))
         updated_at = int(r.get("updated_at") or 0)
 
@@ -268,7 +266,6 @@ def _format_doc_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "active_tab_id": active_tab_id,
             "history": history,
             "rev": rev,
-            "visibility": visibility,
             "is_deleted": is_deleted,
             "updated": updated_at,
             "updated_at": updated_at
@@ -313,7 +310,7 @@ async def get_doc_delta_sync(
             # Full active documents pull
             rows = await execute_pg_query(
                 "SELECT doc_id, title, body, preview_text, word_count, pinned, in_trash, target, "
-                "tabs, active_tab_id, history, rev, visibility, is_deleted, updated_at "
+                "tabs, active_tab_id, history, rev, is_deleted, updated_at "
                 "FROM user_sync_docs "
                 "WHERE user_id = $1 AND is_deleted = FALSE "
                 "ORDER BY rev ASC",
@@ -323,7 +320,7 @@ async def get_doc_delta_sync(
             # Delta pull
             rows = await execute_pg_query(
                 "SELECT doc_id, title, body, preview_text, word_count, pinned, in_trash, target, "
-                "tabs, active_tab_id, history, rev, visibility, is_deleted, updated_at "
+                "tabs, active_tab_id, history, rev, is_deleted, updated_at "
                 "FROM user_sync_docs "
                 "WHERE user_id = $1 AND rev > $2 "
                 "ORDER BY rev ASC",
@@ -376,7 +373,7 @@ async def sync_keep_docs_batch(
                     # 1. Look up existing doc to determine ownership & permissions
                     existing_rows = await execute_pg_query(
                         "SELECT user_id, rev, title, body, preview_text, word_count, pinned, in_trash, target, "
-                        "tabs, active_tab_id, history, visibility, is_deleted, updated_at "
+                        "tabs, active_tab_id, history, is_deleted, updated_at "
                         "FROM user_sync_docs WHERE doc_id = $1 LIMIT 1",
                         doc_id
                     )
@@ -424,10 +421,6 @@ async def sync_keep_docs_batch(
                     in_trash = bool(item.inTrash if item.inTrash is not None else item.in_trash) if is_owner else False
                     target = int(item.target or 500)
                     active_tab_id = item.activeTabId or item.active_tab_id or "tab-default"
-                    
-                    # Visibility can only be updated by the owner: strictly 'private' or 'link_read'
-                    raw_vis = str(item.visibility or (existing_row.get("visibility") if existing_row else "private")).lower().strip()
-                    item_visibility = "link_read" if raw_vis in ("link_read", "public") else "private"
 
                     tabs_val = _normalize_json_field(item.tabs, [])
                     tabs_json = json.dumps(tabs_val)
@@ -444,8 +437,8 @@ async def sync_keep_docs_batch(
                             await execute_pg_query(
                                 "INSERT INTO user_sync_docs ("
                                 "   user_id, doc_id, title, body, preview_text, word_count, pinned, in_trash, "
-                                "   target, tabs, active_tab_id, history, rev, visibility, is_deleted, deleted_at, updated_at"
-                                ") VALUES ($1, $2, '', '', '', 0, FALSE, FALSE, 500, '[]'::jsonb, '', '[]'::jsonb, $3, 'private', TRUE, CURRENT_TIMESTAMP, $4) "
+                                "   target, tabs, active_tab_id, history, rev, is_deleted, deleted_at, updated_at"
+                                ") VALUES ($1, $2, '', '', '', 0, FALSE, FALSE, 500, '[]'::jsonb, '', '[]'::jsonb, $3, TRUE, CURRENT_TIMESTAMP, $4) "
                                 "ON CONFLICT (doc_id) DO UPDATE SET "
                                 "   title = '', body = '', preview_text = '', word_count = 0, pinned = FALSE, in_trash = FALSE, "
                                 "   tabs = '[]'::jsonb, history = '[]'::jsonb, is_deleted = TRUE, deleted_at = CURRENT_TIMESTAMP, rev = EXCLUDED.rev, updated_at = EXCLUDED.updated_at "
@@ -463,18 +456,18 @@ async def sync_keep_docs_batch(
                         await execute_pg_query(
                             "INSERT INTO user_sync_docs ("
                             "   user_id, doc_id, title, body, preview_text, word_count, pinned, in_trash, "
-                            "   target, tabs, active_tab_id, history, rev, visibility, is_deleted, deleted_at, updated_at"
-                            ") VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11, $12::jsonb, $13, $14, FALSE, NULL, $15) "
+                            "   target, tabs, active_tab_id, history, rev, is_deleted, deleted_at, updated_at"
+                            ") VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11, $12::jsonb, $13, FALSE, NULL, $14) "
                             "ON CONFLICT (doc_id) DO UPDATE SET "
                             "   title = EXCLUDED.title, body = EXCLUDED.body, preview_text = EXCLUDED.preview_text, "
                             "   word_count = EXCLUDED.word_count, pinned = EXCLUDED.pinned, in_trash = EXCLUDED.in_trash, "
                             "   target = EXCLUDED.target, tabs = EXCLUDED.tabs, active_tab_id = EXCLUDED.active_tab_id, "
-                            "   history = EXCLUDED.history, rev = EXCLUDED.rev, visibility = EXCLUDED.visibility, "
+                            "   history = EXCLUDED.history, rev = EXCLUDED.rev, "
                             "   is_deleted = FALSE, deleted_at = NULL, updated_at = EXCLUDED.updated_at "
                             "WHERE user_sync_docs.user_id = EXCLUDED.user_id AND user_sync_docs.is_deleted = FALSE",
                             target_owner_id, doc_id, item_title, item_body, preview_text, word_count,
                             pinned, in_trash, target, tabs_json, active_tab_id, history_json,
-                            next_rev, item_visibility, item_updated_at
+                            next_rev, item_updated_at
                         )
                         mutation_results.append({"id": raw_doc_id, "status": "ACK", "rev": next_rev})
 
@@ -507,7 +500,7 @@ async def sync_keep_docs_batch(
         if since_rev == 0 or since_rev > effective_rev:
             rows = await execute_pg_query(
                 "SELECT doc_id, title, body, preview_text, word_count, pinned, in_trash, target, "
-                "tabs, active_tab_id, history, rev, visibility, is_deleted, updated_at "
+                "tabs, active_tab_id, history, rev, is_deleted, updated_at "
                 "FROM user_sync_docs "
                 "WHERE user_id = $1 AND is_deleted = FALSE "
                 "ORDER BY rev ASC",
@@ -517,7 +510,7 @@ async def sync_keep_docs_batch(
         elif since_rev < effective_rev:
             rows = await execute_pg_query(
                 "SELECT doc_id, title, body, preview_text, word_count, pinned, in_trash, target, "
-                "tabs, active_tab_id, history, rev, visibility, is_deleted, updated_at "
+                "tabs, active_tab_id, history, rev, is_deleted, updated_at "
                 "FROM user_sync_docs "
                 "WHERE user_id = $1 AND rev > $2 "
                 "ORDER BY rev ASC",

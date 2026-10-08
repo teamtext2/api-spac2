@@ -57,7 +57,7 @@ from services.heartbeat import heartbeat_check_loop
 
 # --- Routers ---
 from routers import auth, profile, friends, groups, messages, notifications, uploads, calls, admin
-from sync import note_router, task_router, calendar_router, countday_router, mindmap_router, table_router, doc_router, resource_router
+from sync import note_router, task_router, calendar_router, countday_router, mindmap_router, table_router, doc_router
 
 
 
@@ -120,7 +120,6 @@ app.include_router(countday_router)
 app.include_router(mindmap_router)
 app.include_router(table_router)
 app.include_router(doc_router)
-app.include_router(resource_router)
 app.include_router(admin.router)
 
 

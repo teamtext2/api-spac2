@@ -31,9 +31,8 @@ async def check_resource_permission(
     user_email: Optional[str] = None
 ) -> bool:
     """
-    Validates if the requesting user has permission to subscribe to a resource.
-    Ensures private resources cannot be monitored or probed by unauthorized users.
-    Contract V1: Visibility must be 'link_read', or user must be owner.
+    Validates if the requesting user is the owner of a resource.
+    Ensures resources cannot be monitored or probed by unauthorized users.
     """
     if not resource_id:
         return False
@@ -45,40 +44,36 @@ async def check_resource_permission(
     try:
         if app_code == "doc":
             rows = await execute_pg_query(
-                "SELECT user_id, visibility, is_deleted FROM user_sync_docs WHERE doc_id = $1 AND is_deleted = FALSE",
+                "SELECT user_id, is_deleted FROM user_sync_docs WHERE doc_id = $1 AND is_deleted = FALSE",
                 r_id
             )
             if not rows:
-                # Document not yet in DB; allow authenticated session to subscribe to their own pending creations
                 return bool(user_id or user_email)
             doc = rows[0]
-            # 1. Owner access
-            if user_id and doc.get("user_id") == user_id:
-                return True
-            # 2. Link shared access (link_read)
-            if str(doc.get("visibility") or "").lower() in ("link_read", "public"):
-                return True
-            return False
+            return bool(user_id and doc.get("user_id") == user_id)
 
         elif app_code == "note":
             rows = await execute_pg_query(
-                "SELECT user_id, visibility, is_deleted FROM user_sync_notes WHERE note_id = $1 AND is_deleted = FALSE",
+                "SELECT user_id, is_deleted FROM user_sync_notes WHERE note_id = $1 AND is_deleted = FALSE",
                 r_id
             )
             if not rows:
                 return bool(user_id or user_email)
             note = rows[0]
-            # 1. Owner access
-            if user_id and note.get("user_id") == user_id:
-                return True
-            # 2. Link shared access (link_read)
-            if str(note.get("visibility") or "").lower() in ("link_read", "public"):
-                return True
-            return False
+            return bool(user_id and note.get("user_id") == user_id)
+
+        elif app_code == "mindmap":
+            rows = await execute_pg_query(
+                "SELECT user_id, is_deleted FROM user_sync_mindmap_projects WHERE project_id = $1 AND is_deleted = FALSE",
+                r_id
+            )
+            if not rows:
+                return bool(user_id or user_email)
+            proj = rows[0]
+            return bool(user_id and proj.get("user_id") == user_id)
 
     except Exception as e:
         print(f"[WS Permission Check] Notice: {e}")
-        # Fail closed on database error for private data safety
         return False
 
     return True

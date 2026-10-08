@@ -1,6 +1,6 @@
 # Spac2 Note Synchronization & Architecture Specification (`/api/sync/note`)
 
-Tài liệu này đặc tả chi tiết kiến trúc đồng bộ dữ liệu, mô hình cơ sở dữ liệu, bảng màu pastel, giao diện chia sẻ tinh giản và cơ chế sao chép vào sổ tay cá nhân (Clone to notes) dành cho ứng dụng **Spac2 Note** (`/app/note/`).
+Tài liệu này đặc tả chi tiết kiến trúc đồng bộ dữ liệu, mô hình cơ sở dữ liệu, bảng màu pastel dành cho ứng dụng **Spac2 Note** (`/app/note/`).
 
 ---
 
@@ -8,7 +8,7 @@ Tài liệu này đặc tả chi tiết kiến trúc đồng bộ dữ liệu, m
 
 - **Domain**: Fast Note-taking & Pastel Memo Cards.
 - **Client Codebase**: `/app/note/` (`index.html`, `js/main.js`, `js/sync.js`, `css/main.css`).
-- **Backend Router**: `/api/sync/note.py` (`FastAPI`), `/api/sync/resource.py`.
+- **Backend Router**: `/api/sync/note.py` (`FastAPI`).
 - **Database Table**: `user_sync_notes` (PostgreSQL).
 - **URL Hash Route**: `https://spac2.com/app/note/#NOTE/{note_id}` (ví dụ: `#NOTE/N19s7A2x`).
 - **Mô hình đồng bộ**: 1-1 Client-Server Push & Pull Sync, Monotonic Revision Counter, Anti-Resurrection Guard.
@@ -29,7 +29,6 @@ CREATE TABLE IF NOT EXISTS user_sync_notes (
     date TEXT DEFAULT '',
     history JSONB DEFAULT '[]',
     rev BIGINT NOT NULL DEFAULT 1,
-    visibility VARCHAR(20) NOT NULL DEFAULT 'private',
     is_deleted BOOLEAN DEFAULT FALSE,
     deleted_at TIMESTAMP WITH TIME ZONE DEFAULT NULL,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
@@ -47,7 +46,6 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_sync_notes_global_note_id ON user_sync_not
 - `color`: Cấu hình màu nền / theme card ghi chú (`{ "bg": "#fff", "border": "#eee" }` hoặc mã HEX).
 - `is_saved`: Trạng thái bookmark / pin vào danh mục Saved.
 - `rev`: Số hiệu phiên bản đơn điệu tăng (Monotonic Revision).
-- `visibility`: `private` (chỉ chủ sở hữu xem) hoặc `link_read` (ai có link đều xem được).
 - `is_deleted` & `deleted_at`: Soft-delete ngăn chặn thiết bị offline hồi sinh ghi chú cũ.
 
 ---
@@ -71,7 +69,6 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_sync_notes_global_note_id ON user_sync_not
       "date": "2026-10-06",
       "base_rev": 5,
       "rev": 6,
-      "visibility": "private",
       "is_deleted": false,
       "updated": 1728219000000
     }
@@ -94,7 +91,6 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_sync_notes_global_note_id ON user_sync_not
       "is_saved": true,
       "date": "2026-10-06",
       "rev": 6,
-      "visibility": "private",
       "is_deleted": false,
       "updated_at": 1728219000000
     }
@@ -105,35 +101,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_sync_notes_global_note_id ON user_sync_not
 
 ---
 
-## 4. Giao Thức Chia Sẻ & Quyền Người Xem (Share & Viewer Protocol)
-
-### 4.1. Lấy Ghi Chú Chia Sẻ (`GET /api/sync/resource/note/{note_id}`)
-- Nếu ghi chú ở chế độ `link_read`: Trả về dữ liệu kèm vai trò `"role": "viewer"`.
-- Nếu chưa bật chia sẻ: Trả về `404 Not Found`.
-
-### 4.2. Bật/Tắt Quyền Chia Sẻ (`PATCH /api/sync/resource/note/{note_id}/visibility`)
-- Endpoint: `PATCH /api/sync/resource/note/{note_id}/visibility`
-- Payload: `{"visibility": "link_read"}` hoặc `{"visibility": "private"}`.
-
-### 4.3. UI & Luồng Thao Tác (Popup Share & Clone)
-1. **Chủ sở hữu (Owner)**:
-   - Nút **Share** trên header mở popup chứa công tắc **Share to Web** (iOS Switch).
-   - Khi bật, hiển thị thanh pill link kèm nút **Copy Link** có icon animated `✓ Copied`.
-2. **Người xem (Viewer)**:
-   - Editor khóa chỉnh sửa (`readonly`), ẩn nút chọn màu và nút xóa.
-   - Nút **Share** trên header mở popup thông tin truy cập:
-     - Huy hiệu **`Viewer (View only)`**.
-     - Nút to **`Add to my notes`** (icon `+`).
-     - Thanh copy link để chia sẻ tiếp.
-   - Bấm **`Add to my notes`** (`cloneCurrentSharedNote()`):
-     - Tạo `note_id` mới độc lập (`n_...`).
-     - Gỡ bỏ cờ `isViewer`, chuyển `visibility` thành `private`.
-     - Lưu cục bộ và kích hoạt `NoteSyncManager.sync()` đẩy lên tài khoản người nhận.
-     - Cập nhật hash `#NOTE/{new_note_id}` và mở trình soạn thảo cho phép sửa đổi ngay.
-
----
-
-## 5. Hướng Dẫn Kiểm Thử Bằng cURL (Developer Cheat Sheet)
+## 4. Hướng Dẫn Kiểm Thử Bằng cURL (Developer Cheat Sheet)
 
 ```bash
 # 1. Đồng bộ ghi chú
@@ -149,13 +117,4 @@ curl -X POST https://spac2.com/api/sync/note \
       "rev": 1
     }]
   }'
-
-# 2. Bật chia sẻ ghi chú
-curl -X PATCH https://spac2.com/api/sync/resource/note/n_sample_01/visibility \
-  -H "Authorization: Bearer <TOKEN>" \
-  -H "Content-Type: application/json" \
-  -d '{"visibility": "link_read"}'
-
-# 3. Đọc ghi chú công khai
-curl -X GET https://spac2.com/api/sync/resource/note/n_sample_01
 ```

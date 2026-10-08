@@ -685,7 +685,6 @@ def _ensure_sqlite_schema(cursor, conn):
             active_tab_id TEXT DEFAULT 'tab-default',
             history TEXT DEFAULT '[]',
             rev INTEGER NOT NULL DEFAULT 1,
-            visibility TEXT DEFAULT 'private',
             is_deleted INTEGER DEFAULT 0,
             deleted_at TEXT DEFAULT NULL,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -731,15 +730,13 @@ def _ensure_sqlite_schema(cursor, conn):
     cursor.execute("DROP TABLE IF EXISTS user_resource_acls;")
     cursor.execute("DROP TABLE IF EXISTS user_resource_activity;")
 
-    # Check and add visibility and deleted_at to all sync tables in SQLite
+    # Check and add deleted_at to all sync tables in SQLite
     for t_name in ["user_sync_notes", "user_sync_task_projects", "user_sync_tasks", 
                    "user_sync_calendar_events", "user_sync_countday_events", 
                    "user_sync_mindmap_projects", "user_sync_table_projects", "user_sync_docs"]:
         try:
             cursor.execute(f"PRAGMA table_info({t_name})")
             t_cols = [r[1] for r in cursor.fetchall()]
-            if "visibility" not in t_cols:
-                cursor.execute(f"ALTER TABLE {t_name} ADD COLUMN visibility TEXT DEFAULT 'private';")
             if "deleted_at" not in t_cols:
                 cursor.execute(f"ALTER TABLE {t_name} ADD COLUMN deleted_at TEXT DEFAULT NULL;")
         except Exception:

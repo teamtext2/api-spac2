@@ -31,7 +31,6 @@ async def _ensure_note_table():
                 date TEXT DEFAULT '',
                 history JSONB DEFAULT '[]',
                 rev BIGINT NOT NULL DEFAULT 1,
-                visibility VARCHAR(20) NOT NULL DEFAULT 'private',
                 is_deleted BOOLEAN DEFAULT FALSE,
                 deleted_at TIMESTAMP WITH TIME ZONE DEFAULT NULL,
                 created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
@@ -42,7 +41,7 @@ async def _ensure_note_table():
         try:
             await execute_pg_query("ALTER TABLE user_sync_notes ADD COLUMN IF NOT EXISTS rev BIGINT NOT NULL DEFAULT 1;")
             await execute_pg_query("ALTER TABLE user_sync_notes ADD COLUMN IF NOT EXISTS history JSONB DEFAULT '[]';")
-            await execute_pg_query("ALTER TABLE user_sync_notes ADD COLUMN IF NOT EXISTS visibility VARCHAR(20) NOT NULL DEFAULT 'private';")
+            await execute_pg_query("ALTER TABLE user_sync_notes DROP COLUMN IF EXISTS visibility CASCADE;")
             await execute_pg_query("ALTER TABLE user_sync_notes ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP WITH TIME ZONE DEFAULT NULL;")
             await execute_pg_query("CREATE INDEX IF NOT EXISTS idx_sync_notes_user_rev ON user_sync_notes(user_id, rev);")
             await execute_pg_query("CREATE UNIQUE INDEX IF NOT EXISTS idx_sync_notes_global_note_id ON user_sync_notes(note_id);")
@@ -62,7 +61,7 @@ class NoteSyncItem(BaseModel):
     date: Optional[str] = ""
     rev: Optional[int] = 1
     base_rev: Optional[int] = None
-    visibility: Optional[str] = "private"
+    visibility: Optional[str] = None
     history: Optional[Union[List[Dict[str, Any]], str]] = None
     updated: Optional[int] = None
     updated_at: Optional[int] = None
@@ -289,7 +288,6 @@ def _format_note_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
         seen_ids.add(note_id)
         color_val = _normalize_color(r.get("color"))
-        visibility = str(r.get("visibility") or "private").lower().strip()
         history_val = _normalize_json_field(r.get("history"), [])
 
         items_list.append({
@@ -300,7 +298,6 @@ def _format_note_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "isSaved": bool(r.get("is_saved")),
             "date": date_str,
             "rev": int(r.get("rev") or 1),
-            "visibility": visibility,
             "history": history_val,
             "updated": int(r.get("updated_at") or 0),
             "updated_at": int(r.get("updated_at") or 0),
@@ -337,7 +334,7 @@ async def get_note_delta_sync(
         if since_rev == 0 or since_rev > current_rev:
             # Full active notes pull
             rows = await execute_pg_query(
-                "SELECT note_id, title, content, color, is_saved, date, history, rev, visibility, is_deleted, updated_at "
+                "SELECT note_id, title, content, color, is_saved, date, history, rev, is_deleted, updated_at "
                 "FROM user_sync_notes "
                 "WHERE user_id = $1 AND is_deleted = FALSE "
                 "ORDER BY rev ASC",
@@ -346,7 +343,7 @@ async def get_note_delta_sync(
         else:
             # Delta pull
             rows = await execute_pg_query(
-                "SELECT note_id, title, content, color, is_saved, date, history, rev, visibility, is_deleted, updated_at "
+                "SELECT note_id, title, content, color, is_saved, date, history, rev, is_deleted, updated_at "
                 "FROM user_sync_notes "
                 "WHERE user_id = $1 AND rev > $2 "
                 "ORDER BY rev ASC",
@@ -396,7 +393,7 @@ async def sync_keep_notes_batch(
 
                     # 1. Ownership & Permissions lookup
                     existing_rows = await execute_pg_query(
-                        "SELECT user_id, rev, title, content, color, is_saved, date, history, visibility, is_deleted, updated_at "
+                        "SELECT user_id, rev, title, content, color, is_saved, date, history, is_deleted, updated_at "
                         "FROM user_sync_notes WHERE note_id = $1 LIMIT 1",
                         note_id
                     )
@@ -440,10 +437,6 @@ async def sync_keep_notes_batch(
                     color_json = json.dumps(normalized_color)
                     item_updated_at = int(item.updated or item.updated_at or now_ts)
 
-                    # Visibility can only be updated by the owner: strictly 'private' or 'link_read'
-                    raw_vis = str(item.visibility or (existing_row.get("visibility") if existing_row else "private")).lower().strip()
-                    item_visibility = "link_read" if raw_vis in ("link_read", "public") else "private"
-
                     history_val = _normalize_json_field(item.history, [])
                     if not isinstance(history_val, list):
                         history_val = []
@@ -453,8 +446,8 @@ async def sync_keep_notes_batch(
                         if is_owner:
                             await execute_pg_query(
                                 "INSERT INTO user_sync_notes ("
-                                "   user_id, note_id, title, content, color, is_saved, date, history, rev, visibility, is_deleted, deleted_at, updated_at"
-                                ") VALUES ($1, $2, '', '', '{}'::jsonb, FALSE, '', '[]'::jsonb, $3, 'private', TRUE, CURRENT_TIMESTAMP, $4) "
+                                "   user_id, note_id, title, content, color, is_saved, date, history, rev, is_deleted, deleted_at, updated_at"
+                                ") VALUES ($1, $2, '', '', '{}'::jsonb, FALSE, '', '[]'::jsonb, $3, TRUE, CURRENT_TIMESTAMP, $4) "
                                 "ON CONFLICT (note_id) DO UPDATE SET "
                                 "   title = '', content = '', is_deleted = TRUE, deleted_at = CURRENT_TIMESTAMP, rev = EXCLUDED.rev, updated_at = EXCLUDED.updated_at "
                                 "WHERE user_sync_notes.user_id = EXCLUDED.user_id",
@@ -470,16 +463,16 @@ async def sync_keep_notes_batch(
                     else:
                         await execute_pg_query(
                             "INSERT INTO user_sync_notes ("
-                            "   user_id, note_id, title, content, color, is_saved, date, history, rev, visibility, is_deleted, deleted_at, updated_at"
-                            ") VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8::jsonb, $9, $10, FALSE, NULL, $11) "
+                            "   user_id, note_id, title, content, color, is_saved, date, history, rev, is_deleted, deleted_at, updated_at"
+                            ") VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8::jsonb, $9, FALSE, NULL, $10) "
                             "ON CONFLICT (note_id) DO UPDATE SET "
                             "   title = EXCLUDED.title, content = EXCLUDED.content, color = EXCLUDED.color, "
                             "   is_saved = EXCLUDED.is_saved, date = EXCLUDED.date, history = EXCLUDED.history, "
-                            "   rev = EXCLUDED.rev, visibility = EXCLUDED.visibility, is_deleted = FALSE, deleted_at = NULL, updated_at = EXCLUDED.updated_at "
+                            "   rev = EXCLUDED.rev, is_deleted = FALSE, deleted_at = NULL, updated_at = EXCLUDED.updated_at "
                             "WHERE user_sync_notes.user_id = EXCLUDED.user_id",
                             target_owner_id, note_id, item_title, item_content,
                             color_json, bool(item.isSaved), item.date or "", history_json,
-                            next_rev, item_visibility, item_updated_at
+                            next_rev, item_updated_at
                         )
                         mutation_results.append({"id": raw_note_id, "status": "ACK", "rev": next_rev})
 
@@ -501,7 +494,7 @@ async def sync_keep_notes_batch(
 
         if since_rev == 0 or since_rev > effective_rev:
             rows = await execute_pg_query(
-                "SELECT note_id, title, content, color, is_saved, date, history, rev, visibility, is_deleted, updated_at "
+                "SELECT note_id, title, content, color, is_saved, date, history, rev, is_deleted, updated_at "
                 "FROM user_sync_notes "
                 "WHERE user_id = $1 AND is_deleted = FALSE "
                 "ORDER BY rev ASC",
@@ -510,7 +503,7 @@ async def sync_keep_notes_batch(
             remote_items = _format_note_rows(rows)
         elif since_rev < effective_rev:
             rows = await execute_pg_query(
-                "SELECT note_id, title, content, color, is_saved, date, history, rev, visibility, is_deleted, updated_at "
+                "SELECT note_id, title, content, color, is_saved, date, history, rev, is_deleted, updated_at "
                 "FROM user_sync_notes "
                 "WHERE user_id = $1 AND rev > $2 "
                 "ORDER BY rev ASC",

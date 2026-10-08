@@ -6,7 +6,6 @@ from sync.countday import router as countday_router
 from sync.mindmap import router as mindmap_router
 from sync.table import router as table_router
 from sync.doc import router as doc_router
-from sync.resource import router as resource_router
 
 __all__ = [
     "note_router",
@@ -16,7 +15,6 @@ __all__ = [
     "mindmap_router",
     "table_router",
     "doc_router",
-    "resource_router",
 ]
 
 
