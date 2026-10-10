@@ -368,10 +368,22 @@ async def sync_keep_mindmap_batch(
                         server_rev = int(existing_row.get("rev") or 1)
                         client_base_rev = item.base_rev if item.base_rev is not None else item.rev
                         if client_base_rev is not None and client_base_rev > 0 and client_base_rev < server_rev:
+                            raw_sdata = existing_row.get("data")
+                            parsed_sdata = {"nodes": [], "edges": [], "transform": {"x": 0, "y": 0, "scale": 1}}
+                            if isinstance(raw_sdata, str):
+                                try:
+                                    parsed_sdata = json.loads(raw_sdata)
+                                except Exception:
+                                    pass
+                            elif isinstance(raw_sdata, dict):
+                                parsed_sdata = raw_sdata
+
                             mutation_results.append({
                                 "id": raw_proj_id,
                                 "status": "CONFLICT",
                                 "server_rev": server_rev,
+                                "server_name": existing_row.get("name") or "",
+                                "server_data": parsed_sdata,
                                 "server_updated_at": int(existing_row.get("updated_at") or now_ts),
                                 "error": "OCC_VERSION_MISMATCH"
                             })
