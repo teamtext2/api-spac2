@@ -19,8 +19,6 @@ from websocket.manager import (
     subscribe_resource,
     unsubscribe_resource,
     cleanup_socket_subscriptions,
-    safe_send_ws,
-    remove_dead_socket,
 )
 from auth.deps import verify_auth_token
 from services.push import send_web_push
@@ -41,14 +39,11 @@ async def websocket_endpoint(websocket: WebSocket, username: str, token: str = Q
     if not is_verified:
         print(f"[WS] Connection rejected: unauthorized. Email: '{email}', Verified: {is_verified}")
         await websocket.accept()
-        await safe_send_ws(websocket, json.dumps({
+        await websocket.send_text(json.dumps({
             "type": "error",
             "text": "Unauthorized: Invalid or missing token"
-        }), timeout=3.0)
-        try:
-            await websocket.close(code=1008)
-        except Exception:
-            pass
+        }))
+        await websocket.close(code=1008)
         return
 
     await websocket.accept()
@@ -91,7 +86,10 @@ async def websocket_endpoint(websocket: WebSocket, username: str, token: str = Q
     if username in buffered_call_signals and buffered_call_signals[username]:
         print(f"[CALL] Flushing {len(buffered_call_signals[username])} buffered call signals for @{username}")
         for signal_str in buffered_call_signals[username]:
-            await safe_send_ws(websocket, signal_str, timeout=1.5)
+            try:
+                await websocket.send_text(signal_str)
+            except Exception as e:
+                print(f"[CALL] Failed to send buffered call signal: {e}")
         del buffered_call_signals[username]
 
     async def sync_db_on_connect():
@@ -124,61 +122,61 @@ async def websocket_endpoint(websocket: WebSocket, username: str, token: str = Q
             if websocket in connection_metadata:
                 connection_metadata[websocket]["last_seen"] = time.time()
 
-            try:
-                data = json.loads(data_str)
-                msg_type = data.get("type")
+            data = json.loads(data_str)
+            msg_type = data.get("type")
 
-                if msg_type == "ping":
-                    await safe_send_ws(websocket, json.dumps({"type": "pong"}), timeout=2.0)
-                    continue
+            if msg_type == "ping":
+                try:
+                    await websocket.send_text(json.dumps({"type": "pong"}))
+                except Exception:
+                    pass
+                continue
 
-                elif msg_type == "visibility":
-                    visible = data.get("visible", True)
-                    if websocket in connection_metadata:
-                        connection_metadata[websocket]["visible"] = visible
-                    continue
+            elif msg_type == "visibility":
+                visible = data.get("visible", True)
+                if websocket in connection_metadata:
+                    connection_metadata[websocket]["visible"] = visible
+                    print(f"[VISIBILITY] User @{username} visibility updated to: {visible}")
+                continue
 
-                elif msg_type in ("subscribe", "resource_subscribe"):
-                    resources = data.get("resources") or data.get("topics") or []
-                    if not resources and data.get("resource_id") and data.get("app"):
-                        resources = [f"{data.get('app')}:{data.get('resource_id')}"]
-                    if isinstance(resources, str):
-                        resources = [resources]
-                    meta = connection_metadata.get(websocket, {})
-                    await subscribe_resource(
-                        websocket,
-                        resources,
-                        user_id=meta.get("user_id") or current_user_id,
-                        user_email=email
-                    )
-                    continue
+            elif msg_type in ("subscribe", "resource_subscribe"):
+                resources = data.get("resources") or data.get("topics") or []
+                if not resources and data.get("resource_id") and data.get("app"):
+                    resources = [f"{data.get('app')}:{data.get('resource_id')}"]
+                if isinstance(resources, str):
+                    resources = [resources]
+                meta = connection_metadata.get(websocket, {})
+                await subscribe_resource(
+                    websocket,
+                    resources,
+                    user_id=meta.get("user_id") or current_user_id,
+                    user_email=email
+                )
+                continue
 
-                elif msg_type in ("unsubscribe", "resource_unsubscribe"):
-                    resources = data.get("resources") or data.get("topics") or []
-                    if not resources and data.get("resource_id") and data.get("app"):
-                        resources = [f"{data.get('app')}:{data.get('resource_id')}"]
-                    if isinstance(resources, str):
-                        resources = [resources]
-                    unsubscribe_resource(websocket, resources)
-                    continue
+            elif msg_type in ("unsubscribe", "resource_unsubscribe"):
+                resources = data.get("resources") or data.get("topics") or []
+                if not resources and data.get("resource_id") and data.get("app"):
+                    resources = [f"{data.get('app')}:{data.get('resource_id')}"]
+                if isinstance(resources, str):
+                    resources = [resources]
+                unsubscribe_resource(websocket, resources)
+                continue
 
-                elif msg_type == "message":
-                    asyncio.create_task(_handle_message(websocket, username, email, data, data_str))
+            elif msg_type == "message":
+                await _handle_message(websocket, username, email, data, data_str)
 
-                elif msg_type in ("typing", "stop_typing"):
-                    asyncio.create_task(_handle_typing(username, email, data, msg_type))
+            elif msg_type in ("typing", "stop_typing"):
+                await _handle_typing(username, email, data, msg_type)
 
-                elif msg_type == "read":
-                    asyncio.create_task(_handle_read(websocket, username, data))
+            elif msg_type == "read":
+                await _handle_read(websocket, username, data)
 
-                elif msg_type == "reaction":
-                    asyncio.create_task(_handle_reaction(websocket, username, data))
+            elif msg_type == "reaction":
+                await _handle_reaction(websocket, username, data)
 
-                elif msg_type in ("call_offer", "call_answer", "ice_candidate", "call_reject", "call_cancel", "call_hangup", "call_busy"):
-                    asyncio.create_task(_handle_call_signal(websocket, username, data, data_str, msg_type))
-
-            except Exception as per_msg_err:
-                print(f"[WS] Error processing message payload from @{username}: {per_msg_err}")
+            elif msg_type in ("call_offer", "call_answer", "ice_candidate", "call_reject", "call_cancel", "call_hangup", "call_busy"):
+                await _handle_call_signal(websocket, username, data, data_str, msg_type)
 
     except WebSocketDisconnect:
         cleanup_socket_subscriptions(websocket)
@@ -278,40 +276,43 @@ async def _route_group_message(websocket, username, email, sender, recipient, te
 
     sender_name = data.get("senderName") or sender.upper()
     push_title = f"{sender_name} in {group_name}"
-    group_msg_payload = json.dumps({
-        "type": "message",
-        "id": str(msg_uuid),
-        "sender": sender,
-        "senderName": sender_name,
-        "recipient": recipient,
-        "text": text,
-        "senderAvatar": data.get("senderAvatar") or DEFAULT_AVATAR_URL,
-        "senderEmail": data.get("senderEmail", ""),
-        "groupName": group_name,
-        "groupAvatar": group_avatar,
-        "timestamp": timestamp,
-        "replyTo": data.get("replyTo"),
-        "forwarded": data.get("forwarded"),
-        "forwardedFrom": data.get("forwardedFrom"),
-        "update_id": inserted_update_id
-    })
 
-    async def _send_to_group_member(r_ws, m_user):
-        ok = await safe_send_ws(r_ws, group_msg_payload, timeout=1.5)
-        if not ok:
-            remove_dead_socket(r_ws, m_user)
-        return ok
-
-    send_tasks = []
     for m_email in member_emails:
         m_username = email_to_username.get(m_email) or member_usernames_by_email.get(m_email, "")
+        member_delivered = False
+        member_visible = False
         if m_username and m_username in active_connections:
             for r_ws in list(active_connections[m_username]):
                 if m_username == sender and r_ws == websocket:
                     continue
-                send_tasks.append(_send_to_group_member(r_ws, m_username))
+                meta = connection_metadata.get(r_ws, {})
+                if meta.get("visible", True):
+                    member_visible = True
+                try:
+                    await r_ws.send_text(json.dumps({
+                        "type": "message",
+                        "id": str(msg_uuid),
+                        "sender": sender,
+                        "senderName": sender_name,
+                        "recipient": recipient,
+                        "text": text,
+                        "senderAvatar": data.get("senderAvatar") or DEFAULT_AVATAR_URL,
+                        "senderEmail": data.get("senderEmail", ""),
+                        "groupName": group_name,
+                        "groupAvatar": group_avatar,
+                        "timestamp": timestamp,
+                        "replyTo": data.get("replyTo"),
+                        "forwarded": data.get("forwarded"),
+                        "forwardedFrom": data.get("forwardedFrom"),
+                        "update_id": inserted_update_id
+                    }))
+                    member_delivered = True
+                except Exception as e:
+                    print(f"Failed to forward group message to connection of @{m_username}: {e}")
 
         # Always send push for non-sender members.
+        # SW dedup (sw.js) handles suppressing banner when app is visible.
+        # Backend cannot reliably track visibility on mobile (Android WS stays alive in background).
         if m_email != sender_email:
             asyncio.create_task(send_web_push(
                 recipient_username=m_username or m_email,
@@ -321,84 +322,83 @@ async def _route_group_message(websocket, username, email, sender, recipient, te
                 avatar=data.get("senderAvatar") or DEFAULT_AVATAR_URL
             ))
 
-    if send_tasks:
-        await asyncio.gather(*send_tasks, return_exceptions=True)
+    await execute_pg_query("UPDATE messages SET delivered = TRUE WHERE id = $1", msg_uuid)
 
     try:
-        await execute_pg_query("UPDATE messages SET delivered = TRUE WHERE id = $1", msg_uuid)
-    except Exception as e:
-        print(f"[WS] Failed to mark group message delivered: {e}")
-
-    await safe_send_ws(websocket, json.dumps({
-        "type": "status",
-        "status": "delivered",
-        "recipient": recipient,
-        "id": str(msg_uuid),
-        "text": "Group message processed.",
-        "update_id": inserted_update_id
-    }), timeout=1.5)
-
-
-async def _route_direct_message(websocket, username, sender, recipient, text, data, msg_uuid, timestamp, inserted_update_id):
-    recipient_delivered = False
-    direct_msg_payload = json.dumps({
-        "type": "message",
-        "id": str(msg_uuid),
-        "sender": sender,
-        "recipient": recipient,
-        "text": text,
-        "senderAvatar": data.get("senderAvatar") or DEFAULT_AVATAR_URL,
-        "senderEmail": data.get("senderEmail", ""),
-        "timestamp": timestamp,
-        "replyTo": data.get("replyTo"),
-        "forwarded": data.get("forwarded"),
-        "forwardedFrom": data.get("forwardedFrom"),
-        "update_id": inserted_update_id
-    })
-
-    async def _send_to_recipient_socket(r_ws):
-        ok = await safe_send_ws(r_ws, direct_msg_payload, timeout=1.5)
-        if not ok:
-            remove_dead_socket(r_ws, recipient)
-        return ok
-
-    if recipient in active_connections:
-        recipient_sockets = [
-            r_ws for r_ws in list(active_connections[recipient])
-            if not (recipient == sender and r_ws == websocket)
-        ]
-        if recipient_sockets:
-            results = await asyncio.gather(*[_send_to_recipient_socket(ws) for ws in recipient_sockets], return_exceptions=True)
-            recipient_delivered = any(r is True for r in results)
-
-    if recipient_delivered or (recipient == sender):
-        try:
-            await execute_pg_query(
-                "UPDATE messages SET delivered = TRUE WHERE id = $1",
-                msg_uuid
-            )
-        except Exception as e:
-            print(f"[WS] Failed to update delivered status: {e}")
-
-        await safe_send_ws(websocket, json.dumps({
+        await websocket.send_text(json.dumps({
             "type": "status",
             "status": "delivered",
             "recipient": recipient,
             "id": str(msg_uuid),
-            "text": f"Delivered to @{recipient}." if recipient != sender else "Saved message saved.",
+            "text": "Group message processed.",
             "update_id": inserted_update_id
-        }), timeout=1.5)
-    else:
-        await safe_send_ws(websocket, json.dumps({
-            "type": "status",
-            "status": "offline",
-            "recipient": recipient,
-            "id": str(msg_uuid),
-            "text": f"@{recipient} is offline. Message queued.",
-            "update_id": inserted_update_id
-        }), timeout=1.5)
+        }))
+    except Exception as e:
+        print(f"Failed to send status to sender: {e}")
 
-    # Always send push for offline or backgrounded user
+
+async def _route_direct_message(websocket, username, sender, recipient, text, data, msg_uuid, timestamp, inserted_update_id):
+    recipient_delivered = False
+    recipient_visible = False
+
+    if recipient in active_connections:
+        for r_ws in list(active_connections[recipient]):
+            if recipient == sender and r_ws == websocket:
+                continue
+            meta = connection_metadata.get(r_ws, {})
+            if meta.get("visible", True):
+                recipient_visible = True
+            try:
+                await r_ws.send_text(json.dumps({
+                    "type": "message",
+                    "id": str(msg_uuid),
+                    "sender": sender,
+                    "recipient": recipient,
+                    "text": text,
+                    "senderAvatar": data.get("senderAvatar") or DEFAULT_AVATAR_URL,
+                    "senderEmail": data.get("senderEmail", ""),
+                    "timestamp": timestamp,
+                    "replyTo": data.get("replyTo"),
+                    "forwarded": data.get("forwarded"),
+                    "forwardedFrom": data.get("forwardedFrom"),
+                    "update_id": inserted_update_id
+                }))
+                recipient_delivered = True
+            except Exception as e:
+                print(f"Failed to forward message to a connection of online recipient @{recipient}: {e}")
+
+    if recipient_delivered or (recipient == sender):
+        await execute_pg_query(
+            "UPDATE messages SET delivered = TRUE WHERE id = $1",
+            msg_uuid
+        )
+        try:
+            await websocket.send_text(json.dumps({
+                "type": "status",
+                "status": "delivered",
+                "recipient": recipient,
+                "id": str(msg_uuid),
+                "text": f"Delivered to @{recipient}." if recipient != sender else "Saved message saved.",
+                "update_id": inserted_update_id
+            }))
+        except Exception as e:
+            print(f"Failed to send status to sender: {e}")
+    else:
+        try:
+            await websocket.send_text(json.dumps({
+                "type": "status",
+                "status": "offline",
+                "recipient": recipient,
+                "id": str(msg_uuid),
+                "text": f"@{recipient} is offline. Message queued.",
+                "update_id": inserted_update_id
+            }))
+        except Exception as e:
+            print(f"Failed to send status to sender: {e}")
+
+    # Always send push — SW dedup handles suppressing banner when app is visible.
+    # Android Chrome keeps WebSocket alive in background, so recipient_visible
+    # can be stale True even when app is backgrounded → never skip push at backend.
     if recipient != sender:
         asyncio.create_task(send_web_push(
             recipient_username=recipient,
@@ -410,17 +410,25 @@ async def _route_direct_message(websocket, username, sender, recipient, text, da
 
     # Broadcast to all OTHER connections of the sender (multi-tab/device sync)
     if sender != recipient and sender in active_connections:
-        sender_other_sockets = [
-            s_ws for s_ws in list(active_connections[sender])
-            if s_ws != websocket
-        ]
-        if sender_other_sockets:
-            async def _send_to_sender_socket(s_ws):
-                ok = await safe_send_ws(s_ws, direct_msg_payload, timeout=1.5)
-                if not ok:
-                    remove_dead_socket(s_ws, sender)
-                return ok
-            await asyncio.gather(*[_send_to_sender_socket(ws) for ws in sender_other_sockets], return_exceptions=True)
+        for s_ws in list(active_connections[sender]):
+            if s_ws != websocket:
+                try:
+                    await s_ws.send_text(json.dumps({
+                        "type": "message",
+                        "id": str(msg_uuid),
+                        "sender": sender,
+                        "recipient": recipient,
+                        "text": text,
+                        "senderAvatar": data.get("senderAvatar") or DEFAULT_AVATAR_URL,
+                        "senderEmail": data.get("senderEmail", ""),
+                        "timestamp": timestamp,
+                        "replyTo": data.get("replyTo"),
+                        "forwarded": data.get("forwarded"),
+                        "forwardedFrom": data.get("forwardedFrom"),
+                        "update_id": inserted_update_id
+                    }))
+                except Exception as e:
+                    print(f"Failed to broadcast sent message to another connection of sender @{sender}: {e}")
 
 
 async def _handle_typing(username, email, data, msg_type):
@@ -429,7 +437,6 @@ async def _handle_typing(username, email, data, msg_type):
         try:
             members_rows = await execute_pg_query("SELECT email, username FROM chat_group_members WHERE group_id = $1", recipient)
             sender_email = username_to_email.get(username, email)
-            tasks = []
             for row in members_rows:
                 m_email = row.get("email", "")
                 if m_email == sender_email:
@@ -437,51 +444,57 @@ async def _handle_typing(username, email, data, msg_type):
                 m_username = email_to_username.get(m_email) or row.get("username", "")
                 if m_username and m_username in active_connections:
                     for r_ws in list(active_connections[m_username]):
-                        tasks.append(safe_send_ws(r_ws, json.dumps({
-                            "type": msg_type,
-                            "sender": username,
-                            "recipient": recipient
-                        }), timeout=1.5))
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
+                        try:
+                            await r_ws.send_text(json.dumps({
+                                "type": msg_type,
+                                "sender": username,
+                                "recipient": recipient
+                            }))
+                        except Exception:
+                            pass
         except Exception:
             pass
     else:
         if recipient in active_connections:
-            tasks = [
-                safe_send_ws(r_ws, json.dumps({
-                    "type": msg_type,
-                    "sender": username
-                }), timeout=1.5)
-                for r_ws in list(active_connections[recipient])
-            ]
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
+            for r_ws in list(active_connections[recipient]):
+                try:
+                    await r_ws.send_text(json.dumps({
+                        "type": msg_type,
+                        "sender": username
+                    }))
+                except Exception as e:
+                    print(f"Failed to forward typing status to a connection of @{recipient}: {e}")
 
 
 async def _handle_read(websocket, username, data):
     recipient = data.get("recipient", "").strip().lower()
     message_ids = data.get("message_ids", [])
-    read_payload = json.dumps({
-        "type": "read",
-        "sender": username,
-        "message_ids": message_ids,
-        "recipient": recipient
-    })
 
-    tasks = []
     if recipient in active_connections:
         for r_ws in list(active_connections[recipient]):
-            tasks.append(safe_send_ws(r_ws, read_payload, timeout=1.5))
+            try:
+                await r_ws.send_text(json.dumps({
+                    "type": "read",
+                    "sender": username,
+                    "message_ids": message_ids,
+                    "recipient": recipient
+                }))
+            except Exception as e:
+                print(f"Failed to forward read status to a connection of @{recipient}: {e}")
 
     # Broadcast to other sender connections
     if username in active_connections:
         for s_ws in list(active_connections[username]):
             if s_ws != websocket:
-                tasks.append(safe_send_ws(s_ws, read_payload, timeout=1.5))
-
-    if tasks:
-        await asyncio.gather(*tasks, return_exceptions=True)
+                try:
+                    await s_ws.send_text(json.dumps({
+                        "type": "read",
+                        "sender": username,
+                        "message_ids": message_ids,
+                        "recipient": recipient
+                    }))
+                except Exception as e:
+                    print(f"Failed to broadcast read status to another connection of @{username}: {e}")
 
 
 async def _handle_reaction(websocket, username, data):
@@ -534,15 +547,6 @@ async def _handle_reaction(websocket, username, data):
                 elif isinstance(reactions_val, dict):
                     current_reactions = reactions_val
 
-        rx_payload = json.dumps({
-            "type": "reaction",
-            "msgId": str(msg_uuid),
-            "reactions": current_reactions,
-            "sender": sender,
-            "recipient": recipient
-        })
-
-        tasks = []
         is_group = recipient.startswith("group_")
         if is_group:
             try:
@@ -553,21 +557,45 @@ async def _handle_reaction(websocket, username, data):
                         for r_ws in list(active_connections[member]):
                             if member == sender and r_ws == websocket:
                                 continue
-                            tasks.append(safe_send_ws(r_ws, rx_payload, timeout=1.5))
+                            try:
+                                await r_ws.send_text(json.dumps({
+                                    "type": "reaction",
+                                    "msgId": str(msg_uuid),
+                                    "reactions": current_reactions,
+                                    "sender": sender,
+                                    "recipient": recipient
+                                }))
+                            except Exception:
+                                pass
             except Exception:
                 pass
         else:
             if recipient in active_connections:
                 for r_ws in list(active_connections[recipient]):
-                    tasks.append(safe_send_ws(r_ws, rx_payload, timeout=1.5))
+                    try:
+                        await r_ws.send_text(json.dumps({
+                            "type": "reaction",
+                            "msgId": str(msg_uuid),
+                            "reactions": current_reactions,
+                            "sender": sender,
+                            "recipient": recipient
+                        }))
+                    except Exception as e:
+                        print(f"Failed to forward reaction to a connection of @{recipient}: {e}")
 
             if sender in active_connections:
                 for s_ws in list(active_connections[sender]):
                     if s_ws != websocket:
-                        tasks.append(safe_send_ws(s_ws, rx_payload, timeout=1.5))
-
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+                        try:
+                            await s_ws.send_text(json.dumps({
+                                "type": "reaction",
+                                "msgId": str(msg_uuid),
+                                "reactions": current_reactions,
+                                "sender": sender,
+                                "recipient": recipient
+                            }))
+                        except Exception as e:
+                            print(f"Failed to broadcast reaction to another connection of @{sender}: {e}")
     except Exception as e:
         print(f"Error handling reaction: {e}")
 
@@ -575,12 +603,11 @@ async def _handle_reaction(websocket, username, data):
 async def _handle_call_signal(websocket, username, data, data_str, msg_type):
     recipient = data.get("recipient", "").strip().lower()
     if recipient in active_connections:
-        tasks = [
-            safe_send_ws(r_ws, data_str, timeout=1.5)
-            for r_ws in list(active_connections[recipient])
-        ]
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+        for r_ws in list(active_connections[recipient]):
+            try:
+                await r_ws.send_text(data_str)
+            except Exception as e:
+                print(f"Failed to forward call signal {msg_type} to a connection of @{recipient}: {e}")
     else:
         if recipient not in buffered_call_signals:
             buffered_call_signals[recipient] = []
@@ -588,6 +615,7 @@ async def _handle_call_signal(websocket, username, data, data_str, msg_type):
         print(f"[CALL] Buffered {msg_type} for offline/transitioning user @{recipient}")
 
         if msg_type == "call_offer":
+            # Send push notification for the call immediately since the user is offline
             is_video = data.get("isVideo", True)
             asyncio.create_task(send_call_push(
                 recipient_username=recipient,
@@ -595,29 +623,27 @@ async def _handle_call_signal(websocket, username, data, data_str, msg_type):
                 avatar=data.get("senderAvatar", "") or data.get("callerAvatar", "") or DEFAULT_AVATAR_URL,
                 is_video=is_video
             ))
+            
+            print(f"[CALL] @{recipient} is offline. Call buffered. Waiting up to 30s for reconnect...")
 
-            # Run 30s offline reconnect wait in background so caller's WebSocket loop remains responsive
-            async def _wait_and_handle_offline_call():
-                forwarded = False
-                for _ in range(30):
-                    await asyncio.sleep(1)
-                    if recipient in active_connections:
-                        forwarded = True
-                        print(f"[CALL] @{recipient} came online! Buffered signals flushed to recipient.")
-                        break
+            forwarded = False
+            for _ in range(30):
+                await asyncio.sleep(1)
+                if recipient in active_connections:
+                    forwarded = True
+                    print(f"[CALL] @{recipient} came online! Buffered signals flushed to recipient.")
+                    break
 
-                if not forwarded:
-                    print(f"[CALL] @{recipient} still offline after 30s. Sending call_busy to @{username}.")
-                    if recipient in buffered_call_signals:
-                        try:
-                            buffered_call_signals.pop(recipient, None)
-                        except KeyError:
-                            pass
-                    await safe_send_ws(websocket, json.dumps({
+            if not forwarded:
+                print(f"[CALL] @{recipient} still offline after 30s. Sending call_busy to @{username}.")
+                if recipient in buffered_call_signals:
+                    del buffered_call_signals[recipient]
+                try:
+                    await websocket.send_text(json.dumps({
                         "type": "call_busy",
                         "sender": recipient,
                         "recipient": username,
                         "reason": "offline"
-                    }), timeout=3.0)
-
-            asyncio.create_task(_wait_and_handle_offline_call())
+                    }))
+                except Exception as e:
+                    print(f"[CALL] Failed to send call_busy to @{username}: {e}")

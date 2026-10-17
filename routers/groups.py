@@ -11,7 +11,7 @@ from storage.r2 import (
     delete_media_url_from_r2_and_local,
     delete_message_attachments_from_contents,
 )
-from websocket.manager import active_connections, get_email_by_username, send_to_user_by_email, safe_send_ws, remove_dead_socket
+from websocket.manager import active_connections, get_email_by_username, send_to_user_by_email
 from config import LOCAL_AVATARS_DIR, R2_CDN_BASE, R2_BUCKET_NAME
 
 router = APIRouter(prefix="/api", tags=["groups"])
@@ -36,17 +36,13 @@ async def perform_group_disband_cleanup(group_id: str, members_to_notify: list):
     await execute_pg_query("DELETE FROM chat_groups WHERE id = $1", group_id)
 
     broadcast_payload = json.dumps({"type": "group_disbanded", "group_id": group_id})
-    async def _send_disband(conn, m):
-        ok = await safe_send_ws(conn, broadcast_payload, timeout=1.5)
-        if not ok:
-            remove_dead_socket(conn, m)
-    disband_tasks = []
     for m in members_to_notify:
         if m in active_connections:
             for conn in list(active_connections[m]):
-                disband_tasks.append(_send_disband(conn, m))
-    if disband_tasks:
-        await asyncio.gather(*disband_tasks, return_exceptions=True)
+                try:
+                    await conn.send_text(broadcast_payload)
+                except Exception:
+                    pass
 
 
 async def _delete_message_attachments(contents: list):
@@ -100,8 +96,8 @@ async def api_create_group(payload: dict, token: str = Depends(get_auth_token), 
         "type": "group_created",
         "group": {"id": group_id, "name": name, "avatar": avatar_url, "created_by": creator, "members": unique_members}
     })
-    if added_member_emails:
-        await asyncio.gather(*[send_to_user_by_email(m_email, broadcast_payload) for m_email in added_member_emails], return_exceptions=True)
+    for m_email in added_member_emails:
+        await send_to_user_by_email(m_email, broadcast_payload)
 
     return {"success": True, "group": {"id": group_id, "name": name, "avatar": avatar_url, "created_by": creator, "members": unique_members}}
 
@@ -203,8 +199,9 @@ async def api_leave_group(group_id: str, payload: dict, token: str = Depends(get
         "members": remaining_usernames
     })
 
-    leave_targets = list(set(remaining_emails + [email]))
-    await asyncio.gather(*[send_to_user_by_email(m_email, broadcast_payload) for m_email in leave_targets], return_exceptions=True)
+    for m_email in remaining_emails:
+        await send_to_user_by_email(m_email, broadcast_payload)
+    await send_to_user_by_email(email, broadcast_payload)
 
     return {"success": True, "message": "Successfully left the group"}
 
@@ -264,8 +261,8 @@ async def api_add_group_members(group_id: str, payload: dict, token: str = Depen
         "members": all_members_usernames
     })
 
-    if all_members_emails:
-        await asyncio.gather(*[send_to_user_by_email(m_email, broadcast_payload) for m_email in all_members_emails], return_exceptions=True)
+    for m_email in all_members_emails:
+        await send_to_user_by_email(m_email, broadcast_payload)
 
     return {"success": True, "added_members": added_members_usernames, "members": all_members_usernames}
 
@@ -327,9 +324,16 @@ async def api_kick_group_member(group_id: str, payload: dict, token: str = Depen
         "members": remaining_usernames
     })
 
-    kick_notify_emails = list(set(remaining_emails + ([target_email] if target_email else [])))
-    if kick_notify_emails:
-        await asyncio.gather(*[send_to_user_by_email(m_email, broadcast_payload) for m_email in kick_notify_emails], return_exceptions=True)
+    for m_email in remaining_emails:
+        await send_to_user_by_email(m_email, broadcast_payload)
+    if target_email:
+        await send_to_user_by_email(target_email, broadcast_payload)
+    elif target_user in active_connections:
+        for conn in list(active_connections[target_user]):
+            try:
+                await conn.send_text(broadcast_payload)
+            except Exception:
+                pass
 
     return {"success": True, "message": f"Successfully kicked {target_user}", "members": remaining_usernames}
 
@@ -369,8 +373,15 @@ async def api_update_group_avatar(group_id: str, payload: dict, token: str = Dep
     member_emails = [r["email"] for r in member_rows if r.get("email")]
 
     broadcast_payload = json.dumps({"type": "group_avatar_updated", "group_id": group_id, "avatar": avatar_url, "members": members})
-    if member_emails:
-        await asyncio.gather(*[send_to_user_by_email(m_email, broadcast_payload) for m_email in member_emails], return_exceptions=True)
+    for m_email in member_emails:
+        await send_to_user_by_email(m_email, broadcast_payload)
+    for m in members:
+        if m in active_connections:
+            for conn in list(active_connections[m]):
+                try:
+                    await conn.send_text(broadcast_payload)
+                except Exception:
+                    pass
 
     return {"success": True, "avatar": avatar_url}
 
@@ -401,8 +412,15 @@ async def api_rename_group(group_id: str, payload: dict, token: str = Depends(ge
     member_emails = [r["email"] for r in member_rows if r.get("email")]
 
     broadcast_payload = json.dumps({"type": "group_name_updated", "group_id": group_id, "name": new_name})
-    if member_emails:
-        await asyncio.gather(*[send_to_user_by_email(m_email, broadcast_payload) for m_email in member_emails], return_exceptions=True)
+    for m_email in member_emails:
+        await send_to_user_by_email(m_email, broadcast_payload)
+    for m in members:
+        if m in active_connections:
+            for conn in list(active_connections[m]):
+                try:
+                    await conn.send_text(broadcast_payload)
+                except Exception:
+                    pass
 
     return {"success": True, "name": new_name}
 

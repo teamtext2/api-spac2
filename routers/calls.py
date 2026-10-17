@@ -1,7 +1,7 @@
 import json
 from fastapi import APIRouter, HTTPException
 from database.postgres import execute_pg_query
-from websocket.manager import active_connections, safe_send_ws, remove_dead_socket
+from websocket.manager import active_connections
 from models.schemas import CallRejectRequest
 
 router = APIRouter(prefix="/api", tags=["calls"])
@@ -14,19 +14,18 @@ async def api_call_reject(req: CallRejectRequest):
 
     if caller in active_connections:
         success = False
-        payload = json.dumps({
-            "type": "call_reject",
-            "sender": recipient,
-            "recipient": caller
-        })
-        async def _send_reject(ws):
-            ok = await safe_send_ws(ws, payload, timeout=1.5)
-            if not ok:
-                remove_dead_socket(ws, caller)
-            return ok
+        for ws in list(active_connections[caller]):
+            try:
+                await ws.send_text(json.dumps({
+                    "type": "call_reject",
+                    "sender": recipient,
+                    "recipient": caller
+                }))
+                success = True
+            except Exception as e:
+                print(f"[REST Call Reject] Failed to send call_reject to a connection of @{caller}: {e}")
 
-        results = await asyncio.gather(*[_send_reject(ws) for ws in list(active_connections[caller])], return_exceptions=True)
-        if any(r is True for r in results):
+        if success:
             print(f"[REST Call Reject] Sent call_reject to @{caller} from @{recipient}")
             return {"status": "success"}
         else:

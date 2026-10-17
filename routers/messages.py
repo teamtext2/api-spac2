@@ -7,7 +7,7 @@ from fastapi import APIRouter, HTTPException, Depends, Query
 from database.postgres import execute_pg_query
 from auth.deps import get_auth_token, verify_auth_token
 from models.schemas import MarkDeliveredRequest, MarkReadRequest, DeleteMessagesRequest, DeleteConversationRequest
-from websocket.manager import get_email_by_username, get_username_by_email, safe_send_ws, remove_dead_socket, active_connections
+from websocket.manager import get_email_by_username, get_username_by_email
 from storage.r2 import (
     r2_client,
     R2_BUCKET_NAME,
@@ -672,23 +672,19 @@ async def api_delete_messages(req: DeleteMessagesRequest, token: str = Depends(g
                             affected_peers.add(gm["username"].strip().lower())
 
                 # 4. Broadcast realtime deletion to all connections of affected participants
+                from websocket.manager import active_connections
                 del_payload = json.dumps({
                     "type": "messages_deleted",
                     "sender": username,
                     "message_ids": del_ids
                 })
-                async def _send_del(w, p):
-                    sent = await safe_send_ws(w, del_payload, timeout=1.5)
-                    if not sent:
-                        remove_dead_socket(w, p)
-
-                del_tasks = []
                 for peer in affected_peers:
                     if peer in active_connections:
                         for ws in list(active_connections[peer]):
-                            del_tasks.append(_send_del(ws, peer))
-                if del_tasks:
-                    await asyncio.gather(*del_tasks, return_exceptions=True)
+                            try:
+                                await ws.send_text(del_payload)
+                            except Exception:
+                                pass
         return {"status": "success"}
     except Exception as e:
         print(f"Error deleting messages in Postgres: {e}")
@@ -760,23 +756,19 @@ async def api_delete_conversation(req: DeleteConversationRequest, token: str = D
             peers_to_notify = [username, friend_username]
 
         # Broadcast conversation deletion to active connections
+        from websocket.manager import active_connections
         del_conv_payload = json.dumps({
             "type": "conversation_deleted",
             "sender": username,
             "friend_username": friend_username
         })
-        async def _send_conv_del(w, p):
-            sent = await safe_send_ws(w, del_conv_payload, timeout=1.5)
-            if not sent:
-                remove_dead_socket(w, p)
-
-        conv_tasks = []
         for peer in peers_to_notify:
             if peer in active_connections:
                 for ws in list(active_connections[peer]):
-                    conv_tasks.append(_send_conv_del(ws, peer))
-        if conv_tasks:
-            await asyncio.gather(*conv_tasks, return_exceptions=True)
+                    try:
+                        await ws.send_text(del_conv_payload)
+                    except Exception:
+                        pass
 
         return {"status": "success"}
     except Exception as e:

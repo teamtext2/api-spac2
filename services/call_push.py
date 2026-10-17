@@ -10,7 +10,7 @@ async def send_call_push(recipient_username: str, sender: str, avatar: str, is_v
     """
     try:
         subscriptions = await execute_pg_query(
-            "SELECT endpoint, p256dh, auth FROM chat_push_subscriptions WHERE username = $1 ORDER BY id DESC LIMIT 5",
+            "SELECT endpoint, p256dh, auth FROM chat_push_subscriptions WHERE username = $1",
             recipient_username.lower()
         )
     except Exception as e:
@@ -18,7 +18,10 @@ async def send_call_push(recipient_username: str, sender: str, avatar: str, is_v
         return
 
     if not subscriptions:
+        print(f"[CALL_PUSH] No subscriptions found for @{recipient_username}")
         return
+
+    print(f"[CALL_PUSH] Sending call notification to @{recipient_username} ({len(subscriptions)} subscription(s))")
 
     # Ensure avatar is an absolute URL
     if avatar:
@@ -54,7 +57,4 @@ async def send_call_push(recipient_username: str, sender: str, avatar: str, is_v
         tasks.append(send_single_web_push_with_retry(subscription_info, payload))
 
     if tasks:
-        try:
-            await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=10.0)
-        except Exception as gather_err:
-            print(f"[CALL_PUSH] Notice during push dispatch: {gather_err}")
+        await asyncio.gather(*tasks)

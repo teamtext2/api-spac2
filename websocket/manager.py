@@ -24,35 +24,6 @@ email_to_username: Dict[str, str] = {}  # email -> username (current)
 buffered_call_signals: Dict[str, list] = {}
 
 
-async def safe_send_ws(ws: WebSocket, payload: str, timeout: float = 1.5) -> bool:
-    """
-    Safely send text to a WebSocket with a strict timeout.
-    Prevents half-open/paused client connections from blocking the asyncio event loop.
-    Returns True on success, False if timeout or socket error occurred.
-    """
-    try:
-        await asyncio.wait_for(ws.send_text(payload), timeout=timeout)
-        return True
-    except Exception:
-        return False
-
-
-def remove_dead_socket(ws: WebSocket, username: Optional[str] = None):
-    """Cleanly deregister a dead/timed-out socket from all tracking registries."""
-    cleanup_socket_subscriptions(ws)
-    uname = username
-    if ws in connection_metadata:
-        uname = uname or connection_metadata[ws].get("username")
-        try:
-            del connection_metadata[ws]
-        except KeyError:
-            pass
-    if uname and uname in active_connections:
-        active_connections[uname].discard(ws)
-        if not active_connections[uname]:
-            del active_connections[uname]
-
-
 async def check_resource_permission(
     app: str,
     resource_id: str,
@@ -178,20 +149,25 @@ async def _dispatch_to_local_subscribers(ping_data: dict) -> int:
     r_id = str(ping_data.get("resource_id", "")).strip()
     r_key = f"{app_code}:{r_id}".lower()
 
-    subscribers = list(resource_subscribers.get(r_key, set()))
+    subscribers = resource_subscribers.get(r_key)
     if not subscribers:
         return 0
 
     payload = json.dumps(ping_data)
+    dead_sockets = []
+    sent_count = 0
 
-    async def _send_to_sub(ws):
-        ok = await safe_send_ws(ws, payload, timeout=1.5)
-        if not ok:
-            remove_dead_socket(ws)
-        return ok
+    for ws in list(subscribers):
+        try:
+            await ws.send_text(payload)
+            sent_count += 1
+        except Exception:
+            dead_sockets.append(ws)
 
-    results = await asyncio.gather(*[_send_to_sub(ws) for ws in subscribers], return_exceptions=True)
-    return sum(1 for r in results if r is True)
+    for ws in dead_sockets:
+        cleanup_socket_subscriptions(ws)
+
+    return sent_count
 
 
 async def coalesce_and_dispatch_invalidation(data: dict):
@@ -311,17 +287,12 @@ async def send_to_user_by_email(email: str, payload: str):
     """Send a message to a user identified by email, looking up their current username."""
     email = email.strip().lower()
     username = email_to_username.get(email)
-    if not username:
-        username = await get_username_by_email(email)
     if username and username in active_connections:
-        sockets = list(active_connections[username])
-        if sockets:
-            async def _send(ws):
-                ok = await safe_send_ws(ws, payload, timeout=1.5)
-                if not ok:
-                    remove_dead_socket(ws, username)
-                return ok
-            await asyncio.gather(*[_send(ws) for ws in sockets], return_exceptions=True)
+        for ws in list(active_connections[username]):
+            try:
+                await ws.send_text(payload)
+            except Exception:
+                pass
 
 
 async def get_username_by_email(email: str) -> str:
@@ -425,18 +396,10 @@ async def broadcast_user_status(username: str, status: str, last_seen: str):
         "status": status,
         "last_seen": last_seen
     })
-
-    async def _send_status(ws, friend_uname):
-        ok = await safe_send_ws(ws, payload, timeout=1.5)
-        if not ok:
-            remove_dead_socket(ws, friend_uname)
-        return ok
-
-    tasks = []
     for friend in friends:
         if friend in active_connections:
             for ws in list(active_connections[friend]):
-                tasks.append(_send_status(ws, friend))
-
-    if tasks:
-        await asyncio.gather(*tasks, return_exceptions=True)
+                try:
+                    await ws.send_text(payload)
+                except Exception:
+                    pass
