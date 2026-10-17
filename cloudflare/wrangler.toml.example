@@ -1,0 +1,7 @@
+name = "spac2-email-verifier"
+main = "email-worker.js"
+compatibility_date = "2024-09-28"
+
+[vars]
+FASTAPI_WEBHOOK_URL = "https://api1.spac2.com/api/auth/email-webhook"
+WEBHOOK_SECRET_KEY = "spac2_super_secure_secret_2026"

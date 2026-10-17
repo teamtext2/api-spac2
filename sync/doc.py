@@ -1,0 +1,553 @@
+from __future__ import annotations
+import json
+import hashlib
+import time
+from typing import Optional, List, Dict, Any, Union
+from fastapi import APIRouter, HTTPException, Depends, Query, Header, Response
+from pydantic import BaseModel
+
+from auth.deps import get_auth_token, decode_spac2_token, create_spac2_token, decode_text2_token, create_text2_token
+from database.postgres import execute_pg_query
+from sync.engine import get_domain_max_rev, execute_sync_batch_atomic, resolve_canonical_id
+
+router = APIRouter(prefix="/api/sync/doc", tags=["sync_doc"])
+
+
+# --- Pydantic Models ---
+class DocSyncItem(BaseModel):
+    id: str
+    title: Optional[str] = ""
+    body: Optional[str] = ""
+    previewText: Optional[str] = ""
+    preview_text: Optional[str] = ""
+    wordCount: Optional[int] = 0
+    word_count: Optional[int] = 0
+    pinned: Optional[bool] = False
+    inTrash: Optional[bool] = False
+    in_trash: Optional[bool] = False
+    target: Optional[int] = 500
+    tabs: Optional[Union[List[Dict[str, Any]], str]] = None
+    activeTabId: Optional[str] = ""
+    active_tab_id: Optional[str] = ""
+    history: Optional[Union[List[Dict[str, Any]], str]] = None
+    created: Optional[Union[int, float, str]] = None
+    updated: Optional[Union[int, float, str]] = None
+    created_at: Optional[Union[int, float, str]] = None
+    updated_at: Optional[Union[int, float, str]] = None
+    rev: Optional[int] = None
+    base_rev: Optional[int] = None
+    visibility: Optional[str] = None
+    is_deleted: Optional[bool] = False
+
+
+class DocKeepSyncRequest(BaseModel):
+    sync_batch_id: Optional[str] = None
+    since_rev: Optional[int] = 0
+    items: Optional[List[DocSyncItem]] = []
+
+
+_table_initialized = False
+
+
+async def _ensure_doc_table():
+    global _table_initialized
+    if _table_initialized:
+        return
+    try:
+        await execute_pg_query("""
+            CREATE TABLE IF NOT EXISTS user_sync_docs (
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                doc_id VARCHAR(100) NOT NULL,
+                title TEXT DEFAULT '',
+                body TEXT DEFAULT '',
+                preview_text TEXT DEFAULT '',
+                word_count INT DEFAULT 0,
+                pinned BOOLEAN DEFAULT FALSE,
+                in_trash BOOLEAN DEFAULT FALSE,
+                target INT DEFAULT 500,
+                tabs JSONB DEFAULT '[]',
+                active_tab_id VARCHAR(100) DEFAULT 'tab-default',
+                history JSONB DEFAULT '[]',
+                rev BIGINT NOT NULL DEFAULT 1,
+                is_deleted BOOLEAN DEFAULT FALSE,
+                deleted_at TIMESTAMP WITH TIME ZONE DEFAULT NULL,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                updated_at BIGINT DEFAULT 0,
+                CONSTRAINT uq_sync_docs_doc_id UNIQUE (doc_id)
+            );
+        """)
+        try:
+            await execute_pg_query("ALTER TABLE user_sync_docs DROP COLUMN IF EXISTS visibility CASCADE;")
+            await execute_pg_query("ALTER TABLE user_sync_docs ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP WITH TIME ZONE DEFAULT NULL;")
+            await execute_pg_query("CREATE INDEX IF NOT EXISTS idx_sync_docs_user_rev ON user_sync_docs(user_id, rev);")
+            await execute_pg_query("CREATE UNIQUE INDEX IF NOT EXISTS idx_sync_docs_global_doc_id ON user_sync_docs(doc_id);")
+        except Exception:
+            pass
+        _table_initialized = True
+    except Exception as e:
+        print(f"[DOC SYNC] Warning initializing user_sync_docs table: {e}")
+
+
+def _clean_str(val: Any) -> str:
+    if isinstance(val, str):
+        return val.strip()
+    return ""
+
+
+async def _resolve_user_id(
+    token: Any = None,
+    x_user_id: Any = None,
+    x_user_email: Any = None,
+    x_user_name: Any = None,
+    response: Optional[Response] = None
+) -> int:
+    """Seamlessly resolve a stable, permanent user_id across all devices."""
+    clean_token = _clean_str(token)
+    clean_id = _clean_str(x_user_id)
+    clean_email = _clean_str(x_user_email).lower()
+    clean_username = _clean_str(x_user_name).lower()
+
+    # 1. Primary: Verify Spac2 JWT Token
+    if clean_token:
+        payload = decode_spac2_token(clean_token)
+        if payload and payload.get("user_id"):
+            return int(payload["user_id"])
+
+    # 2. Secondary: Direct X-User-Id Header
+    if clean_id and clean_id.isdigit() and int(clean_id) > 0:
+        uid_val = int(clean_id)
+        if uid_val < 10000:
+            try:
+                rows = await execute_pg_query("SELECT id, user_id FROM users WHERE id = $1", uid_val)
+                if rows and rows[0].get("id"):
+                    return int(rows[0].get("user_id") or (10000 + rows[0]["id"]))
+            except Exception:
+                pass
+            return 10000 + uid_val
+        return uid_val
+
+    # 3. Tertiary: Lookup in central users table by email
+    if clean_email:
+        try:
+            rows = await execute_pg_query(
+                "SELECT id, user_id, username, email FROM users WHERE LOWER(email) = $1", 
+                clean_email
+            )
+            if rows and len(rows) > 0 and rows[0].get("id"):
+                row = rows[0]
+                db_id = row["id"]
+                uid = int(row.get("user_id") or (10000 + db_id))
+                
+                if not row.get("user_id"):
+                    try:
+                        await execute_pg_query("UPDATE users SET user_id = $1 WHERE id = $2", uid, db_id)
+                    except Exception:
+                        pass
+
+                if response is not None:
+                    new_token = create_spac2_token(
+                        user_id=uid,
+                        username=row.get("username") or clean_username or clean_email.split("@")[0],
+                        email=row.get("email") or clean_email
+                    )
+                    response.headers["X-New-Spac2-Token"] = new_token
+                return uid
+            else:
+                uname = clean_username or clean_email.split("@")[0]
+                try:
+                    await execute_pg_query(
+                        "INSERT INTO users (username, email, user_id, name, created_at, updated_at) "
+                        "VALUES ($1, $2, (SELECT COALESCE(MAX(user_id), 10000) + 1 FROM users), $3, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) "
+                        "ON CONFLICT (email) DO NOTHING",
+                        uname, clean_email, uname
+                    )
+                    prov_rows = await execute_pg_query("SELECT id, user_id, username, email FROM users WHERE LOWER(email) = $1", clean_email)
+                    if prov_rows and prov_rows[0].get("id"):
+                        prov_row = prov_rows[0]
+                        uid = int(prov_row.get("user_id") or (10000 + prov_row["id"]))
+                        if response is not None:
+                            new_token = create_spac2_token(
+                                user_id=uid,
+                                username=prov_row.get("username") or uname,
+                                email=clean_email
+                            )
+                            response.headers["X-New-Spac2-Token"] = new_token
+                        return uid
+                except Exception as prov_err:
+                    print(f"[ResolveUser] Auto-provision doc user notice: {prov_err}")
+        except Exception as err:
+            print(f"[ResolveUser] Email lookup warning: {err}")
+
+    # 4. Quaternary: Lookup by username
+    if clean_username:
+        try:
+            rows = await execute_pg_query(
+                "SELECT id, user_id, username, email FROM users WHERE LOWER(username) = $1", 
+                clean_username
+            )
+            if rows and len(rows) > 0 and rows[0].get("id"):
+                row = rows[0]
+                uid = int(row.get("user_id") or (10000 + row["id"]))
+                if response is not None:
+                    new_token = create_spac2_token(
+                        user_id=uid,
+                        username=row.get("username") or clean_username,
+                        email=row.get("email") or clean_email or f"{clean_username}@spac2.com"
+                    )
+                    response.headers["X-New-Spac2-Token"] = new_token
+                return uid
+        except Exception as err:
+            print(f"[ResolveUser] Username lookup warning: {err}")
+
+    # 5. Deterministic permanent fallback hash from email
+    if clean_email:
+        email_hash_56bit = int(hashlib.sha256(f"spac2_doc_salt_{clean_email}".encode("utf-8")).hexdigest()[:14], 16)
+        stable_id = 1000000000000 + (email_hash_56bit % 8000000000000)
+        return stable_id
+
+    raise HTTPException(status_code=401, detail="Unauthorized: No valid Spac2 session or user ID found")
+
+
+def _normalize_json_field(val: Any, default_val: Any) -> Any:
+    if val is None:
+        return default_val
+    if isinstance(val, (dict, list)):
+        return val
+    if isinstance(val, str):
+        trimmed = val.strip()
+        if not trimmed:
+            return default_val
+        try:
+            return json.loads(trimmed)
+        except Exception:
+            return default_val
+    return default_val
+
+
+def _format_doc_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    items_list = []
+    seen_ids = set()
+
+    for r in rows:
+        doc_id = str(r.get("doc_id") or "").strip()
+        if not doc_id or doc_id in seen_ids:
+            continue
+        seen_ids.add(doc_id)
+
+        title = str(r.get("title") or "")
+        body = str(r.get("body") or "")
+        preview_text = str(r.get("preview_text") or "")
+        word_count = int(r.get("word_count") or 0)
+        pinned = bool(r.get("pinned"))
+        in_trash = bool(r.get("in_trash"))
+        target = int(r.get("target") or 500)
+        tabs = _normalize_json_field(r.get("tabs"), [])
+        active_tab_id = str(r.get("active_tab_id") or "")
+        history = _normalize_json_field(r.get("history"), [])
+        rev = int(r.get("rev") or 1)
+        is_deleted = bool(r.get("is_deleted"))
+        updated_at = int(r.get("updated_at") or 0)
+
+        items_list.append({
+            "id": doc_id,
+            "title": title,
+            "body": body,
+            "previewText": preview_text,
+            "preview_text": preview_text,
+            "wordCount": word_count,
+            "word_count": word_count,
+            "pinned": pinned,
+            "inTrash": in_trash,
+            "in_trash": in_trash,
+            "target": target,
+            "tabs": tabs,
+            "activeTabId": active_tab_id,
+            "active_tab_id": active_tab_id,
+            "history": history,
+            "rev": rev,
+            "is_deleted": is_deleted,
+            "updated": updated_at,
+            "updated_at": updated_at
+        })
+    return items_list
+
+
+def _inject_doc_headers(response: Response):
+    response.headers["Cache-Control"] = "private, no-store, no-cache, must-revalidate"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    response.headers["X-Robots-Tag"] = "noindex, nofollow, noarchive, nosnippet"
+
+
+@router.get("")
+async def get_doc_delta_sync(
+    response: Response,
+    since_rev: int = Query(0),
+    token: str = Depends(get_auth_token),
+    x_user_id: Optional[str] = Header(None),
+    x_user_email: Optional[str] = Header(None),
+    x_user_name: Optional[str] = Header(None)
+):
+    """Google Keep-Style Lightweight Delta Pull for Spac2 Doc.
+    Returns documents created/updated/deleted since since_rev.
+    """
+    _inject_doc_headers(response)
+    user_id = await _resolve_user_id(token, x_user_id, x_user_email, x_user_name, response)
+    await _ensure_doc_table()
+
+    try:
+        current_rev = await get_domain_max_rev(user_id, "doc")
+
+        if since_rev > 0 and since_rev == current_rev:
+            return {
+                "status": "success",
+                "current_rev": current_rev,
+                "items": []
+            }
+
+        if since_rev == 0 or since_rev > current_rev:
+            # Full active documents pull
+            rows = await execute_pg_query(
+                "SELECT doc_id, title, body, preview_text, word_count, pinned, in_trash, target, "
+                "tabs, active_tab_id, history, rev, is_deleted, updated_at "
+                "FROM user_sync_docs "
+                "WHERE user_id = $1 AND is_deleted = FALSE "
+                "ORDER BY rev ASC",
+                user_id
+            )
+        else:
+            # Delta pull
+            rows = await execute_pg_query(
+                "SELECT doc_id, title, body, preview_text, word_count, pinned, in_trash, target, "
+                "tabs, active_tab_id, history, rev, is_deleted, updated_at "
+                "FROM user_sync_docs "
+                "WHERE user_id = $1 AND rev > $2 "
+                "ORDER BY rev ASC",
+                user_id, since_rev
+            )
+
+        return {
+            "status": "success",
+            "current_rev": current_rev,
+            "items": _format_doc_rows(rows)
+        }
+    except Exception as e:
+        print(f"[KeepSyncDoc] Delta fetch error for user {user_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch delta docs: {str(e)}")
+
+
+@router.post("")
+async def sync_keep_docs_batch(
+    payload: DocKeepSyncRequest,
+    response: Response,
+    token: str = Depends(get_auth_token),
+    x_user_id: Optional[str] = Header(None),
+    x_user_email: Optional[str] = Header(None),
+    x_user_name: Optional[str] = Header(None)
+):
+    """Google Keep-Style Single-Trip Atomic Full Sync (Push + Pull).
+    1. Saves all client mutations (upserts/deletes) atomically with next revision.
+    2. Soft Delete Tombstone: frees heavy body/tabs content while retaining metadata for 30-day delta propagation.
+    3. Auto-purges soft-deleted tombstones older than 30 days.
+    4. Atomically queries and returns remote documents updated by other devices since since_rev.
+    """
+    _inject_doc_headers(response)
+    user_id = await _resolve_user_id(token, x_user_id, x_user_email, x_user_name, response)
+    await _ensure_doc_table()
+
+    try:
+        has_mutations = bool(payload.items and len(payload.items) > 0)
+        mutation_results: List[Dict[str, Any]] = []
+
+        async def _write_doc_mutations(next_rev: int, now_ts: int):
+            if payload.items and len(payload.items) > 0:
+                for item in payload.items:
+                    raw_doc_id = str(item.id).strip()
+                    if not raw_doc_id:
+                        continue
+                    doc_id = await resolve_canonical_id(user_id, "doc", raw_doc_id)
+                    if not doc_id:
+                        continue
+
+                    # 1. Look up existing doc to determine ownership & permissions
+                    existing_rows = await execute_pg_query(
+                        "SELECT user_id, rev, title, body, preview_text, word_count, pinned, in_trash, target, "
+                        "tabs, active_tab_id, history, is_deleted, updated_at "
+                        "FROM user_sync_docs WHERE doc_id = $1 LIMIT 1",
+                        doc_id
+                    )
+
+                    is_owner = True
+                    target_owner_id = user_id
+                    existing_row = None
+
+                    if existing_rows and len(existing_rows) > 0:
+                        existing_row = existing_rows[0]
+                        owner_id = int(existing_row["user_id"])
+                        is_owner = (owner_id == user_id)
+                        target_owner_id = owner_id
+
+                        if not is_owner:
+                            # Strict Owner-Only Policy: Non-owners cannot mutate another user's document
+                            mutation_results.append({
+                                "id": raw_doc_id,
+                                "status": "REJECT",
+                                "error": "PERMISSION_DENIED"
+                            })
+                            continue
+
+                    # 2. Strict Optimistic Concurrency Control (OCC) - DO NOT overwrite stale server data
+                    if existing_row and not item.is_deleted:
+                        server_rev = int(existing_row.get("rev") or 1)
+                        client_base_rev = item.base_rev if item.base_rev is not None else item.rev
+                        if client_base_rev is not None and client_base_rev > 0 and client_base_rev < server_rev:
+                            # Explicit Lightweight CONFLICT: Refuse overwrite.
+                            # Full server state is delivered naturally via standard pull response items
+                            mutation_results.append({
+                                "id": raw_doc_id,
+                                "status": "CONFLICT",
+                                "server_rev": server_rev,
+                                "server_updated_at": int(existing_row.get("updated_at") or now_ts),
+                                "error": "OCC_VERSION_MISMATCH"
+                            })
+                            continue
+
+                    item_title = (item.title or "").strip()
+                    item_body = item.body or ""
+                    preview_text = item.previewText or item.preview_text or ""
+                    word_count = item.wordCount if item.wordCount is not None else (item.word_count or 0)
+                    pinned = bool(item.pinned) if is_owner else bool(existing_row.get("pinned") if existing_row else False)
+                    in_trash = bool(item.inTrash if item.inTrash is not None else item.in_trash) if is_owner else False
+                    target = int(item.target or 500)
+                    active_tab_id = item.activeTabId or item.active_tab_id or "tab-default"
+
+                    tabs_val = _normalize_json_field(item.tabs, [])
+                    tabs_json = json.dumps(tabs_val)
+
+                    history_val = _normalize_json_field(item.history, [])
+                    if not isinstance(history_val, list):
+                        history_val = []
+                    history_json = json.dumps(history_val[-50:]) # Retain latest 50 history snapshots
+
+                    item_updated_at = int(item.updated or item.updated_at or now_ts)
+
+                    if item.is_deleted:
+                        if is_owner:
+                            await execute_pg_query(
+                                "INSERT INTO user_sync_docs ("
+                                "   user_id, doc_id, title, body, preview_text, word_count, pinned, in_trash, "
+                                "   target, tabs, active_tab_id, history, rev, is_deleted, deleted_at, updated_at"
+                                ") VALUES ($1, $2, '', '', '', 0, FALSE, FALSE, 500, '[]'::jsonb, '', '[]'::jsonb, $3, TRUE, CURRENT_TIMESTAMP, $4) "
+                                "ON CONFLICT (doc_id) DO UPDATE SET "
+                                "   title = '', body = '', preview_text = '', word_count = 0, pinned = FALSE, in_trash = FALSE, "
+                                "   tabs = '[]'::jsonb, history = '[]'::jsonb, is_deleted = TRUE, deleted_at = CURRENT_TIMESTAMP, rev = EXCLUDED.rev, updated_at = EXCLUDED.updated_at "
+                                "WHERE user_sync_docs.user_id = EXCLUDED.user_id",
+                                target_owner_id, doc_id, next_rev, now_ts
+                            )
+                            mutation_results.append({"id": raw_doc_id, "status": "ACK", "rev": next_rev})
+                        else:
+                            mutation_results.append({
+                                "id": raw_doc_id,
+                                "status": "REJECT",
+                                "error": "ONLY_OWNER_CAN_DELETE"
+                            })
+                    else:
+                        await execute_pg_query(
+                            "INSERT INTO user_sync_docs ("
+                            "   user_id, doc_id, title, body, preview_text, word_count, pinned, in_trash, "
+                            "   target, tabs, active_tab_id, history, rev, is_deleted, deleted_at, updated_at"
+                            ") VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11, $12::jsonb, $13, FALSE, NULL, $14) "
+                            "ON CONFLICT (doc_id) DO UPDATE SET "
+                            "   title = EXCLUDED.title, body = EXCLUDED.body, preview_text = EXCLUDED.preview_text, "
+                            "   word_count = EXCLUDED.word_count, pinned = EXCLUDED.pinned, in_trash = EXCLUDED.in_trash, "
+                            "   target = EXCLUDED.target, tabs = EXCLUDED.tabs, active_tab_id = EXCLUDED.active_tab_id, "
+                            "   history = EXCLUDED.history, rev = EXCLUDED.rev, "
+                            "   is_deleted = FALSE, deleted_at = NULL, updated_at = EXCLUDED.updated_at "
+                            "WHERE user_sync_docs.user_id = EXCLUDED.user_id AND user_sync_docs.is_deleted = FALSE",
+                            target_owner_id, doc_id, item_title, item_body, preview_text, word_count,
+                            pinned, in_trash, target, tabs_json, active_tab_id, history_json,
+                            next_rev, item_updated_at
+                        )
+                        mutation_results.append({"id": raw_doc_id, "status": "ACK", "rev": next_rev})
+
+            # Auto-purge soft-deleted tombstones older than 30 days
+            try:
+                thirty_days_ago_ts = now_ts - (30 * 86400 * 1000)
+                await execute_pg_query(
+                    "DELETE FROM user_sync_docs WHERE user_id = $1 AND is_deleted = TRUE AND updated_at < $2",
+                    user_id, thirty_days_ago_ts
+                )
+            except Exception as purge_err:
+                print(f"[KeepSyncDoc] 30-day tombstone cleanup notice: {purge_err}")
+
+        # Atomic commit with idempotency & concurrency protection
+        sync_result = await execute_sync_batch_atomic(
+            user_id=user_id,
+            app_code="doc",
+            sync_batch_id=payload.sync_batch_id,
+            payload_data=payload,
+            has_mutations=has_mutations,
+            write_callback=_write_doc_mutations
+        )
+
+        effective_rev = sync_result["current_rev"]
+
+        # Atomic Pull: Get remote updates
+        since_rev = payload.since_rev if payload.since_rev is not None else 0
+        remote_items = []
+
+        if since_rev == 0 or since_rev > effective_rev:
+            rows = await execute_pg_query(
+                "SELECT doc_id, title, body, preview_text, word_count, pinned, in_trash, target, "
+                "tabs, active_tab_id, history, rev, is_deleted, updated_at "
+                "FROM user_sync_docs "
+                "WHERE user_id = $1 AND is_deleted = FALSE "
+                "ORDER BY rev ASC",
+                user_id
+            )
+            remote_items = _format_doc_rows(rows)
+        elif since_rev < effective_rev:
+            rows = await execute_pg_query(
+                "SELECT doc_id, title, body, preview_text, word_count, pinned, in_trash, target, "
+                "tabs, active_tab_id, history, rev, is_deleted, updated_at "
+                "FROM user_sync_docs "
+                "WHERE user_id = $1 AND rev > $2 "
+                "ORDER BY rev ASC",
+                user_id, since_rev
+            )
+            remote_items = _format_doc_rows(rows)
+
+        ack_count = len([r for r in mutation_results if r.get("status") == "ACK"])
+
+        # Broadcast lightweight invalidation ping to subscribed clients
+        if ack_count > 0:
+            for res_item in mutation_results:
+                if res_item.get("status") == "ACK":
+                    doc_id_val = res_item.get("id")
+                    if doc_id_val:
+                        try:
+                            import asyncio
+                            from websocket.manager import broadcast_resource_invalidation
+                            asyncio.create_task(broadcast_resource_invalidation(
+                                app="doc",
+                                resource_id=str(doc_id_val),
+                                rev=effective_rev,
+                                actor_email=_clean_str(x_user_email)
+                            ))
+                        except Exception as ping_err:
+                            print(f"[WS Ping Notice] {ping_err}")
+
+        return {
+            "status": "success",
+            "current_rev": effective_rev,
+            "deduplicated": sync_result.get("deduplicated", False),
+            "synced_count": ack_count,
+            "results": mutation_results,
+            "items": remote_items
+        }
+
+    except Exception as e:
+        print(f"[KeepSyncDoc] Sync error for user {user_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to sync docs: {str(e)}")
+

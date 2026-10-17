@@ -1,0 +1,247 @@
+import re
+import time
+from datetime import datetime, timezone
+from fastapi import HTTPException
+
+from database.postgres import execute_pg_query
+from storage.r2 import process_and_upload_avatar, delete_r2_object, delete_media_url_from_r2_and_local
+from websocket.manager import active_connections
+from config import LOCAL_AVATARS_DIR, R2_CDN_BASE, R2_AVATAR_CDN_BASE, DEFAULT_AVATAR_URL
+import os
+
+
+async def get_email_by_username(username: str) -> str:
+    from websocket.manager import get_email_by_username as mgr_get_email
+    return await mgr_get_email(username)
+
+
+async def save_profile(profile_data: dict, base_url: str = ""):
+    """Upsert a user profile into the central users table. Handles profile sync, username uniqueness, and avatar processing."""
+    is_login = profile_data.get("is_login", False)
+    email = profile_data.get("email").strip().lower()
+
+    existing_users = await execute_pg_query(
+        "SELECT id, user_id, username, name, bio, status, avatar FROM users WHERE email = $1", email
+    )
+
+    if existing_users and is_login:
+        merged = await _merge_login_profile(existing_users, profile_data, email, base_url)
+        return merged, False
+
+    is_new = not bool(existing_users)
+    updated = await _upsert_profile(existing_users, profile_data, email, base_url)
+    return updated, is_new
+
+
+async def _merge_login_profile(existing_users, profile_data, email, base_url):
+    """Fill in missing profile fields during an account login session."""
+    u = existing_users[0]
+    db_id = u["id"]
+    user_id = u.get("user_id") or (10000 + db_id)
+
+    db_username = (u["username"] or "").strip()
+    db_name = (u["name"] or "").strip()
+    db_bio = (u["bio"] or "").strip()
+    db_status = (u["status"] or "online").strip()
+    db_avatar = (u["avatar"] or "").strip()
+
+    p_username = profile_data.get("username", "").strip().lower()
+    p_name = profile_data.get("name", "").strip()
+    p_bio = profile_data.get("bio", "").strip()
+    p_status = profile_data.get("status", "online").strip()
+    p_avatar = profile_data.get("avatar", "").strip()
+
+    updated = False
+
+    if not u.get("user_id"):
+        await execute_pg_query("UPDATE users SET user_id = $1 WHERE id = $2", user_id, db_id)
+
+    if not db_username:
+        candidate_username = p_username or re.sub(r"[^a-z0-9]", "", email.split("@")[0].lower()) or f"user{int(time.time())}"
+        username_check = await execute_pg_query("SELECT id FROM users WHERE username = $1", candidate_username)
+        if username_check:
+            base_username = candidate_username
+            counter = 1
+            while True:
+                candidate = f"{base_username}{counter}"
+                check = await execute_pg_query("SELECT id FROM users WHERE username = $1", candidate)
+                if not check:
+                    candidate_username = candidate
+                    break
+                counter += 1
+        db_username = candidate_username
+        updated = True
+
+    if not db_name and p_name:
+        db_name = p_name
+        updated = True
+    if not db_bio and p_bio:
+        db_bio = p_bio
+        updated = True
+    if not db_status and p_status:
+        db_status = p_status
+        updated = True
+    if not db_avatar and p_avatar:
+        if p_avatar.startswith("data:image/") or (p_avatar.startswith("http") and not (p_avatar.startswith(f"{R2_AVATAR_CDN_BASE}/") or p_avatar.startswith(f"{R2_CDN_BASE}/"))):
+            db_avatar = process_and_upload_avatar(db_username, p_avatar, base_url)
+        else:
+            db_avatar = p_avatar
+        updated = True
+
+    if updated:
+        await execute_pg_query(
+            "UPDATE users SET username = $1, name = $2, bio = $3, status = $4, avatar = $5, user_id = $6, updated_at = CURRENT_TIMESTAMP WHERE email = $7",
+            db_username, db_name, db_bio, db_status, db_avatar, user_id, email
+        )
+        print(f"Profile for @{db_username} (ID: {user_id}) merged and updated in PostgreSQL users table during login.")
+
+    return {
+        "id": user_id,
+        "user_id": user_id,
+        "username": db_username,
+        "name": db_name,
+        "bio": db_bio,
+        "email": email,
+        "status": db_status,
+        "avatar": db_avatar or DEFAULT_AVATAR_URL,
+        "avatar_url": db_avatar or DEFAULT_AVATAR_URL
+    }
+
+
+async def _upsert_profile(existing_users, profile_data, email, base_url):
+    """Create or update a user profile."""
+    username = profile_data.get("username").strip().lower()
+    name = profile_data.get("name", "").strip()
+    bio = profile_data.get("bio", "").strip()
+    status = profile_data.get("status", "online").strip()
+    avatar = profile_data.get("avatar", "").strip()
+
+    old_username = None
+    old_avatar = None
+    user_id = None
+
+    if existing_users:
+        old_username = existing_users[0]["username"]
+        old_avatar = existing_users[0]["avatar"]
+        user_id = existing_users[0].get("user_id") or (10000 + existing_users[0]["id"])
+
+    # Username uniqueness check (Case-insensitive across all users)
+    is_login = profile_data.get("is_login", False)
+    if old_username and old_username != username:
+        username_check = await execute_pg_query("SELECT id FROM users WHERE LOWER(username) = LOWER($1) AND LOWER(email) != LOWER($2)", username, email)
+        if username_check:
+            raise HTTPException(status_code=400, detail="Username is already taken by another user")
+    elif not old_username:
+        username_check = await execute_pg_query("SELECT id FROM users WHERE LOWER(username) = LOWER($1) AND LOWER(email) != LOWER($2)", username, email)
+        if username_check:
+            if is_login:
+                base_username = username
+                counter = 1
+                while True:
+                    candidate = f"{base_username}{counter}"
+                    check = await execute_pg_query("SELECT id FROM users WHERE LOWER(username) = LOWER($1)", candidate)
+                    if not check:
+                        username = candidate
+                        break
+                    counter += 1
+            else:
+                raise HTTPException(status_code=400, detail="Username is already taken by another user")
+
+    # Process avatar and upload to Cloudflare R2
+    avatar_url = avatar
+    if avatar != old_avatar:
+        if avatar and (avatar.startswith("data:image/") or (avatar.startswith("http") and not (f"/avatar/" in avatar or f"/avatars/" in avatar))):
+            avatar_url = process_and_upload_avatar(username, avatar, base_url)
+
+        # Clean up old avatar from R2 and local disk storage
+        if old_avatar and old_avatar != avatar_url:
+            delete_media_url_from_r2_and_local(old_avatar)
+
+    if existing_users:
+        db_id = existing_users[0]["id"]
+        # Update central users table
+        await execute_pg_query(
+            "UPDATE users SET username = $1, name = $2, bio = $3, status = $4, avatar = $5, user_id = $6, updated_at = CURRENT_TIMESTAMP WHERE email = $7",
+            username, name, bio, status, avatar_url, user_id, email
+        )
+        print(f"Profile for @{username} (ID: {user_id}) updated in PostgreSQL users table.")
+
+        if old_username and old_username != username:
+            print(f"Username changed from @{old_username} to @{username}. Cascading updates across chat tables...")
+            await execute_pg_query("UPDATE messages SET sender_id = $1 WHERE LOWER(sender_id) = LOWER($2)", username, old_username)
+            await execute_pg_query("UPDATE messages SET recipient_id = $1 WHERE LOWER(recipient_id) = LOWER($2)", username, old_username)
+            await execute_pg_query("UPDATE chat_push_subscriptions SET username = $1 WHERE LOWER(username) = LOWER($2)", username, old_username)
+            await execute_pg_query("UPDATE chat_group_members SET username = $1 WHERE LOWER(username) = LOWER($2)", username, old_username)
+            await execute_pg_query("UPDATE chat_friends SET username = $1 WHERE LOWER(username) = LOWER($2)", username, old_username)
+            await execute_pg_query("UPDATE chat_friends SET friend_username = $1 WHERE LOWER(friend_username) = LOWER($2)", username, old_username)
+    else:
+        next_uid_res = await execute_pg_query("SELECT nextval('users_user_id_seq') AS next_uid")
+        user_id = next_uid_res[0]["next_uid"] if next_uid_res else 10001
+        
+        # Insert into central users table
+        await execute_pg_query(
+            "INSERT INTO users (user_id, username, name, bio, email, status, avatar) VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (email) DO UPDATE SET username = EXCLUDED.username, avatar = EXCLUDED.avatar",
+            user_id, username, name, bio, email, status, avatar_url
+        )
+        print(f"Profile for @{username} (ID: {user_id}) inserted into PostgreSQL users table.")
+
+    return {
+        "id": user_id,
+        "user_id": user_id,
+        "username": username,
+        "name": name,
+        "bio": bio,
+        "email": email,
+        "status": status,
+        "avatar": avatar_url or DEFAULT_AVATAR_URL,
+        "avatar_url": avatar_url or DEFAULT_AVATAR_URL
+    }
+
+
+async def get_profile(identifier: str):
+    """Retrieve a public user profile by username, email, or user_id from the central users table."""
+    if not identifier:
+        return None
+    ident = str(identifier).strip().lower()
+    
+    if ident.isdigit():
+        users = await execute_pg_query(
+            "SELECT id, user_id, username, name, bio, email, status, avatar, last_seen, is_verified, email_verified FROM users WHERE user_id = $1 OR id = $1",
+            int(ident)
+        )
+    elif "@" in ident:
+        users = await execute_pg_query(
+            "SELECT id, user_id, username, name, bio, email, status, avatar, last_seen, is_verified, email_verified FROM users WHERE LOWER(email) = $1",
+            ident
+        )
+    else:
+        users = await execute_pg_query(
+            "SELECT id, user_id, username, name, bio, email, status, avatar, last_seen, is_verified, email_verified FROM users WHERE LOWER(username) = $1",
+            ident
+        )
+
+    if users:
+        u = users[0]
+        uid = u.get("user_id") or (10000 + u["id"])
+        avatar_val = u["avatar"] or DEFAULT_AVATAR_URL
+        verified = bool(u.get("is_verified") or u.get("email_verified"))
+        return {
+            "id": uid,
+            "user_id": uid,
+            "name": u["name"] or "",
+            "username": u["username"] or "",
+            "bio": u["bio"] or "",
+            "email": u["email"] or "",
+            "is_verified": verified,
+            "email_verified": verified,
+            "status": "online" if u["username"] and u["username"].strip().lower() in active_connections else "offline",
+            "avatar": avatar_val,
+            "avatar_url": avatar_val,
+            "last_seen": u["last_seen"] or ""
+        }
+    return None
+
+
+# Backward-compatible aliases
+save_profile_to_d1 = save_profile
+get_profile_from_d1 = get_profile
