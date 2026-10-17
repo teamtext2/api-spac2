@@ -24,6 +24,35 @@ email_to_username: Dict[str, str] = {}  # email -> username (current)
 buffered_call_signals: Dict[str, list] = {}
 
 
+async def safe_send_ws(ws: WebSocket, payload: str, timeout: float = 3.0) -> bool:
+    """
+    Safely send text to a WebSocket with a strict timeout.
+    Prevents half-open/paused client connections from blocking the asyncio event loop.
+    Returns True on success, False if timeout or socket error occurred.
+    """
+    try:
+        await asyncio.wait_for(ws.send_text(payload), timeout=timeout)
+        return True
+    except Exception:
+        return False
+
+
+def remove_dead_socket(ws: WebSocket, username: Optional[str] = None):
+    """Cleanly deregister a dead/timed-out socket from all tracking registries."""
+    cleanup_socket_subscriptions(ws)
+    uname = username
+    if ws in connection_metadata:
+        uname = uname or connection_metadata[ws].get("username")
+        try:
+            del connection_metadata[ws]
+        except KeyError:
+            pass
+    if uname and uname in active_connections:
+        active_connections[uname].discard(ws)
+        if not active_connections[uname]:
+            del active_connections[uname]
+
+
 async def check_resource_permission(
     app: str,
     resource_id: str,
@@ -158,14 +187,14 @@ async def _dispatch_to_local_subscribers(ping_data: dict) -> int:
     sent_count = 0
 
     for ws in list(subscribers):
-        try:
-            await ws.send_text(payload)
+        ok = await safe_send_ws(ws, payload, timeout=3.0)
+        if ok:
             sent_count += 1
-        except Exception:
+        else:
             dead_sockets.append(ws)
 
     for ws in dead_sockets:
-        cleanup_socket_subscriptions(ws)
+        remove_dead_socket(ws)
 
     return sent_count
 
@@ -289,10 +318,9 @@ async def send_to_user_by_email(email: str, payload: str):
     username = email_to_username.get(email)
     if username and username in active_connections:
         for ws in list(active_connections[username]):
-            try:
-                await ws.send_text(payload)
-            except Exception:
-                pass
+            ok = await safe_send_ws(ws, payload, timeout=3.0)
+            if not ok:
+                remove_dead_socket(ws, username)
 
 
 async def get_username_by_email(email: str) -> str:
@@ -399,7 +427,6 @@ async def broadcast_user_status(username: str, status: str, last_seen: str):
     for friend in friends:
         if friend in active_connections:
             for ws in list(active_connections[friend]):
-                try:
-                    await ws.send_text(payload)
-                except Exception:
-                    pass
+                ok = await safe_send_ws(ws, payload, timeout=3.0)
+                if not ok:
+                    remove_dead_socket(ws, friend)

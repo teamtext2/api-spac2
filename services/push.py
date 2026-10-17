@@ -4,14 +4,10 @@ from config import VAPID_PRIVATE_KEY, VAPID_CLAIMS, DEFAULT_AVATAR_URL
 from database.postgres import execute_pg_query
 
 
-async def send_single_web_push_with_retry(subscription_info: dict, payload: str, retries: int = 3) -> bool:
+async def send_single_web_push_with_retry(subscription_info: dict, payload: str, retries: int = 2) -> bool:
     """
     Send a single web push notification with exponential backoff retry.
-
-    Content encoding strategy (detected via endpoint URL):
-    - iOS Safari 16.4+ (web.push.apple.com) → aes128gcm (RFC 8188) REQUIRED
-    - Android Chrome/Edge (fcm.googleapis.com) → aes128gcm (pywebpush v2 standard)
-    - Firefox/Desktop (other endpoints)        → aes128gcm (most compatible)
+    Includes strict HTTP timeouts to prevent thread pool exhaustion and event loop freezes.
     """
     try:
         import anyio
@@ -20,7 +16,7 @@ async def send_single_web_push_with_retry(subscription_info: dict, payload: str,
         print("[PUSH] pywebpush or anyio is not installed. Skipping push notification sending.")
         return False
 
-    delay = 1.0
+    delay = 0.5
     endpoint = subscription_info.get("endpoint", "")
     endpoint_preview = endpoint[:80] + "..." if len(endpoint) > 80 else endpoint
 
@@ -34,12 +30,9 @@ async def send_single_web_push_with_retry(subscription_info: dict, payload: str,
     else:
         platform = "Desktop/Firefox"
 
-    print(f"[PUSH] → Attempting delivery to {platform}: {endpoint_preview}")
-
     for attempt in range(retries):
         try:
             def _push():
-                # 24h TTL (86400s) ensures notifications are queued and delivered when offline devices reconnect
                 effective_ttl = 86400
                 headers = {"Urgency": "high"}
                 if is_apple:
@@ -52,11 +45,15 @@ async def send_single_web_push_with_retry(subscription_info: dict, payload: str,
                     vapid_claims=VAPID_CLAIMS.copy(),
                     ttl=effective_ttl,
                     content_encoding="aes128gcm",
-                    headers=headers
+                    headers=headers,
+                    timeout=5.0
                 )
-            await anyio.to_thread.run_sync(_push)
-            print(f"[PUSH] ✓ Delivered ({platform}): {endpoint_preview}")
+
+            # Strict 7-second ceiling per push delivery attempt
+            await asyncio.wait_for(anyio.to_thread.run_sync(_push), timeout=7.0)
             return True
+        except asyncio.TimeoutError:
+            print(f"[PUSH] ✗ Timeout (7s ceiling exceeded) delivering to {platform}: {endpoint_preview}")
         except Exception as ex:
             # Capture full response details for debugging
             status_code = None
@@ -71,10 +68,6 @@ async def send_single_web_push_with_retry(subscription_info: dict, payload: str,
             print(f"[PUSH] ✗ Error ({platform}) attempt {attempt+1}/{retries} — "
                   f"status={status_code} body={response_body!r} error={ex}")
 
-            # 410 Gone = subscription permanently revoked → safe to delete.
-            # 404 for APNs can be transient (device offline / endpoint not yet active)
-            #     → do NOT delete iOS subscriptions on 404, only retry.
-            # 404 for FCM is also permanent → delete Android subscriptions on 404.
             should_delete = (
                 status_code == 410 or
                 (status_code == 404 and not is_apple)
@@ -88,7 +81,7 @@ async def send_single_web_push_with_retry(subscription_info: dict, payload: str,
                     print(f"[PUSH] Deleted revoked subscription ({platform}): {endpoint_preview}")
                 except Exception as err:
                     print(f"[PUSH] Failed to delete revoked subscription: {err}")
-                break  # No retry for permanently revoked subscriptions
+                break
 
             if status_code == 413:
                 print(f"[PUSH] Payload too large for {platform}. Skipping retry.")
@@ -97,8 +90,6 @@ async def send_single_web_push_with_retry(subscription_info: dict, payload: str,
             if attempt < retries - 1:
                 await asyncio.sleep(delay)
                 delay *= 2
-            else:
-                print(f"[PUSH] ✗ Failed after {retries} attempts ({platform})")
     return False
 
 
@@ -134,12 +125,12 @@ async def send_web_push(recipient_username: str, title: str, body: str, sender: 
         
         if email:
             subscriptions = await execute_pg_query(
-                "SELECT endpoint, p256dh, auth FROM chat_push_subscriptions WHERE username = $1 OR username = $2",
+                "SELECT endpoint, p256dh, auth FROM chat_push_subscriptions WHERE username = $1 OR username = $2 ORDER BY id DESC LIMIT 5",
                 recipient_user_clean, email.lower()
             )
         else:
             subscriptions = await execute_pg_query(
-                "SELECT endpoint, p256dh, auth FROM chat_push_subscriptions WHERE username = $1",
+                "SELECT endpoint, p256dh, auth FROM chat_push_subscriptions WHERE username = $1 ORDER BY id DESC LIMIT 5",
                 recipient_user_clean
             )
     except Exception as e:
@@ -147,10 +138,7 @@ async def send_web_push(recipient_username: str, title: str, body: str, sender: 
         return
 
     if not subscriptions:
-        print(f"[PUSH] No subscriptions found for @{recipient_username}")
         return
-
-    print(f"[PUSH] Sending message notification to @{recipient_username} ({len(subscriptions)} subscription(s))")
 
     # Ensure avatar is an absolute URL for iOS/Android push daemon compatibility
     if avatar:
@@ -161,14 +149,9 @@ async def send_web_push(recipient_username: str, title: str, body: str, sender: 
             else:
                 avatar = "https://spac2.com/" + avatar_str
 
-    # iOS 16.4+: icon must be a PNG/JPG URL (no .ico, no .svg)
-    # Use DEFAULT_AVATAR_URL as fallback for maximum compatibility
     safe_icon = avatar if (avatar and any(avatar.lower().endswith(ext) for ext in [".png", ".jpg", ".jpeg", ".webp"])) \
         else DEFAULT_AVATAR_URL
 
-    # Send FULL payload — no SW fetch needed.
-    # Android Doze mode can block SW fetch calls, so we include all display
-    # data upfront. SW will show the notification immediately upon receipt.
     payload = json.dumps({
         "type": "message_push",
         "recipient": recipient_username.lower(),
@@ -177,7 +160,6 @@ async def send_web_push(recipient_username: str, title: str, body: str, sender: 
         "body": body,
         "avatar": safe_icon,
     })
-
 
     tasks = []
     for sub in subscriptions:
@@ -188,7 +170,10 @@ async def send_web_push(recipient_username: str, title: str, body: str, sender: 
         tasks.append(send_single_web_push_with_retry(subscription_info, payload))
 
     if tasks:
-        await asyncio.gather(*tasks)
+        try:
+            await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=10.0)
+        except Exception as gather_err:
+            print(f"[PUSH] Notice during push dispatch: {gather_err}")
 
 
 # NOTE: send_call_push has been intentionally removed.

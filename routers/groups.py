@@ -11,7 +11,7 @@ from storage.r2 import (
     delete_media_url_from_r2_and_local,
     delete_message_attachments_from_contents,
 )
-from websocket.manager import active_connections, get_email_by_username, send_to_user_by_email
+from websocket.manager import active_connections, get_email_by_username, send_to_user_by_email, safe_send_ws, remove_dead_socket
 from config import LOCAL_AVATARS_DIR, R2_CDN_BASE, R2_BUCKET_NAME
 
 router = APIRouter(prefix="/api", tags=["groups"])
@@ -39,10 +39,9 @@ async def perform_group_disband_cleanup(group_id: str, members_to_notify: list):
     for m in members_to_notify:
         if m in active_connections:
             for conn in list(active_connections[m]):
-                try:
-                    await conn.send_text(broadcast_payload)
-                except Exception:
-                    pass
+                ok = await safe_send_ws(conn, broadcast_payload, timeout=2.0)
+                if not ok:
+                    remove_dead_socket(conn, m)
 
 
 async def _delete_message_attachments(contents: list):
@@ -330,10 +329,9 @@ async def api_kick_group_member(group_id: str, payload: dict, token: str = Depen
         await send_to_user_by_email(target_email, broadcast_payload)
     elif target_user in active_connections:
         for conn in list(active_connections[target_user]):
-            try:
-                await conn.send_text(broadcast_payload)
-            except Exception:
-                pass
+            ok = await safe_send_ws(conn, broadcast_payload, timeout=2.0)
+            if not ok:
+                remove_dead_socket(conn, target_user)
 
     return {"success": True, "message": f"Successfully kicked {target_user}", "members": remaining_usernames}
 
@@ -378,10 +376,9 @@ async def api_update_group_avatar(group_id: str, payload: dict, token: str = Dep
     for m in members:
         if m in active_connections:
             for conn in list(active_connections[m]):
-                try:
-                    await conn.send_text(broadcast_payload)
-                except Exception:
-                    pass
+                ok = await safe_send_ws(conn, broadcast_payload, timeout=2.0)
+                if not ok:
+                    remove_dead_socket(conn, m)
 
     return {"success": True, "avatar": avatar_url}
 
@@ -417,10 +414,9 @@ async def api_rename_group(group_id: str, payload: dict, token: str = Depends(ge
     for m in members:
         if m in active_connections:
             for conn in list(active_connections[m]):
-                try:
-                    await conn.send_text(broadcast_payload)
-                except Exception:
-                    pass
+                ok = await safe_send_ws(conn, broadcast_payload, timeout=2.0)
+                if not ok:
+                    remove_dead_socket(conn, m)
 
     return {"success": True, "name": new_name}
 

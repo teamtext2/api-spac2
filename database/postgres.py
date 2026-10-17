@@ -29,7 +29,7 @@ async def execute_pg_query(query: str, *args):
     # 2. Acquire from pool for standalone query
     if pg_pool:
         try:
-            async with pg_pool.acquire() as conn:
+            async with pg_pool.acquire(timeout=5.0) as conn:
                 if query.strip().upper().startswith("SELECT"):
                     records = await conn.fetch(query, *args)
                     return [dict(r) for r in records]
@@ -37,9 +37,11 @@ async def execute_pg_query(query: str, *args):
                     await conn.execute(query, *args)
                     return [{"success": True}]
         except Exception as e:
-            print(f"PostgreSQL query error, attempting local SQLite fallback: {e}")
+            print(f"[PostgreSQL Query Error]: {e} | Query: {query[:120]}")
+            # Do NOT fall back to local synchronous SQLite when PostgreSQL is the active production DB
+            raise e
 
-    # SQLite FALLBACK FOR LOCAL DEV
+    # SQLite FALLBACK FOR LOCAL DEV ONLY (when pg_pool was never initialized)
     return execute_sqlite_query(query, *args)
 
 
@@ -53,10 +55,13 @@ async def initialize_pg_pool():
             user=POSTGRES_USER,
             password=POSTGRES_PASSWORD,
             database=POSTGRES_DB,
-            min_size=1,
-            max_size=10
+            min_size=2,
+            max_size=30,
+            timeout=10.0,
+            command_timeout=15.0,
+            max_inactive_connection_lifetime=300.0
         )
-        print("PostgreSQL connection pool created successfully!")
+        print("PostgreSQL connection pool created successfully (min=2, max=30, timeout=10s, cmd_timeout=15s)!")
     except Exception as e:
         print(f"Failed to initialize PostgreSQL pool: {e}")
         pg_pool = None
