@@ -133,6 +133,11 @@ app.websocket("/ws/{username}")(websocket_endpoint)
 # --- Startup & Shutdown Events ---
 @app.on_event("startup")
 async def startup_event():
+    try:
+        import anyio.to_thread
+        anyio.to_thread.current_default_thread_limiter().total_tokens = 100
+    except Exception as e:
+        print(f"[Startup] Could not raise threadpool limit: {e}")
     await initialize_pg_pool()
     await initialize_pg_schema()
     asyncio.create_task(heartbeat_check_loop())

@@ -1,3 +1,4 @@
+import asyncio
 import uuid
 import os
 import urllib.parse
@@ -5,7 +6,7 @@ import unicodedata
 import re
 from typing import Optional, Dict, Any, List, Union
 from fastapi import APIRouter, HTTPException, Depends, File, UploadFile, Query, Request
-from fastapi.responses import StreamingResponse, FileResponse
+from fastapi.responses import StreamingResponse, FileResponse, RedirectResponse
 import httpx
 from database.postgres import execute_pg_query
 from auth.deps import get_auth_token, verify_auth_token
@@ -250,8 +251,32 @@ async def api_get_presigned_url(
         raise HTTPException(status_code=500, detail=f"Failed to generate upload URL: {str(e)}")
 
 
+# Cap concurrent proxied downloads so heavy files can never starve the event loop /
+# threadpool that every other user's API calls and WebSocket traffic depend on.
+_DOWNLOAD_PROXY_LIMIT = 6
+_download_sem = asyncio.Semaphore(_DOWNLOAD_PROXY_LIMIT)
+_STREAM_CHUNK = 256 * 1024
+_TRUSTED_DOWNLOAD_HOSTS = ("cdn.spac2.com", "spac2.com", "api1.spac2.com", "cdn1.spac2.com", "cdn2.spac2.com", "localhost", "127.0.0.1")
+
+
+def _is_trusted_download_url(url: str) -> bool:
+    host = (urllib.parse.urlparse(url).hostname or "").lower()
+    return any(host == d or host.endswith("." + d) for d in _TRUSTED_DOWNLOAD_HOSTS)
+
+
+async def _acquire_download_slot():
+    try:
+        await asyncio.wait_for(_download_sem.acquire(), timeout=3.0)
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            status_code=503,
+            detail="Server is busy with other downloads, please retry shortly",
+            headers={"Retry-After": "3"},
+        )
+
+
 @router.get("/download")
-async def api_download_file(url: str, filename: str):
+async def api_download_file(request: Request, url: str, filename: str):
     content_disp = get_content_disposition(filename)
 
     try:
@@ -271,28 +296,74 @@ async def api_download_file(url: str, filename: str):
             cdn_base = f"{R2_AVATAR_CDN_BASE}/" if url.startswith(f"{R2_AVATAR_CDN_BASE}/") else f"{R2_CDN_BASE}/"
             key = url.replace(cdn_base, "").split("?")[0]
             if r2_client and R2_BUCKET_NAME:
+                # 1) Browser navigation (<a href download>): send the browser straight to R2 via a
+                #    short-lived presigned URL. No file bytes pass through this API server at all.
+                if request.headers.get("sec-fetch-mode", "").lower() == "navigate":
+                    try:
+                        signed = r2_client.generate_presigned_url(
+                            "get_object",
+                            Params={
+                                "Bucket": R2_BUCKET_NAME,
+                                "Key": key,
+                                "ResponseContentDisposition": content_disp,
+                            },
+                            ExpiresIn=300,
+                        )
+                        return RedirectResponse(signed, status_code=302)
+                    except Exception as sign_err:
+                        print(f"R2 presign failed, falling back to proxy stream: {sign_err}")
+
+                # 2) fetch()/non-navigation clients: bounded, non-blocking proxy stream.
+                await _acquire_download_slot()
                 try:
-                    response = r2_client.get_object(Bucket=R2_BUCKET_NAME, Key=key)
-                    return StreamingResponse(
-                        response["Body"],
-                        media_type=response.get("ContentType", "application/octet-stream"),
-                        headers={"Content-Disposition": content_disp}
+                    response = await run_in_threadpool(
+                        r2_client.get_object, Bucket=R2_BUCKET_NAME, Key=key
                     )
                 except Exception as r2_err:
+                    _download_sem.release()
                     print(f"R2 get_object failed: {r2_err}")
+                else:
+                    body = response["Body"]
+
+                    async def r2_stream():
+                        try:
+                            while True:
+                                chunk = await run_in_threadpool(body.read, _STREAM_CHUNK)
+                                if not chunk:
+                                    break
+                                yield chunk
+                        finally:
+                            try:
+                                body.close()
+                            except Exception:
+                                pass
+                            _download_sem.release()
+
+                    headers = {"Content-Disposition": content_disp}
+                    if response.get("ContentLength") is not None:
+                        headers["Content-Length"] = str(response["ContentLength"])
+                    return StreamingResponse(
+                        r2_stream(),
+                        media_type=response.get("ContentType", "application/octet-stream"),
+                        headers=headers
+                    )
 
         if url.startswith("http://") or url.startswith("https://"):
-            trusted_domains = ("cdn.spac2.com", "spac2.com", "api1.spac2.com", "cdn1.spac2.com", "cdn2.spac2.com", "localhost", "127.0.0.1")
-            if not any(d in url for d in trusted_domains):
+            if not _is_trusted_download_url(url):
                 raise HTTPException(status_code=400, detail="Untrusted download domain")
 
+            await _acquire_download_slot()
+
             async def stream_file():
-                async with httpx.AsyncClient() as client:
-                    async with client.stream("GET", url) as r:
-                        if r.status_code != 200:
-                            raise HTTPException(status_code=r.status_code, detail="Failed to fetch file from source")
-                        async for chunk in r.aiter_bytes():
-                            yield chunk
+                try:
+                    async with httpx.AsyncClient(timeout=httpx.Timeout(15.0, read=60.0)) as client:
+                        async with client.stream("GET", url) as r:
+                            if r.status_code != 200:
+                                return
+                            async for chunk in r.aiter_bytes(_STREAM_CHUNK):
+                                yield chunk
+                finally:
+                    _download_sem.release()
 
             return StreamingResponse(
                 stream_file(),
@@ -307,3 +378,4 @@ async def api_download_file(url: str, filename: str):
     except Exception as e:
         print(f"Error handling download proxy: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
