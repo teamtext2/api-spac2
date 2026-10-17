@@ -24,7 +24,7 @@ email_to_username: Dict[str, str] = {}  # email -> username (current)
 buffered_call_signals: Dict[str, list] = {}
 
 
-async def safe_send_ws(ws: WebSocket, payload: str, timeout: float = 3.0) -> bool:
+async def safe_send_ws(ws: WebSocket, payload: str, timeout: float = 1.5) -> bool:
     """
     Safely send text to a WebSocket with a strict timeout.
     Prevents half-open/paused client connections from blocking the asyncio event loop.
@@ -178,25 +178,20 @@ async def _dispatch_to_local_subscribers(ping_data: dict) -> int:
     r_id = str(ping_data.get("resource_id", "")).strip()
     r_key = f"{app_code}:{r_id}".lower()
 
-    subscribers = resource_subscribers.get(r_key)
+    subscribers = list(resource_subscribers.get(r_key, set()))
     if not subscribers:
         return 0
 
     payload = json.dumps(ping_data)
-    dead_sockets = []
-    sent_count = 0
 
-    for ws in list(subscribers):
-        ok = await safe_send_ws(ws, payload, timeout=3.0)
-        if ok:
-            sent_count += 1
-        else:
-            dead_sockets.append(ws)
+    async def _send_to_sub(ws):
+        ok = await safe_send_ws(ws, payload, timeout=1.5)
+        if not ok:
+            remove_dead_socket(ws)
+        return ok
 
-    for ws in dead_sockets:
-        remove_dead_socket(ws)
-
-    return sent_count
+    results = await asyncio.gather(*[_send_to_sub(ws) for ws in subscribers], return_exceptions=True)
+    return sum(1 for r in results if r is True)
 
 
 async def coalesce_and_dispatch_invalidation(data: dict):
@@ -316,11 +311,17 @@ async def send_to_user_by_email(email: str, payload: str):
     """Send a message to a user identified by email, looking up their current username."""
     email = email.strip().lower()
     username = email_to_username.get(email)
+    if not username:
+        username = await get_username_by_email(email)
     if username and username in active_connections:
-        for ws in list(active_connections[username]):
-            ok = await safe_send_ws(ws, payload, timeout=3.0)
-            if not ok:
-                remove_dead_socket(ws, username)
+        sockets = list(active_connections[username])
+        if sockets:
+            async def _send(ws):
+                ok = await safe_send_ws(ws, payload, timeout=1.5)
+                if not ok:
+                    remove_dead_socket(ws, username)
+                return ok
+            await asyncio.gather(*[_send(ws) for ws in sockets], return_exceptions=True)
 
 
 async def get_username_by_email(email: str) -> str:
@@ -424,9 +425,18 @@ async def broadcast_user_status(username: str, status: str, last_seen: str):
         "status": status,
         "last_seen": last_seen
     })
+
+    async def _send_status(ws, friend_uname):
+        ok = await safe_send_ws(ws, payload, timeout=1.5)
+        if not ok:
+            remove_dead_socket(ws, friend_uname)
+        return ok
+
+    tasks = []
     for friend in friends:
         if friend in active_connections:
             for ws in list(active_connections[friend]):
-                ok = await safe_send_ws(ws, payload, timeout=3.0)
-                if not ok:
-                    remove_dead_socket(ws, friend)
+                tasks.append(_send_status(ws, friend))
+
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)

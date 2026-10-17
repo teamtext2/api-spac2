@@ -19,14 +19,14 @@ async def api_call_reject(req: CallRejectRequest):
             "sender": recipient,
             "recipient": caller
         })
-        for ws in list(active_connections[caller]):
-            ok = await safe_send_ws(ws, payload, timeout=2.0)
-            if ok:
-                success = True
-            else:
+        async def _send_reject(ws):
+            ok = await safe_send_ws(ws, payload, timeout=1.5)
+            if not ok:
                 remove_dead_socket(ws, caller)
+            return ok
 
-        if success:
+        results = await asyncio.gather(*[_send_reject(ws) for ws in list(active_connections[caller])], return_exceptions=True)
+        if any(r is True for r in results):
             print(f"[REST Call Reject] Sent call_reject to @{caller} from @{recipient}")
             return {"status": "success"}
         else:

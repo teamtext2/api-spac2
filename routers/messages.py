@@ -677,15 +677,18 @@ async def api_delete_messages(req: DeleteMessagesRequest, token: str = Depends(g
                     "sender": username,
                     "message_ids": del_ids
                 })
+                async def _send_del(w, p):
+                    sent = await safe_send_ws(w, del_payload, timeout=1.5)
+                    if not sent:
+                        remove_dead_socket(w, p)
+
+                del_tasks = []
                 for peer in affected_peers:
                     if peer in active_connections:
                         for ws in list(active_connections[peer]):
-                            try:
-                                sent = await safe_send_ws(ws, del_payload, timeout=2.0)
-                                if not sent:
-                                    remove_dead_socket(ws, peer)
-                            except Exception:
-                                remove_dead_socket(ws, peer)
+                            del_tasks.append(_send_del(ws, peer))
+                if del_tasks:
+                    await asyncio.gather(*del_tasks, return_exceptions=True)
         return {"status": "success"}
     except Exception as e:
         print(f"Error deleting messages in Postgres: {e}")
@@ -762,15 +765,18 @@ async def api_delete_conversation(req: DeleteConversationRequest, token: str = D
             "sender": username,
             "friend_username": friend_username
         })
+        async def _send_conv_del(w, p):
+            sent = await safe_send_ws(w, del_conv_payload, timeout=1.5)
+            if not sent:
+                remove_dead_socket(w, p)
+
+        conv_tasks = []
         for peer in peers_to_notify:
             if peer in active_connections:
                 for ws in list(active_connections[peer]):
-                    try:
-                        sent = await safe_send_ws(ws, del_conv_payload, timeout=2.0)
-                        if not sent:
-                            remove_dead_socket(ws, peer)
-                    except Exception:
-                        remove_dead_socket(ws, peer)
+                    conv_tasks.append(_send_conv_del(ws, peer))
+        if conv_tasks:
+            await asyncio.gather(*conv_tasks, return_exceptions=True)
 
         return {"status": "success"}
     except Exception as e:

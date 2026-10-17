@@ -52,7 +52,7 @@ async def heartbeat_check_loop():
         for ws in stale_websockets:
             print("[HEARTBEAT] Closing stale websocket connection due to inactivity")
             try:
-                await ws.close(code=1001)
+                await asyncio.wait_for(ws.close(code=1001), timeout=1.0)
             except Exception:
                 pass
             if ws in connection_metadata:

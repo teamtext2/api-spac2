@@ -52,10 +52,11 @@ async def api_add_friend(req: FriendRequest, token: str = Depends(get_auth_token
                 "senderEmail": email,
                 "text": f"@{username} added you as a friend!"
             })
-            for ws in list(active_connections[friend_username]):
-                ok = await safe_send_ws(ws, payload, timeout=2.0)
+            async def _send_fr(ws):
+                ok = await safe_send_ws(ws, payload, timeout=1.5)
                 if not ok:
                     remove_dead_socket(ws, friend_username)
+            await asyncio.gather(*[_send_fr(ws) for ws in list(active_connections[friend_username])], return_exceptions=True)
 
         return {"status": "success", "message": f"You are now friends with @{friend_username}."}
     except Exception as e:
