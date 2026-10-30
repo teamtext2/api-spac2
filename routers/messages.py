@@ -84,7 +84,11 @@ async def api_get_undelivered_messages(username: str, token: str = Depends(get_a
 
 
 @router.get("/conversations/{username}")
-async def api_get_conversations(username: str, token: str = Depends(get_auth_token)):
+async def api_get_conversations(
+    username: str,
+    limit: int = Query(50, ge=1, le=100),
+    token: str = Depends(get_auth_token)
+):
     username = username.strip().lower()
     email = await get_email_by_username(username)
     if not email or not await verify_auth_token(token, email):
@@ -294,14 +298,19 @@ async def api_get_conversations(username: str, token: str = Depends(get_auth_tok
                 })
 
         conversations.sort(key=lambda c: (1 if c.get("isSavedMessages") else 0, c.get("timestamp", 0)), reverse=True)
-        return conversations
+        return conversations[:limit]
     except Exception as e:
         print(f"Error fetching conversations for @{username}: {e}")
         return []
 
 
 @router.get("/messages/sync/{username}")
-async def api_sync_messages(username: str, since: float = 0.0, token: str = Depends(get_auth_token)):
+async def api_sync_messages(
+    username: str,
+    since: float = 0.0,
+    limit: int = Query(60, ge=1, le=100),
+    token: str = Depends(get_auth_token)
+):
     username = username.strip().lower()
 
     email = await get_email_by_username(username)
@@ -326,8 +335,9 @@ async def api_sync_messages(username: str, since: float = 0.0, token: str = Depe
                 WHERE (LOWER(sender_id) = ANY($1::varchar[]) OR LOWER(recipient_id) = ANY($1::varchar[]) OR LOWER(recipient_id) = ANY($3::varchar[])) 
                   AND (COALESCE(update_id, 0) > $2 OR (update_id IS NULL AND $2 = 0))
                 ORDER BY COALESCE(update_id, 0) ASC, created_at ASC
+                LIMIT $4
                 """,
-                user_identifiers, int(since), user_groups_clean
+                user_identifiers, int(since), user_groups_clean, limit
             )
         else:
             if since > 1e11:
@@ -341,8 +351,9 @@ async def api_sync_messages(username: str, since: float = 0.0, token: str = Depe
                 WHERE (LOWER(sender_id) = ANY($1::varchar[]) OR LOWER(recipient_id) = ANY($1::varchar[]) OR LOWER(recipient_id) = ANY($3::varchar[])) 
                   AND created_at > $2
                 ORDER BY COALESCE(update_id, 0) ASC, created_at ASC
+                LIMIT $4
                 """,
-                user_identifiers, since_dt, user_groups_clean
+                user_identifiers, since_dt, user_groups_clean, limit
             )
 
         unique_senders = list(set(msg["sender"] for msg in messages)) if messages else []
@@ -370,11 +381,14 @@ async def api_sync_messages(username: str, since: float = 0.0, token: str = Depe
 
         undelivered_ids = [msg["id"] for msg in messages if msg["recipient"] == username and not msg["delivered"]]
         if undelivered_ids:
-            await execute_pg_query(
-                "UPDATE messages SET delivered = TRUE WHERE id = ANY($1::uuid[])",
-                undelivered_ids
-            )
-            print(f"[SYNC] Marked {len(undelivered_ids)} messages as delivered for @{username}")
+            try:
+                await execute_pg_query(
+                    "UPDATE messages SET delivered = TRUE WHERE id = ANY($1::uuid[])",
+                    undelivered_ids
+                )
+                print(f"[SYNC] Marked {len(undelivered_ids)} messages as delivered for @{username}")
+            except Exception as e:
+                print(f"[SYNC] Error marking messages delivered: {e}")
 
         formatted_messages = []
         for msg in messages:

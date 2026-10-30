@@ -29,7 +29,7 @@ async def execute_pg_query(query: str, *args):
     # 2. Acquire from pool for standalone query
     if pg_pool:
         try:
-            async with pg_pool.acquire(timeout=8.0) as conn:
+            async with pg_pool.acquire(timeout=5.0) as conn:
                 if query.strip().upper().startswith("SELECT"):
                     records = await conn.fetch(query, *args)
                     return [dict(r) for r in records]
@@ -37,9 +37,10 @@ async def execute_pg_query(query: str, *args):
                     await conn.execute(query, *args)
                     return [{"success": True}]
         except Exception as e:
-            print(f"PostgreSQL query error, attempting local SQLite fallback: {e}")
+            print(f"PostgreSQL query error: {e}")
+            raise e
 
-    # SQLite FALLBACK FOR LOCAL DEV
+    # SQLite FALLBACK FOR LOCAL DEV (only when PostgreSQL pool is not configured)
     return execute_sqlite_query(query, *args)
 
 
@@ -54,10 +55,10 @@ async def initialize_pg_pool():
             password=POSTGRES_PASSWORD,
             database=POSTGRES_DB,
             min_size=2,
-            max_size=30,
-            command_timeout=25
+            max_size=20,
+            command_timeout=12
         )
-        print("PostgreSQL connection pool created successfully (min=2, max=30, timeout=25s)!")
+        print("PostgreSQL connection pool created successfully (min=2, max=20, timeout=12s)!")
     except Exception as e:
         print(f"Failed to initialize PostgreSQL pool: {e}")
         pg_pool = None
@@ -94,12 +95,25 @@ async def initialize_pg_schema():
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_update_id ON messages(update_id);")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_recipient_delivered ON messages(recipient_id, delivered);")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_pair ON messages(sender_id, recipient_id, created_at);")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_lower_sender ON messages(LOWER(sender_id));")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_lower_recipient ON messages(LOWER(recipient_id));")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_lower_sender_update ON messages(LOWER(sender_id), update_id ASC);")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_lower_recipient_update ON messages(LOWER(recipient_id), update_id ASC);")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_unread_partial ON messages(LOWER(recipient_id)) WHERE read_at IS NULL;")
 
         await conn.execute("""
             CREATE OR REPLACE FUNCTION bump_messages_update_id()
             RETURNS TRIGGER AS $$
             BEGIN
-                NEW.update_id = nextval('messages_update_id_seq');
+                -- Only bump update_id if meaningful content, reactions, read status, or attachments changed.
+                -- Never bump update_id purely for 'delivered = TRUE' to prevent recursive sync loops.
+                IF (OLD.content IS DISTINCT FROM NEW.content) 
+                   OR (OLD.reactions IS DISTINCT FROM NEW.reactions) 
+                   OR (OLD.read_at IS DISTINCT FROM NEW.read_at)
+                   OR (OLD.reply_to IS DISTINCT FROM NEW.reply_to)
+                   OR (OLD.forwarded_from IS DISTINCT FROM NEW.forwarded_from) THEN
+                    NEW.update_id = nextval('messages_update_id_seq');
+                END IF;
                 RETURN NEW;
             END;
             $$ LANGUAGE plpgsql;
@@ -219,6 +233,8 @@ async def initialize_pg_schema():
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_group_members_group_id ON chat_group_members(group_id);")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_group_members_email ON chat_group_members(email);")
         await conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_group_members_username ON chat_group_members(username);")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_group_members_lower_email ON chat_group_members(LOWER(email));")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_group_members_lower_username ON chat_group_members(LOWER(username));")
 
         # ── App Cloud Sync: Notes (Revision-Based Delta Sync) ───────────────
         await conn.execute("""

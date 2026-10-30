@@ -15,5 +15,5 @@ COPY . .
 # Expose the default port for the Realtime API
 EXPOSE 7860
 
-# Run Uvicorn listening on port 7860
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "7860"]
+# Run Uvicorn listening on port 7860 with 4 workers for multi-core parallelism
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "7860", "--workers", "4", "--limit-concurrency", "200", "--timeout-keep-alive", "30"]
