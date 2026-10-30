@@ -29,7 +29,7 @@ async def execute_pg_query(query: str, *args):
     # 2. Acquire from pool for standalone query
     if pg_pool:
         try:
-            async with pg_pool.acquire() as conn:
+            async with pg_pool.acquire(timeout=8.0) as conn:
                 if query.strip().upper().startswith("SELECT"):
                     records = await conn.fetch(query, *args)
                     return [dict(r) for r in records]
@@ -53,10 +53,11 @@ async def initialize_pg_pool():
             user=POSTGRES_USER,
             password=POSTGRES_PASSWORD,
             database=POSTGRES_DB,
-            min_size=1,
-            max_size=10
+            min_size=2,
+            max_size=30,
+            command_timeout=25
         )
-        print("PostgreSQL connection pool created successfully!")
+        print("PostgreSQL connection pool created successfully (min=2, max=30, timeout=25s)!")
     except Exception as e:
         print(f"Failed to initialize PostgreSQL pool: {e}")
         pg_pool = None
