@@ -42,8 +42,8 @@ export default {
     const combinedText = `${subject}\n${rawContent}`;
     let token = null;
 
-    // Standard Spac2 Token Pattern: SPAC2-[A-Z0-9]{6,12}
-    const tokenRegex = /(SPAC2-[A-Z0-9]{6,12})/i;
+    // Standard Spac2 Verification or Password Reset Token Pattern: SPAC2-XXXXXX or RESET-XXXXXX
+    const tokenRegex = /((?:SPAC2|RESET)-[A-Z0-9]{6,12})/i;
     const match = combinedText.match(tokenRegex);
 
     if (match) {
@@ -64,8 +64,8 @@ export default {
 
     console.log(`[Email Verifier] Detected token ${token} for sender ${sender}`);
 
-    // 3. Dispatch Webhook to Spac2 FastAPI Backend
-    const webhookUrl = env.FASTAPI_WEBHOOK_URL || "https://api1.spac2.com/api/auth/email-webhook";
+    // 3. Dispatch Webhook to Spac2 Account Worker (https://api2.spac2.com)
+    const webhookUrl = env.FASTAPI_WEBHOOK_URL || "https://api2.spac2.com/api/auth/email-webhook";
     const webhookSecret = env.WEBHOOK_SECRET_KEY || "spac2_super_secure_secret_2026";
 
     try {
