@@ -602,20 +602,6 @@ async def _handle_reaction(websocket, username, data):
 
 async def _handle_call_signal(websocket, username, data, data_str, msg_type):
     recipient = data.get("recipient", "").strip().lower()
-
-    # Maintain call signal buffer during incoming call setup so transitioning from /chat/ to /chat/call/
-    # never loses the offer or initial ICE candidates
-    if msg_type == "call_offer":
-        buffered_call_signals[recipient] = [data_str]
-    elif msg_type == "ice_candidate":
-        if recipient not in buffered_call_signals:
-            buffered_call_signals[recipient] = []
-        if len(buffered_call_signals[recipient]) < 60:
-            buffered_call_signals[recipient].append(data_str)
-    elif msg_type in ("call_answer", "call_reject", "call_cancel", "call_hangup", "call_busy"):
-        buffered_call_signals.pop(recipient, None)
-        buffered_call_signals.pop(username, None)
-
     if recipient in active_connections:
         for r_ws in list(active_connections[recipient]):
             try:
@@ -623,6 +609,9 @@ async def _handle_call_signal(websocket, username, data, data_str, msg_type):
             except Exception as e:
                 print(f"Failed to forward call signal {msg_type} to a connection of @{recipient}: {e}")
     else:
+        if recipient not in buffered_call_signals:
+            buffered_call_signals[recipient] = []
+        buffered_call_signals[recipient].append(data_str)
         print(f"[CALL] Buffered {msg_type} for offline/transitioning user @{recipient}")
 
         if msg_type == "call_offer":
