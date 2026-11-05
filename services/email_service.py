@@ -17,7 +17,9 @@ def _build_otp_html(
     action_note: str,
     expires_in_minutes: int = 5
 ) -> str:
-    """Generate a responsive, modern HTML template for Spac2 security emails."""
+    """Generate a responsive, minimalist, modern HTML template for Spac2 security emails."""
+    formatted_code = " ".join(list(str(otp_code).strip()))
+
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -25,128 +27,132 @@ def _build_otp_html(
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>{title}</title>
   <style>
-    body, table, td, a {{ -webkit-text-size-adjust: 100%; -ms-text-size-adjust: 100%; }}
+    body, table, td, p, a, li, blockquote {{ -webkit-text-size-adjust: 100%; -ms-text-size-adjust: 100%; }}
+    table, td {{ mso-table-lspace: 0pt; mso-table-rspace: 0pt; }}
+    img {{ -ms-interpolation-mode: bicubic; }}
     body {{
       margin: 0;
       padding: 0;
-      background-color: #0b0f19;
+      background-color: #060709;
       font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
-      color: #e2e8f0;
+      color: #f1f5f9;
     }}
-    .email-container {{
-      max-width: 560px;
-      margin: 30px auto;
-      background: #111827;
-      border: 1px solid #1f2937;
-      border-radius: 16px;
+    .wrapper {{
+      width: 100%;
+      table-layout: fixed;
+      background-color: #060709;
+      padding: 40px 16px;
+    }}
+    .card {{
+      max-width: 480px;
+      margin: 0 auto;
+      background: #0f1117;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      border-radius: 20px;
       overflow: hidden;
-      box-shadow: 0 20px 40px rgba(0, 0, 0, 0.4);
+      box-shadow: 0 24px 48px rgba(0, 0, 0, 0.6);
     }}
-    .header {{
-      background: linear-gradient(135deg, #1e1b4b 0%, #0f172a 100%);
-      padding: 28px 32px;
-      border-bottom: 1px solid #1f2937;
+    .inner {{
+      padding: 38px 36px 32px;
       text-align: center;
     }}
-    .logo {{
-      font-size: 26px;
+    .brand {{
+      font-size: 18px;
       font-weight: 800;
-      letter-spacing: 2px;
+      letter-spacing: 3px;
       color: #38bdf8;
-      text-decoration: none;
+      text-transform: uppercase;
+      margin-bottom: 28px;
       display: inline-block;
     }}
-    .content {{
-      padding: 36px 32px;
+    .brand-dot {{
+      color: #38bdf8;
+      margin-right: 2px;
     }}
     h1 {{
       font-size: 22px;
       font-weight: 700;
-      color: #f8fafc;
-      margin-top: 0;
-      margin-bottom: 12px;
+      color: #ffffff;
+      margin: 0 0 10px 0;
+      letter-spacing: -0.3px;
     }}
-    p {{
-      font-size: 15px;
-      line-height: 1.6;
+    .subtitle {{
+      font-size: 14px;
+      line-height: 1.5;
       color: #94a3b8;
-      margin: 0 0 18px 0;
+      margin: 0 0 28px 0;
     }}
-    .otp-box {{
-      background: #0f172a;
-      border: 1.5px dashed #38bdf8;
-      border-radius: 12px;
-      padding: 22px;
-      text-align: center;
-      margin: 28px 0;
+    .otp-capsule {{
+      background: #08090d;
+      border: 1.5px solid rgba(56, 189, 248, 0.35);
+      border-radius: 14px;
+      padding: 22px 16px;
+      margin: 0 auto 20px auto;
+      box-shadow: 0 0 30px rgba(56, 189, 248, 0.08);
     }}
-    .otp-label {{
-      font-size: 12px;
-      text-transform: uppercase;
-      letter-spacing: 1.5px;
-      color: #64748b;
-      margin-bottom: 8px;
-    }}
-    .otp-code {{
-      font-size: 34px;
+    .otp-number {{
+      font-size: 36px;
       font-weight: 800;
-      font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
-      color: #38bdf8;
-      letter-spacing: 10px;
+      letter-spacing: 8px;
+      color: #ffffff;
+      font-family: 'JetBrains Mono', 'SF Mono', Consolas, 'Liberation Mono', Menlo, monospace;
       margin: 0;
-      padding-left: 10px;
+      padding-left: 8px;
+      text-shadow: 0 0 16px rgba(56, 189, 248, 0.35);
     }}
-    .warning {{
-      font-size: 13px;
-      color: #f59e0b;
-      background: rgba(245, 158, 11, 0.08);
-      border-left: 3px solid #f59e0b;
-      padding: 12px 14px;
-      border-radius: 4px;
-      margin-top: 24px;
-    }}
-    .footer {{
-      background: #090d16;
-      padding: 24px 32px;
-      text-align: center;
-      border-top: 1px solid #1f2937;
+    .meta-tag {{
       font-size: 12px;
       color: #64748b;
+      margin: 0 0 24px 0;
+      letter-spacing: 0.3px;
     }}
-    .footer a {{
-      color: #38bdf8;
-      text-decoration: none;
+    .divider {{
+      height: 1px;
+      background: rgba(255, 255, 255, 0.06);
+      margin: 24px 0;
+    }}
+    .footer-note {{
+      font-size: 12px;
+      line-height: 1.6;
+      color: #475569;
+      margin: 0;
+    }}
+    .copyright {{
+      font-size: 11px;
+      color: #334155;
+      margin-top: 20px;
+      letter-spacing: 0.5px;
     }}
   </style>
 </head>
 <body>
-  <div style="display:none;font-size:1px;color:#333;line-height:1px;max-height:0px;max-width:0px;opacity:0;overflow:hidden;">
+  <div style="display:none;font-size:1px;color:#060709;line-height:1px;max-height:0px;max-width:0px;opacity:0;overflow:hidden;">
     {preheader}
   </div>
-  <div class="email-container">
-    <div class="header">
-      <span class="logo">SPAC2</span>
-    </div>
-    <div class="content">
-      <h1>{greeting}</h1>
-      <p>{description}</p>
-      
-      <div class="otp-box">
-        <div class="otp-label">Verification Code (Expires in {expires_in_minutes} mins)</div>
-        <div class="otp-code">{otp_code}</div>
-      </div>
-      
-      <p>{action_note}</p>
-      
-      <div class="warning">
-        <strong>Security Notice:</strong> Spac2 will never ask for your verification code. Never share this code with anyone.
-      </div>
-    </div>
-    <div class="footer">
-      <p style="margin: 0 0 8px 0;">This email was sent automatically by Spac2 Security System.</p>
-      <p style="margin: 0;">&copy; 2026 Spac2 Ecosystem. All rights reserved.</p>
-    </div>
-  </div>
+  <table class="wrapper" cellpadding="0" cellspacing="0" border="0">
+    <tr>
+      <td align="center">
+        <div class="card">
+          <div class="inner">
+            <div class="brand"><span class="brand-dot">●</span> SPAC2</div>
+            <h1>{greeting}</h1>
+            <p class="subtitle">{description}</p>
+            
+            <div class="otp-capsule">
+              <div class="otp-number">{formatted_code}</div>
+            </div>
+            
+            <p class="meta-tag">Expires in <strong>{expires_in_minutes} minutes</strong> · One-time use</p>
+            
+            <div class="divider"></div>
+            
+            <p class="footer-note">{action_note}</p>
+            <p class="copyright">&copy; 2026 Spac2 · Automated Security Dispatch</p>
+          </div>
+        </div>
+      </td>
+    </tr>
+  </table>
 </body>
 </html>"""
 
