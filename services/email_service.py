@@ -234,8 +234,12 @@ async def send_verification_otp_email(to_email: str, otp_code: str, user_name: O
                     return {"success": True, "id": data.get("id"), "error": None}
                 else:
                     print(f"[Email Service] Cloudflare Worker returned {res.status_code}: {res.text}")
+                    if not RESEND_API_KEY:
+                        return {"success": False, "id": None, "error": f"Cloudflare Worker error ({res.status_code}): {res.text}"}
         except Exception as ex:
             print("[Email Service] Cloudflare Worker dispatch exception:", ex)
+            if not RESEND_API_KEY:
+                return {"success": False, "id": None, "error": f"Failed to reach Cloudflare Worker: {str(ex)}"}
 
     # 2. Fallback to direct Resend API
     title = f"{otp_code} is your Spac2 verification code"
@@ -290,8 +294,12 @@ async def send_password_reset_otp_email(to_email: str, otp_code: str, user_name:
                     return {"success": True, "id": data.get("id"), "error": None}
                 else:
                     print(f"[Email Service] Cloudflare Worker returned {res.status_code}: {res.text}")
+                    if not RESEND_API_KEY:
+                        return {"success": False, "id": None, "error": f"Cloudflare Worker error ({res.status_code}): {res.text}"}
         except Exception as ex:
             print("[Email Service] Cloudflare Worker dispatch exception:", ex)
+            if not RESEND_API_KEY:
+                return {"success": False, "id": None, "error": f"Failed to reach Cloudflare Worker: {str(ex)}"}
 
     # 2. Fallback to direct Resend API
     title = f"{otp_code} is your Spac2 password reset code"
