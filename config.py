@@ -46,6 +46,10 @@ LOCAL_CHAT_DIR = "./data/chat"
 SPAC2_JWT_SECRET = os.getenv("SPAC2_JWT_SECRET", os.getenv("TEXT2_JWT_SECRET", "spac2_ecosystem_super_secret_jwt_key_2026_x89a!"))
 SPAC2_TOKEN_EXPIRE_DAYS = int(os.getenv("SPAC2_TOKEN_EXPIRE_DAYS", os.getenv("TEXT2_TOKEN_EXPIRE_DAYS", "30")))
 
+# --- RESEND EMAIL CONFIGURATION ---
+RESEND_API_KEY = os.getenv("RESEND_API_KEY", "re_egaCLN16_2soseTTHWuJWmMd193hZpG9H")
+RESEND_FROM_EMAIL = os.getenv("RESEND_FROM_EMAIL", "Spac2 Security <no-reply@spac2.com>")
+
 # Backward-compatible aliases
 TEXT2_JWT_SECRET = SPAC2_JWT_SECRET
 TEXT2_TOKEN_EXPIRE_DAYS = SPAC2_TOKEN_EXPIRE_DAYS

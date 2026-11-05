@@ -56,7 +56,7 @@ from database.postgres import initialize_pg_pool, initialize_pg_schema
 from services.heartbeat import heartbeat_check_loop
 
 # --- Routers ---
-from routers import auth, profile, friends, groups, messages, notifications, uploads, calls, admin
+from routers import auth, profile, friends, groups, messages, notifications, uploads, calls, admin, search
 from sync import note_router, task_router, calendar_router, countday_router, mindmap_router, table_router, doc_router
 
 
@@ -121,6 +121,7 @@ app.include_router(mindmap_router)
 app.include_router(table_router)
 app.include_router(doc_router)
 app.include_router(admin.router)
+app.include_router(search.router)
 
 
 

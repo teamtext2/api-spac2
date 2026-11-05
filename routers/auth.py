@@ -12,6 +12,7 @@ from database.postgres import execute_pg_query
 from auth.deps import get_auth_token, create_spac2_token, decode_spac2_token, create_text2_token, decode_text2_token
 from auth.security import hash_password, verify_password, validate_email_format, validate_password_strength
 from services.user_service import get_profile
+from services.email_service import send_verification_otp_email, send_password_reset_otp_email
 from config import DEFAULT_AVATAR_URL
 from websocket.manager import send_to_user_by_email
 
@@ -439,6 +440,319 @@ async def change_password(
     return {
         "status": "success",
         "message": "Đổi mật khẩu thành công! / Password changed successfully."
+    }
+
+
+# ==============================================================================
+# OUTBOUND EMAIL OTP SYSTEM (POWERED BY RESEND API)
+# ==============================================================================
+
+# In-memory OTP storage for 6-digit numeric codes (TTL 5 mins = 300s)
+# Key: email (lowercased) -> { "code": str, "expires_at": float, "attempts": int, "user_id": Optional[int], "sent_at": float }
+_email_verification_otp: Dict[str, Dict[str, Any]] = {}
+_password_reset_otp: Dict[str, Dict[str, Any]] = {}
+
+
+class SendEmailVerifyOtpRequest(BaseModel):
+    email: Optional[str] = None
+
+
+class ConfirmEmailVerifyOtpRequest(BaseModel):
+    otp: str
+    email: Optional[str] = None
+
+
+class SendPasswordResetOtpRequest(BaseModel):
+    email: str
+
+
+class ResetPasswordWithOtpRequest(BaseModel):
+    email: str
+    otp: str
+    new_password: str
+    confirm_password: Optional[str] = None
+
+
+@router.post("/email-verify/send-otp")
+async def send_email_verify_otp(
+    req: SendEmailVerifyOtpRequest,
+    token: Optional[str] = Depends(get_auth_token),
+    x_user_email: Optional[str] = Header(None),
+    x_user_id: Optional[str] = Header(None)
+):
+    """Generate and dispatch a 6-digit OTP to the user's email via Resend."""
+    user_email = (req.email or "").strip().lower()
+    user_id = None
+    username = None
+
+    if token:
+        payload = decode_spac2_token(token)
+        if payload:
+            if not user_email:
+                user_email = (payload.get("email") or "").strip().lower()
+            user_id = payload.get("user_id") or payload.get("id")
+            username = payload.get("username") or payload.get("name")
+
+    if not user_email:
+        for ident in [x_user_email, x_user_id]:
+            if ident and ident.strip():
+                p = await get_profile(ident.strip())
+                if p:
+                    user_email = (p.get("email") or "").strip().lower()
+                    user_id = p.get("id") or p.get("user_id")
+                    username = p.get("username") or p.get("name")
+                    break
+
+    if not user_email or not validate_email_format(user_email):
+        raise HTTPException(status_code=400, detail="A valid email address is required to send verification code.")
+
+    # Check if user exists in database
+    users = await execute_pg_query(
+        "SELECT id, user_id, email, username, is_verified, email_verified FROM users WHERE LOWER(email) = $1",
+        user_email
+    )
+    if users:
+        u = users[0]
+        user_id = u.get("id") or u.get("user_id")
+        username = username or u.get("username")
+        if bool(u.get("is_verified") or u.get("email_verified")):
+            return {
+                "success": True,
+                "already_verified": True,
+                "message": "Your email address is already verified."
+            }
+
+    # Anti-spam rate limiting: 45s between requests
+    now = time.time()
+    existing = _email_verification_otp.get(user_email)
+    if existing and now < existing.get("expires_at", 0):
+        time_since_last = now - existing.get("sent_at", 0)
+        if time_since_last < 45:
+            wait_sec = int(45 - time_since_last) + 1
+            raise HTTPException(
+                status_code=429,
+                detail=f"Please wait {wait_sec} seconds before requesting another code."
+            )
+
+    # Generate 6-digit numeric OTP code
+    otp_code = f"{secrets.randbelow(900000) + 100000}"
+
+    _email_verification_otp[user_email] = {
+        "code": otp_code,
+        "expires_at": now + 300,  # 5 minutes
+        "attempts": 0,
+        "user_id": user_id,
+        "sent_at": now
+    }
+
+    # Dispatch email via Resend
+    delivery = await send_verification_otp_email(to_email=user_email, otp_code=otp_code, user_name=username)
+    if not delivery.get("success"):
+        print(f"[Email Verify OTP] Delivery failure to {user_email}: {delivery.get('error')}")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to send email via Resend: {delivery.get('error') or 'Service unavailable'}"
+        )
+
+    return {
+        "success": True,
+        "message": f"Verification code sent successfully to {user_email}",
+        "email": user_email,
+        "expires_in_seconds": 300
+    }
+
+
+@router.post("/email-verify/confirm-otp")
+async def confirm_email_verify_otp(
+    req: ConfirmEmailVerifyOtpRequest,
+    token: Optional[str] = Depends(get_auth_token),
+    x_user_email: Optional[str] = Header(None),
+    x_user_id: Optional[str] = Header(None)
+):
+    """Verify the 6-digit OTP and mark user account as verified in PostgreSQL."""
+    user_email = (req.email or "").strip().lower()
+
+    if not user_email and token:
+        payload = decode_spac2_token(token)
+        if payload:
+            user_email = (payload.get("email") or "").strip().lower()
+
+    if not user_email:
+        for ident in [x_user_email, x_user_id]:
+            if ident and ident.strip():
+                p = await get_profile(ident.strip())
+                if p:
+                    user_email = (p.get("email") or "").strip().lower()
+                    break
+
+    if not user_email:
+        raise HTTPException(status_code=400, detail="Email address is required.")
+
+    code_input = (req.otp or "").strip()
+    if not code_input or len(code_input) < 4:
+        raise HTTPException(status_code=400, detail="Please enter a valid 6-digit verification code.")
+
+    record = _email_verification_otp.get(user_email)
+    if not record or time.time() > record.get("expires_at", 0):
+        _email_verification_otp.pop(user_email, None)
+        raise HTTPException(status_code=400, detail="Verification code has expired or was not requested. Please request a new code.")
+
+    record["attempts"] += 1
+    if record["attempts"] > 5:
+        _email_verification_otp.pop(user_email, None)
+        raise HTTPException(status_code=400, detail="Too many incorrect attempts. Please request a new code.")
+
+    if record["code"] != code_input:
+        remaining = max(0, 5 - record["attempts"])
+        raise HTTPException(
+            status_code=400,
+            detail=f"Incorrect verification code. {remaining} attempt(s) remaining."
+        )
+
+    # Valid OTP! Mark verified in database
+    user_id = record.get("user_id")
+    if user_id:
+        await execute_pg_query(
+            "UPDATE users SET is_verified = TRUE, email_verified = TRUE, updated_at = CURRENT_TIMESTAMP WHERE id = $1 OR user_id = $1 OR LOWER(email) = $2",
+            user_id, user_email
+        )
+    else:
+        await execute_pg_query(
+            "UPDATE users SET is_verified = TRUE, email_verified = TRUE, updated_at = CURRENT_TIMESTAMP WHERE LOWER(email) = $1",
+            user_email
+        )
+
+    _email_verification_otp.pop(user_email, None)
+
+    # Realtime WebSocket notification
+    try:
+        ws_msg = json.dumps({
+            "type": "EMAIL_VERIFIED",
+            "email": user_email,
+            "message": "Your email address has been verified successfully!"
+        })
+        await send_to_user_by_email(user_email, ws_msg)
+    except Exception as ws_err:
+        print("[Email Verify OTP] WS notify fallback:", ws_err)
+
+    return {
+        "success": True,
+        "message": "Your email has been verified successfully!",
+        "email": user_email
+    }
+
+
+@router.post("/forgot-password/send-otp")
+async def send_forgot_password_otp(req: SendPasswordResetOtpRequest):
+    """Generate and dispatch a 6-digit password reset OTP via Resend."""
+    clean_email = (req.email or "").strip().lower()
+    if not clean_email or not validate_email_format(clean_email):
+        raise HTTPException(status_code=400, detail="Please enter a valid email address.")
+
+    users = await execute_pg_query(
+        "SELECT id, user_id, email, username FROM users WHERE LOWER(email) = $1",
+        clean_email
+    )
+    if not users:
+        raise HTTPException(status_code=404, detail="No Spac2 account found with this email address.")
+
+    user = users[0]
+    user_id = user.get("id") or user.get("user_id")
+    username = user.get("username")
+
+    # Anti-spam rate limiting: 45s between requests
+    now = time.time()
+    existing = _password_reset_otp.get(clean_email)
+    if existing and now < existing.get("expires_at", 0):
+        time_since_last = now - existing.get("sent_at", 0)
+        if time_since_last < 45:
+            wait_sec = int(45 - time_since_last) + 1
+            raise HTTPException(
+                status_code=429,
+                detail=f"Please wait {wait_sec} seconds before requesting another code."
+            )
+
+    otp_code = f"{secrets.randbelow(900000) + 100000}"
+
+    _password_reset_otp[clean_email] = {
+        "code": otp_code,
+        "expires_at": now + 300,  # 5 minutes
+        "attempts": 0,
+        "user_id": user_id,
+        "sent_at": now
+    }
+
+    delivery = await send_password_reset_otp_email(to_email=clean_email, otp_code=otp_code, user_name=username)
+    if not delivery.get("success"):
+        print(f"[Password Reset OTP] Delivery failure to {clean_email}: {delivery.get('error')}")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to send email via Resend: {delivery.get('error') or 'Service unavailable'}"
+        )
+
+    return {
+        "success": True,
+        "message": f"Password reset code sent to {clean_email}",
+        "expires_in_seconds": 300
+    }
+
+
+@router.post("/forgot-password/reset-with-otp")
+async def reset_password_with_otp(req: ResetPasswordWithOtpRequest):
+    """Verify 6-digit OTP and update user's password in PostgreSQL."""
+    clean_email = (req.email or "").strip().lower()
+    if not clean_email or not validate_email_format(clean_email):
+        raise HTTPException(status_code=400, detail="Please enter a valid email address.")
+
+    new_pw = (req.new_password or "").strip()
+    if len(new_pw) < 6:
+        raise HTTPException(status_code=400, detail="New password must be at least 6 characters.")
+
+    if req.confirm_password and req.confirm_password.strip() != new_pw:
+        raise HTTPException(status_code=400, detail="Passwords do not match.")
+
+    code_input = (req.otp or "").strip()
+    if not code_input:
+        raise HTTPException(status_code=400, detail="Please enter the 6-digit verification code.")
+
+    record = _password_reset_otp.get(clean_email)
+    if not record or time.time() > record.get("expires_at", 0):
+        _password_reset_otp.pop(clean_email, None)
+        raise HTTPException(status_code=400, detail="Password reset code has expired or was not requested. Please request a new code.")
+
+    record["attempts"] += 1
+    if record["attempts"] > 5:
+        _password_reset_otp.pop(clean_email, None)
+        raise HTTPException(status_code=400, detail="Too many incorrect attempts. Please request a new code.")
+
+    if record["code"] != code_input:
+        remaining = max(0, 5 - record["attempts"])
+        raise HTTPException(
+            status_code=400,
+            detail=f"Incorrect verification code. {remaining} attempt(s) remaining."
+        )
+
+    # Valid! Hash new password & update DB
+    hashed_pw = hash_password(new_pw)
+    user_id = record.get("user_id")
+
+    if user_id:
+        await execute_pg_query(
+            "UPDATE users SET password_hash = $1, is_verified = TRUE, email_verified = TRUE, updated_at = CURRENT_TIMESTAMP WHERE id = $2 OR user_id = $2 OR LOWER(email) = $3",
+            hashed_pw, user_id, clean_email
+        )
+    else:
+        await execute_pg_query(
+            "UPDATE users SET password_hash = $1, is_verified = TRUE, email_verified = TRUE, updated_at = CURRENT_TIMESTAMP WHERE LOWER(email) = $2",
+            hashed_pw, clean_email
+        )
+
+    _password_reset_otp.pop(clean_email, None)
+    print(f"[Password Reset OTP] Successfully updated password for {clean_email}")
+
+    return {
+        "success": True,
+        "message": "Password reset successfully! You can now sign in with your new password."
     }
 
 
