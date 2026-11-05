@@ -46,9 +46,11 @@ LOCAL_CHAT_DIR = "./data/chat"
 SPAC2_JWT_SECRET = os.getenv("SPAC2_JWT_SECRET", os.getenv("TEXT2_JWT_SECRET", "spac2_ecosystem_super_secret_jwt_key_2026_x89a!"))
 SPAC2_TOKEN_EXPIRE_DAYS = int(os.getenv("SPAC2_TOKEN_EXPIRE_DAYS", os.getenv("TEXT2_TOKEN_EXPIRE_DAYS", "30")))
 
-# --- RESEND EMAIL CONFIGURATION ---
-RESEND_API_KEY = os.getenv("RESEND_API_KEY", "re_egaCLN16_2soseTTHWuJWmMd193hZpG9H")
+# --- RESEND & CLOUDFLARE EMAIL WORKER CONFIGURATION ---
+RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
 RESEND_FROM_EMAIL = os.getenv("RESEND_FROM_EMAIL", "Spac2 Security <no-reply@spac2.com>")
+CLOUDFLARE_MAIL_WORKER_URL = os.getenv("CLOUDFLARE_MAIL_WORKER_URL", "https://email-verify.spac2.com").rstrip("/")
+WORKER_SECRET_KEY = os.getenv("WORKER_SECRET_KEY", "spac2_super_secure_secret_2026")
 
 # Backward-compatible aliases
 TEXT2_JWT_SECRET = SPAC2_JWT_SECRET

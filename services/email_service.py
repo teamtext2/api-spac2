@@ -2,7 +2,7 @@ import os
 import re
 import httpx
 from typing import Optional, Dict, Any
-from config import RESEND_API_KEY, RESEND_FROM_EMAIL
+from config import RESEND_API_KEY, RESEND_FROM_EMAIL, CLOUDFLARE_MAIL_WORKER_URL, WORKER_SECRET_KEY
 
 
 RESEND_API_ENDPOINT = "https://api.resend.com/emails"
@@ -202,8 +202,36 @@ async def send_resend_email(
 
 
 async def send_verification_otp_email(to_email: str, otp_code: str, user_name: Optional[str] = None) -> Dict[str, Any]:
-    """Send a 6-digit email verification OTP."""
+    """Send a 6-digit email verification OTP (via Cloudflare Worker or direct Resend API)."""
     name_display = user_name or "Spac2 Explorer"
+
+    # 1. Try Cloudflare Worker relay if URL is configured
+    if CLOUDFLARE_MAIL_WORKER_URL:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                res = await client.post(
+                    f"{CLOUDFLARE_MAIL_WORKER_URL}/send-otp",
+                    json={
+                        "email": to_email,
+                        "otp": otp_code,
+                        "type": "verify",
+                        "name": name_display
+                    },
+                    headers={
+                        "Content-Type": "application/json",
+                        "X-Spac2-Secret": WORKER_SECRET_KEY
+                    }
+                )
+                if res.status_code == 200:
+                    data = res.json()
+                    print(f"[Email Service] Dispatched verify OTP via Cloudflare Worker to {to_email}")
+                    return {"success": True, "id": data.get("id"), "error": None}
+                else:
+                    print(f"[Email Service] Cloudflare Worker returned {res.status_code}: {res.text}")
+        except Exception as ex:
+            print("[Email Service] Cloudflare Worker dispatch exception:", ex)
+
+    # 2. Fallback to direct Resend API
     title = f"{otp_code} is your Spac2 verification code"
     preheader = f"Your verification code is {otp_code}. Valid for 5 minutes."
     greeting = "Verify Your Email Address"
@@ -230,8 +258,36 @@ async def send_verification_otp_email(to_email: str, otp_code: str, user_name: O
 
 
 async def send_password_reset_otp_email(to_email: str, otp_code: str, user_name: Optional[str] = None) -> Dict[str, Any]:
-    """Send a 6-digit password reset OTP."""
+    """Send a 6-digit password reset OTP (via Cloudflare Worker or direct Resend API)."""
     name_display = user_name or "Spac2 User"
+
+    # 1. Try Cloudflare Worker relay if URL is configured
+    if CLOUDFLARE_MAIL_WORKER_URL:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                res = await client.post(
+                    f"{CLOUDFLARE_MAIL_WORKER_URL}/send-otp",
+                    json={
+                        "email": to_email,
+                        "otp": otp_code,
+                        "type": "reset",
+                        "name": name_display
+                    },
+                    headers={
+                        "Content-Type": "application/json",
+                        "X-Spac2-Secret": WORKER_SECRET_KEY
+                    }
+                )
+                if res.status_code == 200:
+                    data = res.json()
+                    print(f"[Email Service] Dispatched reset OTP via Cloudflare Worker to {to_email}")
+                    return {"success": True, "id": data.get("id"), "error": None}
+                else:
+                    print(f"[Email Service] Cloudflare Worker returned {res.status_code}: {res.text}")
+        except Exception as ex:
+            print("[Email Service] Cloudflare Worker dispatch exception:", ex)
+
+    # 2. Fallback to direct Resend API
     title = f"{otp_code} is your Spac2 password reset code"
     preheader = f"Reset code: {otp_code}. Valid for 5 minutes."
     greeting = "Password Reset Request"
