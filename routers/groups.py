@@ -11,7 +11,13 @@ from storage.r2 import (
     delete_media_url_from_r2_and_local,
     delete_message_attachments_from_contents,
 )
-from websocket.manager import active_connections, get_email_by_username, send_to_user_by_email
+from websocket.manager import (
+    active_connections,
+    get_email_by_username,
+    send_to_user_by_email,
+    send_ws_to_user,
+    send_ws_to_users,
+)
 from config import LOCAL_AVATARS_DIR, R2_CDN_BASE, R2_BUCKET_NAME
 
 router = APIRouter(prefix="/api", tags=["groups"])
@@ -36,13 +42,8 @@ async def perform_group_disband_cleanup(group_id: str, members_to_notify: list):
     await execute_pg_query("DELETE FROM chat_groups WHERE id = $1", group_id)
 
     broadcast_payload = json.dumps({"type": "group_disbanded", "group_id": group_id})
-    for m in members_to_notify:
-        if m in active_connections:
-            for conn in list(active_connections[m]):
-                try:
-                    await conn.send_text(broadcast_payload)
-                except Exception:
-                    pass
+    if members_to_notify:
+        await send_ws_to_users(members_to_notify, broadcast_payload)
 
 
 async def _delete_message_attachments(contents: list):
@@ -145,15 +146,30 @@ async def api_get_user_groups(username: str, token: str = Depends(get_auth_token
         email, username
     )
 
+    if not rows:
+        return []
+
+    group_ids = [r["id"] for r in rows if r.get("id")]
+    all_member_rows = await execute_pg_query(
+        "SELECT group_id, username, email, role FROM chat_group_members WHERE group_id = ANY($1::varchar[])",
+        group_ids
+    )
+    members_by_group = {}
+    emails_by_group = {}
+    for m in (all_member_rows or []):
+        gid = m["group_id"]
+        members_by_group.setdefault(gid, []).append(m.get("username") or m.get("email"))
+        if m.get("email"):
+            emails_by_group.setdefault(gid, []).append(m["email"])
+
     groups = []
     for r in rows:
-        member_rows = await execute_pg_query("SELECT username, email, role FROM chat_group_members WHERE group_id = $1", r["id"])
-        members = [m["username"] or m["email"] for m in member_rows]
-        member_emails = [m["email"] for m in member_rows if m.get("email")]
+        gid = r["id"]
         groups.append({
-            "id": r["id"], "name": r["name"], "avatar": r["avatar"],
+            "id": gid, "name": r["name"], "avatar": r["avatar"],
             "created_by": r["created_by"], "created_at": r["created_at"],
-            "members": members, "member_emails": member_emails
+            "members": members_by_group.get(gid, []),
+            "member_emails": emails_by_group.get(gid, [])
         })
     return groups
 
@@ -328,12 +344,8 @@ async def api_kick_group_member(group_id: str, payload: dict, token: str = Depen
         await send_to_user_by_email(m_email, broadcast_payload)
     if target_email:
         await send_to_user_by_email(target_email, broadcast_payload)
-    elif target_user in active_connections:
-        for conn in list(active_connections[target_user]):
-            try:
-                await conn.send_text(broadcast_payload)
-            except Exception:
-                pass
+    elif target_user:
+        await send_ws_to_user(target_user, broadcast_payload)
 
     return {"success": True, "message": f"Successfully kicked {target_user}", "members": remaining_usernames}
 
@@ -375,13 +387,8 @@ async def api_update_group_avatar(group_id: str, payload: dict, token: str = Dep
     broadcast_payload = json.dumps({"type": "group_avatar_updated", "group_id": group_id, "avatar": avatar_url, "members": members})
     for m_email in member_emails:
         await send_to_user_by_email(m_email, broadcast_payload)
-    for m in members:
-        if m in active_connections:
-            for conn in list(active_connections[m]):
-                try:
-                    await conn.send_text(broadcast_payload)
-                except Exception:
-                    pass
+    if members:
+        await send_ws_to_users(members, broadcast_payload)
 
     return {"success": True, "avatar": avatar_url}
 
@@ -414,13 +421,8 @@ async def api_rename_group(group_id: str, payload: dict, token: str = Depends(ge
     broadcast_payload = json.dumps({"type": "group_name_updated", "group_id": group_id, "name": new_name})
     for m_email in member_emails:
         await send_to_user_by_email(m_email, broadcast_payload)
-    for m in members:
-        if m in active_connections:
-            for conn in list(active_connections[m]):
-                try:
-                    await conn.send_text(broadcast_payload)
-                except Exception:
-                    pass
+    if members:
+        await send_ws_to_users(members, broadcast_payload)
 
     return {"success": True, "name": new_name}
 

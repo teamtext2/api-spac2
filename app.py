@@ -159,16 +159,11 @@ async def api_diagnostics():
     bucket_contents = []
 
     try:
-        if CLOUDFLARE_ACCOUNT_ID and AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY:
-            endpoint = f"https://{CLOUDFLARE_ACCOUNT_ID}.r2.cloudflarestorage.com"
-            client = boto3.client(
-                "s3",
-                endpoint_url=endpoint,
-                aws_access_key_id=AWS_ACCESS_KEY_ID,
-                aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
-                config=Config(signature_version="s3v4")
+        if r2_client and R2_BUCKET_NAME:
+            from fastapi.concurrency import run_in_threadpool
+            res = await run_in_threadpool(
+                lambda: r2_client.list_objects_v2(Bucket=R2_BUCKET_NAME, MaxKeys=5)
             )
-            res = client.list_objects_v2(Bucket=R2_BUCKET_NAME, MaxKeys=5)
             r2_status = "active"
             if "Contents" in res:
                 bucket_contents = [obj["Key"] for obj in res["Contents"]]

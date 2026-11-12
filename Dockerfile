@@ -15,5 +15,6 @@ COPY . .
 # Expose the default port for the Realtime API
 EXPOSE 7860
 
-# Run Uvicorn listening on port 7860 with 4 workers for multi-core parallelism
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "7860", "--workers", "4", "--limit-concurrency", "200", "--timeout-keep-alive", "30"]
+# Run Uvicorn with optimized low-RAM workers, high keep-alive, and native WebSocket ping/pong
+# Note: Do NOT set a low --limit-concurrency (like 200) because every active WebSocket counts towards concurrency!
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "7860", "--workers", "2", "--timeout-keep-alive", "65", "--ws-ping-interval", "25", "--ws-ping-timeout", "30", "--limit-max-requests", "50000"]

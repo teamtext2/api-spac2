@@ -3,7 +3,7 @@ from fastapi import APIRouter, HTTPException, Depends
 from database.postgres import execute_pg_query
 from auth.deps import get_auth_token, verify_auth_token
 from models.schemas import FriendRequest
-from websocket.manager import active_connections, get_email_by_username
+from websocket.manager import active_connections, get_email_by_username, send_ws_to_user
 from config import DEFAULT_AVATAR_URL
 
 router = APIRouter(prefix="/api", tags=["friends"])
@@ -43,20 +43,14 @@ async def api_add_friend(req: FriendRequest, token: str = Depends(get_auth_token
             id1, id2
         )
 
-        if friend_username in active_connections:
-            for ws in list(active_connections[friend_username]):
-                try:
-                    await ws.send_text(json.dumps({
-                        "type": "friend_request",
-                        "sender": username,
-                        "senderName": sender_name,
-                        "senderAvatar": sender_avatar,
-                        "senderEmail": email,
-                        "text": f"@{username} added you as a friend!"
-                    }))
-                    print(f"Real-time friend notification sent to a connection of @{friend_username}")
-                except Exception as e:
-                    print(f"Failed to send real-time friend notification to a connection of @{friend_username}: {e}")
+        await send_ws_to_user(friend_username, json.dumps({
+            "type": "friend_request",
+            "sender": username,
+            "senderName": sender_name,
+            "senderAvatar": sender_avatar,
+            "senderEmail": email,
+            "text": f"@{username} added you as a friend!"
+        }))
 
         return {"status": "success", "message": f"You are now friends with @{friend_username}."}
     except Exception as e:
@@ -97,7 +91,7 @@ async def api_get_friends(username: str, token: str = Depends(get_auth_token)):
         )
         for friend in friends:
             friend_username = friend.get("username", "").strip().lower()
-            friend["status"] = "online" if friend_username in active_connections else "offline"
+            friend["status"] = "online" if (friend_username in active_connections or friend.get("status") == "online") else "offline"
             fav = friend.get("avatar") or DEFAULT_AVATAR_URL
             friend["avatar"] = fav
             friend["avatar_url"] = fav

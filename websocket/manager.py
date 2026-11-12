@@ -1,8 +1,12 @@
 import json
 import time
+import uuid
 import asyncio
-from typing import Dict, Optional, Any, Set
+from typing import Dict, Optional, Any, Set, List
 from fastapi import WebSocket
+
+# Unique ID for this Uvicorn worker process (used for cross-worker Pub/Sub deduplication)
+WORKER_ID = uuid.uuid4().hex[:8]
 
 # Active WebSocket connections: username -> set of WebSocket connections
 active_connections: Dict[str, set] = {}
@@ -16,12 +20,14 @@ socket_subscriptions: Dict[WebSocket, set] = {}
 _coalesce_buffer: Dict[str, dict] = {}
 _coalesce_tasks: Dict[str, asyncio.Task] = {}
 
-# In-memory username <-> email mapping cache (updated when users connect)
+# In-memory username <-> email mapping cache (updated when users connect, bounded by GC)
 username_to_email: Dict[str, str] = {}  # username -> email
 email_to_username: Dict[str, str] = {}  # email -> username (current)
+MAX_IDENTITY_CACHE_SIZE = 5000
 
 # Buffered call signaling messages (e.g. call_offer, ice_candidate) for offline or transitioning users
 buffered_call_signals: Dict[str, list] = {}
+buffered_call_timestamps: Dict[str, float] = {}
 
 
 async def check_resource_permission(
@@ -246,11 +252,185 @@ async def broadcast_resource_invalidation(
     return 1
 
 
+async def _deliver_local_ws(username: str, payload: str, exclude_ws: Optional[WebSocket] = None) -> int:
+    """Delivers a WebSocket text payload to all local active connections of `username` and prunes dead sockets."""
+    if not username:
+        return 0
+    uname = username.strip().lower()
+    conns = active_connections.get(uname)
+    if not conns:
+        return 0
+
+    sent_count = 0
+    dead_sockets = []
+    for ws in list(conns):
+        if exclude_ws is not None and ws == exclude_ws:
+            continue
+        try:
+            await ws.send_text(payload)
+            sent_count += 1
+        except Exception:
+            dead_sockets.append(ws)
+
+    for ws in dead_sockets:
+        conns.discard(ws)
+        cleanup_socket_subscriptions(ws)
+        connection_metadata.pop(ws, None)
+    if not conns:
+        active_connections.pop(uname, None)
+
+    return sent_count
+
+
+async def _handle_cross_worker_chat_event(data: dict):
+    """Handles chat WebSocket events published from another worker process via PG NOTIFY."""
+    try:
+        origin_worker = data.get("w")
+        if origin_worker == WORKER_ID:
+            return
+        targets = data.get("u") or []
+        if isinstance(targets, str):
+            targets = [targets]
+        payload = data.get("p")
+        if not payload and data.get("msg_id"):
+            # Fallback for oversized messages (>7KB) that couldn't fit directly in pg_notify
+            from database.postgres import execute_pg_query
+            msg_id = data.get("msg_id")
+            rows = await execute_pg_query("SELECT content FROM messages WHERE id = $1::uuid", msg_id)
+            base_obj = data.get("meta") or {}
+            if rows and rows[0].get("content") is not None:
+                base_obj["text"] = rows[0]["content"]
+                payload = json.dumps(base_obj)
+        if not payload:
+            return
+        for uname in targets:
+            await _deliver_local_ws(uname, payload)
+    except Exception as e:
+        print(f"[PG Chat Event] Error handling cross-worker payload: {e}")
+
+
+async def send_ws_to_user(
+    username: str,
+    payload: str,
+    exclude_ws: Optional[WebSocket] = None,
+    local_only: bool = False
+) -> int:
+    """
+    Sends a WebSocket payload to `username` on the current worker AND fans out via
+    PostgreSQL NOTIFY ('spac2_chat_events') so sockets connected to other workers also receive it.
+    """
+    if not username or not payload:
+        return 0
+    uname = username.strip().lower()
+    local_sent = await _deliver_local_ws(uname, payload, exclude_ws=exclude_ws)
+
+    if not local_only:
+        await _publish_cross_worker_event([uname], payload)
+
+    return local_sent
+
+
+async def send_ws_to_users(
+    usernames: List[str],
+    payload: str,
+    exclude_ws: Optional[WebSocket] = None,
+    local_only: bool = False
+) -> int:
+    """Delivers a WebSocket payload to multiple usernames across all workers with a single PG NOTIFY."""
+    if not usernames or not payload:
+        return 0
+    clean_users = list({u.strip().lower() for u in usernames if u and u.strip()})
+    if not clean_users:
+        return 0
+
+    total_local = 0
+    for uname in clean_users:
+        total_local += await _deliver_local_ws(uname, payload, exclude_ws=exclude_ws)
+
+    if not local_only:
+        await _publish_cross_worker_event(clean_users, payload)
+
+    return total_local
+
+
+async def _publish_cross_worker_event(targets: List[str], payload: str):
+    """Publishes a chat event envelope to PostgreSQL NOTIFY channel 'spac2_chat_events'."""
+    from database.postgres import execute_pg_query, pg_pool
+    if not pg_pool or not targets:
+        return
+
+    envelope = json.dumps({"w": WORKER_ID, "u": targets, "p": payload})
+    if len(envelope.encode("utf-8")) > 7200:
+        # Handle >7.2KB chat message by stripping `text` and letting receiving workers fetch by `msg_id`
+        try:
+            parsed = json.loads(payload)
+            msg_id = parsed.get("id")
+            if msg_id and "text" in parsed:
+                meta = dict(parsed)
+                meta.pop("text", None)
+                envelope = json.dumps({"w": WORKER_ID, "u": targets, "msg_id": msg_id, "meta": meta})
+        except Exception:
+            return
+
+    if len(envelope.encode("utf-8")) <= 7900:
+        try:
+            await execute_pg_query("SELECT pg_notify('spac2_chat_events', $1)", envelope)
+        except Exception as e:
+            print(f"[WS Cross-Worker] pg_notify error: {e}")
+
+
+async def is_user_online(username: str) -> bool:
+    """Checks whether `username` is connected on this worker or marked online in PostgreSQL."""
+    if not username:
+        return False
+    uname = username.strip().lower()
+    if uname in active_connections and len(active_connections[uname]) > 0:
+        return True
+    try:
+        from database.postgres import execute_pg_query
+        rows = await execute_pg_query("SELECT status FROM users WHERE username = $1", uname)
+        if rows and rows[0].get("status") == "online":
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def prune_manager_caches():
+    """Garbage-collects bounded identity caches, expired buffered call signals, and orphaned metadata."""
+    now = time.time()
+
+    # 1. Clean expired buffered call signals (> 45s old)
+    for uname in list(buffered_call_signals.keys()):
+        ts = buffered_call_timestamps.get(uname, 0)
+        if now - ts > 45:
+            buffered_call_signals.pop(uname, None)
+            buffered_call_timestamps.pop(uname, None)
+
+    # 2. Bound identity caches while preserving currently connected users
+    if len(username_to_email) > MAX_IDENTITY_CACHE_SIZE:
+        active_users = set(active_connections.keys())
+        preserved_u2e = {u: username_to_email[u] for u in active_users if u in username_to_email}
+        username_to_email.clear()
+        username_to_email.update(preserved_u2e)
+        email_to_username.clear()
+        for u, em in preserved_u2e.items():
+            email_to_username[em] = u
+
+    # 3. Clean empty sets in active_connections & resource_subscribers
+    for uname in list(active_connections.keys()):
+        if not active_connections[uname]:
+            active_connections.pop(uname, None)
+    for r_key in list(resource_subscribers.keys()):
+        if not resource_subscribers[r_key]:
+            resource_subscribers.pop(r_key, None)
+
+
 async def start_pg_invalidation_listener():
     """
-    Background worker that listens on PostgreSQL channel 'spac2_resource_changed'.
-    Ensures that invalidation pings published on any API instance are fanned out
-    to WebSockets on this instance.
+    Background worker that listens on PostgreSQL channels:
+    - 'spac2_resource_changed' (resource sync invalidation)
+    - 'spac2_chat_events' (cross-worker real-time chat WebSocket delivery)
     """
     import asyncpg
     from config import POSTGRES_HOST, POSTGRES_PORT, POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB
@@ -264,35 +444,39 @@ async def start_pg_invalidation_listener():
                 password=POSTGRES_PASSWORD,
                 database=POSTGRES_DB
             )
-            print("[PG Listen] Connected to PostgreSQL NOTIFY channel 'spac2_resource_changed'")
+            print(f"[PG Listen] Worker {WORKER_ID} connected to 'spac2_resource_changed' & 'spac2_chat_events'")
 
-            def on_notification(connection, pid, channel, payload):
+            def on_resource_notification(connection, pid, channel, payload):
                 try:
                     data = json.loads(payload)
                     asyncio.create_task(coalesce_and_dispatch_invalidation(data))
                 except Exception as err:
-                    print(f"[PG Listen] Error parsing notification payload: {err}")
+                    print(f"[PG Listen] Error parsing resource payload: {err}")
 
-            await conn.add_listener("spac2_resource_changed", on_notification)
+            def on_chat_notification(connection, pid, channel, payload):
+                try:
+                    data = json.loads(payload)
+                    asyncio.create_task(_handle_cross_worker_chat_event(data))
+                except Exception as err:
+                    print(f"[PG Listen] Error parsing chat event payload: {err}")
+
+            await conn.add_listener("spac2_resource_changed", on_resource_notification)
+            await conn.add_listener("spac2_chat_events", on_chat_notification)
 
             while not conn.is_closed():
-                await asyncio.sleep(15)
+                await asyncio.sleep(20)
                 await conn.execute("SELECT 1")
-        except Exception as e:
+        except Exception:
             # Reconnect loop with 3s backoff
             await asyncio.sleep(3)
 
 
 async def send_to_user_by_email(email: str, payload: str):
-    """Send a message to a user identified by email, looking up their current username."""
+    """Send a message to a user identified by email across all workers."""
     email = email.strip().lower()
-    username = email_to_username.get(email)
-    if username and username in active_connections:
-        for ws in list(active_connections[username]):
-            try:
-                await ws.send_text(payload)
-            except Exception:
-                pass
+    username = await get_username_by_email(email)
+    if username:
+        await send_ws_to_user(username, payload)
 
 
 async def get_username_by_email(email: str) -> str:
@@ -353,7 +537,6 @@ async def get_email_by_username(username: str) -> str:
     return ""
 
 
-
 async def get_user_friends(username: str):
     """Return list of friend usernames for a given user."""
     from database.postgres import execute_pg_query
@@ -384,8 +567,7 @@ async def get_user_friends(username: str):
 
 
 async def broadcast_user_status(username: str, status: str, last_seen: str):
-    """Broadcast online/offline status to all friends of the user."""
-    import json
+    """Broadcast online/offline status to all friends of the user across all workers."""
     username = username.strip().lower()
     friends = await get_user_friends(username)
     if not friends:
@@ -396,10 +578,4 @@ async def broadcast_user_status(username: str, status: str, last_seen: str):
         "status": status,
         "last_seen": last_seen
     })
-    for friend in friends:
-        if friend in active_connections:
-            for ws in list(active_connections[friend]):
-                try:
-                    await ws.send_text(payload)
-                except Exception:
-                    pass
+    await send_ws_to_users(friends, payload)

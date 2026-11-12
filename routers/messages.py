@@ -685,20 +685,15 @@ async def api_delete_messages(req: DeleteMessagesRequest, token: str = Depends(g
                         if gm.get("username"):
                             affected_peers.add(gm["username"].strip().lower())
 
-                # 4. Broadcast realtime deletion to all connections of affected participants
-                from websocket.manager import active_connections
+                # 4. Broadcast realtime deletion to all connections of affected participants across all workers
+                from websocket.manager import send_ws_to_users
                 del_payload = json.dumps({
                     "type": "messages_deleted",
                     "sender": username,
                     "message_ids": del_ids
                 })
-                for peer in affected_peers:
-                    if peer in active_connections:
-                        for ws in list(active_connections[peer]):
-                            try:
-                                await ws.send_text(del_payload)
-                            except Exception:
-                                pass
+                if affected_peers:
+                    await send_ws_to_users(list(affected_peers), del_payload)
         return {"status": "success"}
     except Exception as e:
         print(f"Error deleting messages in Postgres: {e}")
@@ -769,20 +764,15 @@ async def api_delete_conversation(req: DeleteConversationRequest, token: str = D
                 )
             peers_to_notify = [username, friend_username]
 
-        # Broadcast conversation deletion to active connections
-        from websocket.manager import active_connections
+        # Broadcast conversation deletion to active connections across all workers
+        from websocket.manager import send_ws_to_users
         del_conv_payload = json.dumps({
             "type": "conversation_deleted",
             "sender": username,
             "friend_username": friend_username
         })
-        for peer in peers_to_notify:
-            if peer in active_connections:
-                for ws in list(active_connections[peer]):
-                    try:
-                        await ws.send_text(del_conv_payload)
-                    except Exception:
-                        pass
+        if peers_to_notify:
+            await send_ws_to_users(peers_to_notify, del_conv_payload)
 
         return {"status": "success"}
     except Exception as e:
@@ -790,39 +780,77 @@ async def api_delete_conversation(req: DeleteConversationRequest, token: str = D
         raise HTTPException(status_code=500, detail=str(e))
 
 
+_link_preview_cache = {}
+_LINK_PREVIEW_MAX_CACHE = 500
+_LINK_PREVIEW_TTL = 3600
+
+
 @router.get("/link-preview")
 async def api_link_preview(url: str):
     url = url.strip()
     if not url.startswith("http://") and not url.startswith("https://"):
         raise HTTPException(status_code=400, detail="Invalid URL protocol")
-    
+
     import re
     import httpx
     import html as html_lib
     from urllib.parse import urlparse
-    
+
+    now = time.time()
+    cached = _link_preview_cache.get(url)
+    if cached and (now - cached[0] < _LINK_PREVIEW_TTL):
+        return cached[1]
+
     try:
-        async with httpx.AsyncClient(timeout=3.0, follow_redirects=True) as client:
+        parsed_url = urlparse(url)
+        domain = (parsed_url.netloc or "").strip().lower()
+        hostname = (parsed_url.hostname or "").strip().lower()
+
+        # Prevent SSRF / internal network probing & skip direct binary extensions
+        if (
+            not hostname
+            or hostname in ("localhost", "127.0.0.1", "0.0.0.0", "::1", "169.254.169.254")
+            or hostname.startswith(("10.", "192.168.", "127."))
+        ):
+            raise HTTPException(status_code=400, detail="Restricted URL host")
+
+        fallback_result = {
+            "title": parsed_url.netloc or "link",
+            "description": "Click to open link",
+            "image": "",
+            "url": url,
+            "domain": parsed_url.netloc or "link"
+        }
+
+        # Stream at most 64KB of HTML so large files (videos, zips, R2 blobs) never load into server RAM
+        timeout = httpx.Timeout(connect=2.5, read=3.0, write=2.5, pool=2.5)
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, max_redirects=3) as client:
             headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+                "User-Agent": "Mozilla/5.0 (compatible; Spac2ChatBot/1.0; +https://spac2.com)",
+                "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.1",
             }
-            resp = await client.get(url, headers=headers)
-            if resp.status_code != 200:
-                # Return basic fallback instead of failing
-                parsed_url = urlparse(url)
-                return {
-                    "title": parsed_url.netloc,
-                    "description": "Click to open link",
-                    "image": "",
-                    "url": url,
-                    "domain": parsed_url.netloc
-                }
-                
-            html_text = resp.text
-            
-            title_match = re.search(r'<title>(.*?)</title>', html_text, re.IGNORECASE | re.DOTALL)
+            async with client.stream("GET", url, headers=headers) as resp:
+                if resp.status_code != 200:
+                    return fallback_result
+
+                ctype = (resp.headers.get("content-type") or "").lower()
+                if "text/html" not in ctype and "application/xhtml" not in ctype:
+                    return fallback_result
+
+                chunks = []
+                total_read = 0
+                async for chunk in resp.aiter_bytes(chunk_size=8192):
+                    chunks.append(chunk)
+                    total_read += len(chunk)
+                    if total_read >= 65536:  # Read at most 64KB for <head> meta tags
+                        break
+
+                html_bytes = b"".join(chunks)
+                html_text = html_bytes.decode("utf-8", errors="ignore")
+
+            title_match = re.search(r'<title[^>]*>(.*?)</title>', html_text, re.IGNORECASE | re.DOTALL)
             title = title_match.group(1).strip() if title_match else ""
-            
+
             def find_meta(name_or_prop):
                 pattern = rf'<meta\s+[^>]*?(?:property|name)=["\']{re.escape(name_or_prop)}["\'][^>]*?content=["\'](.*?)["\']'
                 m = re.search(pattern, html_text, re.IGNORECASE | re.DOTALL)
@@ -834,27 +862,31 @@ async def api_link_preview(url: str):
             og_title = find_meta("og:title")
             og_desc = find_meta("og:description") or find_meta("description")
             og_image = find_meta("og:image")
-            
-            parsed_url = urlparse(url)
-            domain = parsed_url.netloc
-            
-            final_title = og_title or title or domain
-            final_desc = og_desc or ""
+
+            final_title = (og_title or title or parsed_url.netloc)[:200]
+            final_desc = (og_desc or "")[:350]
             final_image = og_image or ""
-            
+
             if final_image and not (final_image.startswith("http://") or final_image.startswith("https://")):
                 if final_image.startswith("/"):
-                    final_image = f"{parsed_url.scheme}://{domain}{final_image}"
+                    final_image = f"{parsed_url.scheme}://{parsed_url.netloc}{final_image}"
                 else:
-                    final_image = f"{parsed_url.scheme}://{domain}/{final_image}"
-            
-            return {
+                    final_image = f"{parsed_url.scheme}://{parsed_url.netloc}/{final_image}"
+
+            result = {
                 "title": html_lib.unescape(final_title),
                 "description": html_lib.unescape(final_desc),
                 "image": final_image,
                 "url": url,
-                "domain": domain
+                "domain": parsed_url.netloc
             }
+
+            if len(_link_preview_cache) >= _LINK_PREVIEW_MAX_CACHE:
+                _link_preview_cache.clear()
+            _link_preview_cache[url] = (now, result)
+            return result
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"Error fetching link preview: {e}")
         try:

@@ -5,6 +5,7 @@ import re
 import time
 import httpx
 import boto3
+from boto3.s3.transfer import TransferConfig
 from botocore.config import Config
 
 try:
@@ -35,13 +36,27 @@ if CLOUDFLARE_ACCOUNT_ID and AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY:
             endpoint_url=endpoint_url,
             aws_access_key_id=AWS_ACCESS_KEY_ID,
             aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
-            config=Config(signature_version="s3v4")
+            config=Config(
+                signature_version="s3v4",
+                max_pool_connections=25,
+                connect_timeout=10,
+                read_timeout=60,
+                retries={"max_attempts": 3, "mode": "adaptive"},
+            )
         )
         print("Cloudflare R2 client initialized successfully!")
     except Exception as e:
         print(f"Failed to initialize Cloudflare R2 client: {e}")
 else:
     print("Cloudflare R2 credentials not fully configured in environment. Fallback to local files.")
+
+# Low-memory multipart transfer config (single-threaded 8MB chunks to prevent server RAM spikes)
+R2_LOW_MEM_TRANSFER_CONFIG = TransferConfig(
+    multipart_threshold=8 * 1024 * 1024,
+    multipart_chunksize=8 * 1024 * 1024,
+    max_concurrency=1,
+    use_threads=False,
+)
 
 
 def compress_image_if_needed(avatar_bytes: bytes, max_dim: int = 512, quality: int = 85) -> tuple:
@@ -476,14 +491,30 @@ def upload_file_to_r2(key: str, file_bytes: bytes, content_type: str) -> str:
 
 
 def upload_fileobj_to_r2(key: str, fileobj, content_type: str) -> str:
-    """Upload a file-like object to R2 and return its CDN URL."""
+    """Upload a file-like object to R2 using low-memory chunking and return its CDN URL."""
     r2_client.upload_fileobj(
         fileobj,
         Bucket=R2_BUCKET_NAME,
         Key=key,
-        ExtraArgs={"ContentType": content_type}
+        ExtraArgs={"ContentType": content_type},
+        Config=R2_LOW_MEM_TRANSFER_CONFIG,
     )
     return f"{R2_CDN_BASE}/{key}"
+
+
+def generate_r2_presigned_download_url(key: str, content_disposition: str, expires_in: int = 3600) -> str:
+    """Generate a presigned GET URL on Cloudflare R2 with Content-Disposition attachment header (zero server RAM)."""
+    if not r2_client or not R2_BUCKET_NAME or not key:
+        return ""
+    return r2_client.generate_presigned_url(
+        ClientMethod="get_object",
+        Params={
+            "Bucket": R2_BUCKET_NAME,
+            "Key": key,
+            "ResponseContentDisposition": content_disposition,
+        },
+        ExpiresIn=expires_in,
+    )
 
 
 def format_bytes(size_bytes: int) -> str:

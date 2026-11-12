@@ -54,22 +54,39 @@ async def initialize_pg_pool():
             user=POSTGRES_USER,
             password=POSTGRES_PASSWORD,
             database=POSTGRES_DB,
-            min_size=2,
-            max_size=20,
-            command_timeout=12
+            min_size=1,
+            max_size=12,
+            max_inactive_connection_lifetime=300.0,
+            command_timeout=15
         )
-        print("PostgreSQL connection pool created successfully (min=2, max=20, timeout=12s)!")
+        print("PostgreSQL connection pool created successfully (min=1, max=12, timeout=15s)!")
     except Exception as e:
         print(f"Failed to initialize PostgreSQL pool: {e}")
         pg_pool = None
 
 
 async def initialize_pg_schema():
-    """Create all required tables and indexes in PostgreSQL."""
+    """Create all required tables and indexes in PostgreSQL safely across multiple workers."""
     global pg_pool
     if not pg_pool:
         return
     async with pg_pool.acquire() as conn:
+        # Use session-level advisory lock so multiple Uvicorn workers don't collide on DDL at startup
+        locked = await conn.fetchval("SELECT pg_try_advisory_lock(20261112);")
+        if not locked:
+            print("[PostgresSchema] Another worker is initializing schema, skipping duplicate DDL run.")
+            return
+        try:
+            await _run_pg_schema_migrations(conn)
+        finally:
+            try:
+                await conn.execute("SELECT pg_advisory_unlock(20261112);")
+            except Exception:
+                pass
+
+
+async def _run_pg_schema_migrations(conn):
+    if True:
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS messages (
                 id UUID PRIMARY KEY,

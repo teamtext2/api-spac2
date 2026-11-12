@@ -1,0 +1,16 @@
+name = "spac2-mail-worker"
+main = "spac2-mail-worker.js"
+compatibility_date = "2024-09-28"
+
+# Bind your KV Namespace (for OTP storage across edge pops)
+# wrangler kv namespace create OTP_KV
+# kv_namespaces = [
+#   { binding = "OTP_KV", id = "<YOUR_KV_NAMESPACE_ID>" }
+# ]
+
+[vars]
+WORKER_SECRET_KEY = "spac2_super_secure_secret_2026"
+ALLOWED_ORIGIN = "https://spac2.com"
+
+# Secrets (Set via: npx wrangler secret put <NAME>)
+# - RESEND_API_KEY
