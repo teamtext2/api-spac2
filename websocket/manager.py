@@ -303,6 +303,18 @@ async def _handle_cross_worker_chat_event(data: dict):
                 payload = json.dumps(base_obj)
         if not payload:
             return
+        if "_flush_worker_call_signals" in payload:
+            try:
+                flush_info = json.loads(payload)
+                flush_user = (flush_info.get("user") or "").strip().lower()
+                if flush_user and flush_user in buffered_call_signals:
+                    queued_sigs = buffered_call_signals.pop(flush_user, [])
+                    buffered_call_timestamps.pop(flush_user, None)
+                    for q_sig in queued_sigs:
+                        await send_ws_to_user(flush_user, q_sig)
+                return
+            except Exception:
+                pass
         for uname in targets:
             await _deliver_local_ws(uname, payload)
     except Exception as e:

@@ -97,6 +97,16 @@ async def websocket_endpoint(websocket: WebSocket, username: str, token: str = Q
         buffered_call_signals.pop(username, None)
         buffered_call_timestamps.pop(username, None)
 
+    # Request cross-worker call signal flush in case another worker buffered signals
+    try:
+        from websocket.manager import _publish_cross_worker_event
+        asyncio.create_task(_publish_cross_worker_event([username], json.dumps({
+            "type": "_flush_worker_call_signals",
+            "user": username
+        })))
+    except Exception:
+        pass
+
     async def sync_db_on_connect():
         # Keep group member's username column in sync
         try:
@@ -200,15 +210,20 @@ async def _cleanup_connection(websocket: WebSocket, username: str):
         active_connections[username].discard(websocket)
         if not active_connections[username]:
             del active_connections[username]
-            try:
-                now_iso = datetime.now(timezone.utc).isoformat()
-                await execute_pg_query(
-                    "UPDATE users SET status = $1, last_seen = $2 WHERE username = $3",
-                    "offline", now_iso, username
-                )
-                await broadcast_user_status(username, "offline", now_iso)
-            except Exception as e:
-                print(f"Failed to update status on disconnect for @{username}: {e}")
+            # Grace window of 8s to prevent status flaps when navigating to /call/ or reloading
+            async def delayed_offline(u: str):
+                await asyncio.sleep(8)
+                if u not in active_connections:
+                    try:
+                        now_iso = datetime.now(timezone.utc).isoformat()
+                        await execute_pg_query(
+                            "UPDATE users SET status = $1, last_seen = $2 WHERE username = $3",
+                            "offline", now_iso, u
+                        )
+                        await broadcast_user_status(u, "offline", now_iso)
+                    except Exception as e:
+                        print(f"Failed to update status on disconnect for @{u}: {e}")
+            asyncio.create_task(delayed_offline(username))
     if websocket in connection_metadata:
         del connection_metadata[websocket]
 
@@ -533,8 +548,8 @@ async def _handle_call_signal(websocket, username, data, data_str, msg_type):
     if not online_elsewhere:
         if recipient not in buffered_call_signals:
             buffered_call_signals[recipient] = []
-        # Cap per-user buffer to 30 signals to prevent RAM buildup
-        if len(buffered_call_signals[recipient]) < 30:
+        # Cap per-user buffer to 50 signals to prevent RAM buildup
+        if len(buffered_call_signals[recipient]) < 50:
             buffered_call_signals[recipient].append(data_str)
         buffered_call_timestamps[recipient] = time.time()
         print(f"[CALL] Buffered {msg_type} for offline/transitioning user @{recipient}")
