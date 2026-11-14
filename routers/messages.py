@@ -327,36 +327,18 @@ async def api_sync_messages(
         is_sequence = (since <= 1000000000.0)
 
         if is_sequence:
-            since_val = int(since)
-            if since_val == 0:
-                # Cold start / empty cache: fetch the newest `limit` messages directly
-                # so the user gets recent conversations immediately without paging through old history.
-                messages = await execute_pg_query(
-                    """
-                    SELECT id, sender_id AS sender, recipient_id AS recipient, content AS text, 
-                           created_at, read_at, reactions, delivered, update_id, reply_to, forwarded_from
-                    FROM messages
-                    WHERE (LOWER(sender_id) = ANY($1::varchar[]) OR LOWER(recipient_id) = ANY($1::varchar[]) OR LOWER(recipient_id) = ANY($2::varchar[]))
-                    ORDER BY COALESCE(update_id, 0) DESC, created_at DESC
-                    LIMIT $3
-                    """,
-                    user_identifiers, user_groups_clean, limit
-                )
-                if messages:
-                    messages = sorted(messages, key=lambda m: (m.get("update_id") or 0, m["created_at"]))
-            else:
-                messages = await execute_pg_query(
-                    """
-                    SELECT id, sender_id AS sender, recipient_id AS recipient, content AS text, 
-                           created_at, read_at, reactions, delivered, update_id, reply_to, forwarded_from
-                    FROM messages
-                    WHERE (LOWER(sender_id) = ANY($1::varchar[]) OR LOWER(recipient_id) = ANY($1::varchar[]) OR LOWER(recipient_id) = ANY($3::varchar[])) 
-                      AND COALESCE(update_id, 0) > $2
-                    ORDER BY COALESCE(update_id, 0) ASC, created_at ASC
-                    LIMIT $4
-                    """,
-                    user_identifiers, since_val, user_groups_clean, limit
-                )
+            messages = await execute_pg_query(
+                """
+                SELECT id, sender_id AS sender, recipient_id AS recipient, content AS text, 
+                       created_at, read_at, reactions, delivered, update_id, reply_to, forwarded_from
+                FROM messages
+                WHERE (LOWER(sender_id) = ANY($1::varchar[]) OR LOWER(recipient_id) = ANY($1::varchar[]) OR LOWER(recipient_id) = ANY($3::varchar[])) 
+                  AND (COALESCE(update_id, 0) > $2 OR (update_id IS NULL AND $2 = 0))
+                ORDER BY COALESCE(update_id, 0) ASC, created_at ASC
+                LIMIT $4
+                """,
+                user_identifiers, int(since), user_groups_clean, limit
+            )
         else:
             if since > 1e11:
                 since = since / 1000.0
@@ -502,7 +484,7 @@ async def api_get_messages_history(
 
             query = """
                 SELECT id, sender_id AS sender, recipient_id AS recipient, content AS text, 
-                       created_at, read_at, reactions, delivered, update_id, reply_to, forwarded_from
+                       created_at, read_at, reactions, delivered, reply_to, forwarded_from
                 FROM messages
                 WHERE LOWER(recipient_id) = $1
             """
@@ -527,7 +509,7 @@ async def api_get_messages_history(
 
             query = """
                 SELECT id, sender_id AS sender, recipient_id AS recipient, content AS text, 
-                       created_at, read_at, reactions, delivered, update_id, reply_to, forwarded_from
+                       created_at, read_at, reactions, delivered, reply_to, forwarded_from
                 FROM messages
                 WHERE ((LOWER(sender_id) = ANY($1::varchar[]) AND LOWER(recipient_id) = ANY($2::varchar[])) 
                     OR (LOWER(sender_id) = ANY($2::varchar[]) AND LOWER(recipient_id) = ANY($1::varchar[])))
@@ -580,7 +562,6 @@ async def api_get_messages_history(
                 "reactions": reactions_dict,
                 "delivered": True if msg["recipient"] == username else msg["delivered"],
                 "senderAvatar": sender_avatars.get(msg["sender"].strip().lower()) or DEFAULT_AVATAR_URL,
-                "update_id": msg.get("update_id", 0),
                 "replyTo": msg.get("reply_to"),
                 "forwardedFrom": msg.get("forwarded_from"),
                 "forwarded": True if msg.get("forwarded_from") else False
