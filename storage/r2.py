@@ -64,14 +64,19 @@ def compress_image_if_needed(avatar_bytes: bytes, max_dim: int = 512, quality: i
     Server-side image optimizer using Pillow:
     Resizes avatar to a standard square (max 512x512), strips EXIF,
     and encodes to WebP format for minimal bandwidth and fastest CDN loading.
+    Strictly manages memory and closes image/stream buffers immediately.
     Returns (optimized_bytes, content_type, extension).
     """
     if not Image:
         print("[AVATAR SERVER] Pillow is not available, using raw bytes.")
         return avatar_bytes, "image/jpeg", "jpg"
 
+    raw_io = io.BytesIO(avatar_bytes)
+    img = None
+    bg_img = None
+    out_io = None
     try:
-        img = Image.open(io.BytesIO(avatar_bytes))
+        img = Image.open(raw_io)
         
         # Convert transparent/palette modes to RGBA/RGB
         if img.mode in ("RGBA", "LA", "P"):
@@ -79,9 +84,12 @@ def compress_image_if_needed(avatar_bytes: bytes, max_dim: int = 512, quality: i
             if img.mode == "P":
                 img = img.convert("RGBA")
             background.paste(img, mask=img.split()[-1] if len(img.split()) == 4 else None)
+            img.close()
             img = background
         elif img.mode != "RGB":
-            img = img.convert("RGB")
+            converted = img.convert("RGB")
+            img.close()
+            img = converted
 
         # Resize if larger than max_dim
         w, h = img.size
@@ -96,9 +104,11 @@ def compress_image_if_needed(avatar_bytes: bytes, max_dim: int = 512, quality: i
             ext = "webp"
         except Exception:
             # Fallback to JPEG if WebP encoder not available in Pillow build
+            out_io.close()
             if img.mode == "RGBA":
                 bg = Image.new("RGB", img.size, (255, 255, 255))
                 bg.paste(img, mask=img.split()[-1])
+                img.close()
                 img = bg
             out_io = io.BytesIO()
             img.save(out_io, format="JPEG", quality=quality, optimize=True)
@@ -113,6 +123,27 @@ def compress_image_if_needed(avatar_bytes: bytes, max_dim: int = 512, quality: i
     except Exception as e:
         print(f"[AVATAR SERVER] Image compression notice: {e}. Using original bytes.")
         return avatar_bytes, "image/jpeg", "jpg"
+    finally:
+        # Guarantee instant cleanup of all PIL Image objects and memory buffers
+        if img is not None:
+            try:
+                img.close()
+            except Exception:
+                pass
+        if bg_img is not None:
+            try:
+                bg_img.close()
+            except Exception:
+                pass
+        if out_io is not None:
+            try:
+                out_io.close()
+            except Exception:
+                pass
+        try:
+            raw_io.close()
+        except Exception:
+            pass
 
 
 def process_and_upload_avatar(username: str, avatar_src: str, base_url: str = "") -> str:

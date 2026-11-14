@@ -5,6 +5,7 @@ import json
 import hmac
 import hashlib
 import base64
+import asyncio
 import platform
 from typing import Optional, List, Dict, Any
 from pydantic import BaseModel
@@ -18,12 +19,14 @@ except ImportError:
 from database.postgres import execute_pg_query
 from storage.r2 import (
     delete_user_r2_and_local_files,
+    delete_media_url_from_r2_and_local,
+    delete_message_attachments_from_contents,
     r2_client,
     get_user_files_storage,
     get_all_r2_storage_summary,
     format_bytes,
 )
-from websocket.manager import active_connections
+from websocket.manager import active_connections, send_ws_to_users, send_to_user_by_email
 from auth.deps import get_auth_token, _b64_url_encode, _b64_url_decode
 from auth.security import hash_password, validate_password_strength
 from config import SPAC2_JWT_SECRET, DEFAULT_AVATAR_URL
@@ -435,8 +438,9 @@ def get_vps_metrics() -> dict:
         }
 
 
-# --- In-Memory Caches for Hero Admin ---
+# --- In-Memory Caches & Concurrency Guards for Hero Admin ---
 _stats_cache = {"data": None, "ts": 0}
+_group_delete_in_progress = set()
 
 
 @router.get("/stats")
@@ -452,8 +456,16 @@ async def api_admin_stats(admin: dict = Depends(require_hero_admin)):
         user_cnt = await execute_pg_query("SELECT COUNT(*) AS count FROM users")
         total_users = int(user_cnt[0]["count"]) if user_cnt else 0
 
+        total_groups = 0
+        try:
+            group_cnt = await execute_pg_query("SELECT COUNT(*) AS count FROM chat_groups")
+            total_groups = int(group_cnt[0]["count"]) if group_cnt else 0
+        except Exception:
+            total_groups = 0
+
         data = {
             "total_users": total_users,
+            "total_groups": total_groups,
             "online_users": len(active_connections),
             "r2_connected": r2_client is not None,
             "system_status": "healthy"
@@ -464,6 +476,7 @@ async def api_admin_stats(admin: dict = Depends(require_hero_admin)):
     except Exception as e:
         return {
             "total_users": 0,
+            "total_groups": 0,
             "online_users": len(active_connections),
             "r2_connected": r2_client is not None,
             "system_status": "error",
@@ -478,6 +491,21 @@ async def api_admin_vps_status(admin: dict = Depends(require_hero_admin)):
     Ultra-lightweight execution for live dashboard telemetry polling.
     """
     return get_vps_metrics()
+
+
+@router.post("/system/gc")
+async def api_admin_trigger_gc(admin: dict = Depends(require_hero_admin)):
+    """
+    Manually trigger Maximum RAM reclamation, multi-gen GC, and OS heap page trimming.
+    Returns detailed memory delta (RSS before, RSS after, MB freed).
+    """
+    from services.memory_cleaner import perform_full_garbage_collection
+    result = perform_full_garbage_collection(force_trim=True)
+    return {
+        "status": "success",
+        "message": f"Dọn RAM cực đại thành công. Đã giải phóng {result.get('freed_mb', 0)} MB.",
+        "result": result
+    }
 
 
 @router.get("/users")
@@ -989,3 +1017,306 @@ async def api_admin_verify_user(
         "email": email,
         "is_verified": verified
     }
+
+
+# --- Chat Room / Group Management Endpoints (VPS-Protected) ---
+
+@router.get("/groups")
+async def api_admin_get_groups(
+    page: int = Query(1, ge=1),
+    limit: int = Query(10, ge=1, le=50),
+    search: Optional[str] = Query(None),
+    sort_by: str = Query("created_desc"),
+    admin: dict = Depends(require_hero_admin)
+):
+    """
+    Get paginated chat groups list using fast SQL pagination.
+    Zero R2 scans and zero N+1 queries to protect VPS CPU/RAM.
+    """
+    search_q = (search or "").strip()
+    offset = (page - 1) * limit
+
+    order_clause = "g.created_at DESC NULLS LAST"
+    if sort_by == "created_asc":
+        order_clause = "g.created_at ASC NULLS LAST"
+    elif sort_by == "name_asc":
+        order_clause = "LOWER(COALESCE(g.name, '')) ASC, g.created_at DESC"
+    elif sort_by == "name_desc":
+        order_clause = "LOWER(COALESCE(g.name, '')) DESC, g.created_at DESC"
+    elif sort_by == "members_desc":
+        order_clause = "member_count DESC, g.created_at DESC"
+
+    if search_q:
+        like_pat = f"%{search_q}%"
+        cnt_res = await execute_pg_query(
+            """
+            SELECT COUNT(*) AS count
+            FROM chat_groups g
+            WHERE g.id ILIKE $1 OR g.name ILIKE $1 OR g.created_by ILIKE $1 OR COALESCE(g.created_by_email, '') ILIKE $1
+            """,
+            like_pat
+        )
+        total = int(cnt_res[0]["count"]) if cnt_res else 0
+
+        rows = await execute_pg_query(
+            f"""
+            SELECT g.id, g.name, g.avatar, COALESCE(g.bio, '') AS bio,
+                   g.created_by, COALESCE(g.created_by_email, '') AS created_by_email,
+                   g.created_at,
+                   COUNT(m.email)::int AS member_count
+            FROM chat_groups g
+            LEFT JOIN chat_group_members m ON g.id = m.group_id
+            WHERE g.id ILIKE $1 OR g.name ILIKE $1 OR g.created_by ILIKE $1 OR COALESCE(g.created_by_email, '') ILIKE $1
+            GROUP BY g.id, g.name, g.avatar, g.bio, g.created_by, g.created_by_email, g.created_at
+            ORDER BY {order_clause}
+            LIMIT $2 OFFSET $3
+            """,
+            like_pat, limit, offset
+        )
+    else:
+        cnt_res = await execute_pg_query("SELECT COUNT(*) AS count FROM chat_groups")
+        total = int(cnt_res[0]["count"]) if cnt_res else 0
+
+        rows = await execute_pg_query(
+            f"""
+            SELECT g.id, g.name, g.avatar, COALESCE(g.bio, '') AS bio,
+                   g.created_by, COALESCE(g.created_by_email, '') AS created_by_email,
+                   g.created_at,
+                   COUNT(m.email)::int AS member_count
+            FROM chat_groups g
+            LEFT JOIN chat_group_members m ON g.id = m.group_id
+            GROUP BY g.id, g.name, g.avatar, g.bio, g.created_by, g.created_by_email, g.created_at
+            ORDER BY {order_clause}
+            LIMIT $1 OFFSET $2
+            """,
+            limit, offset
+        )
+
+    formatted_groups = []
+    for g in (rows or []):
+        created_at_val = g.get("created_at")
+        created_at_str = created_at_val.isoformat() if hasattr(created_at_val, "isoformat") else str(created_at_val or "")
+        formatted_groups.append({
+            "id": g["id"],
+            "name": g.get("name") or "Nhóm không tên",
+            "avatar": g.get("avatar") or "",
+            "bio": g.get("bio") or "",
+            "created_by": g.get("created_by") or "",
+            "created_by_email": g.get("created_by_email") or "",
+            "created_at": created_at_str,
+            "member_count": int(g.get("member_count") or 0)
+        })
+
+    has_more = (offset + len(formatted_groups)) < total
+    return {
+        "groups": formatted_groups,
+        "total": total,
+        "page": page,
+        "limit": limit,
+        "has_more": has_more,
+        "sort_by": sort_by
+    }
+
+
+@router.get("/groups/{group_id}")
+async def api_admin_get_group_detail(
+    group_id: str,
+    admin: dict = Depends(require_hero_admin)
+):
+    """
+    On-demand single group inspection: metadata, members list (capped at 200),
+    and lightweight SQL message/media stats without scanning R2.
+    """
+    gid = group_id.strip().lower()
+    group_rows = await execute_pg_query(
+        """
+        SELECT id, name, avatar, COALESCE(bio, '') AS bio,
+               created_by, COALESCE(created_by_email, '') AS created_by_email, created_at
+        FROM chat_groups
+        WHERE LOWER(id) = LOWER($1)
+        """,
+        gid
+    )
+    if not group_rows:
+        raise HTTPException(status_code=404, detail="Không tìm thấy phòng chat này")
+
+    g = group_rows[0]
+    exact_gid = g["id"]
+
+    # Fetch member count and top 200 members with user profile details
+    mem_cnt_res = await execute_pg_query(
+        "SELECT COUNT(*) AS count FROM chat_group_members WHERE group_id = $1",
+        exact_gid
+    )
+    member_count = int(mem_cnt_res[0]["count"]) if mem_cnt_res else 0
+
+    member_rows = await execute_pg_query(
+        """
+        SELECT m.username, m.email, m.role, m.joined_at,
+               u.name AS display_name, u.avatar AS user_avatar, u.user_id AS uid
+        FROM chat_group_members m
+        LEFT JOIN users u ON LOWER(m.email) = LOWER(u.email) OR LOWER(m.username) = LOWER(u.username)
+        WHERE m.group_id = $1
+        ORDER BY CASE WHEN m.role = 'creator' THEN 0 ELSE 1 END, m.joined_at ASC NULLS LAST
+        LIMIT 200
+        """,
+        exact_gid
+    )
+
+    members = []
+    for m in (member_rows or []):
+        uname = (m.get("username") or "").strip()
+        joined_val = m.get("joined_at")
+        members.append({
+            "user_id": m.get("uid"),
+            "username": uname,
+            "name": (m.get("display_name") or "").strip() or uname or (m.get("email") or ""),
+            "email": m.get("email") or "",
+            "role": m.get("role") or "member",
+            "avatar": m.get("user_avatar") or DEFAULT_AVATAR_URL,
+            "is_online": uname.lower() in active_connections if uname else False,
+            "joined_at": joined_val.isoformat() if hasattr(joined_val, "isoformat") else str(joined_val or "")
+        })
+
+    # Fast SQL aggregate on messages for this group (uses idx_messages_recipient_id)
+    msg_stats = await execute_pg_query(
+        """
+        SELECT COUNT(*) AS msg_count,
+               COALESCE(SUM(LENGTH(COALESCE(content, '')) + 50), 0) AS db_bytes,
+               COUNT(*) FILTER (WHERE content ILIKE '%/chat/%' OR content ILIKE '%/uploads/%' OR content ILIKE '%[Attachment:%' OR content ILIKE '%![%') AS media_msg_count
+        FROM messages
+        WHERE recipient_id = $1
+        """,
+        exact_gid
+    )
+    msg_count = int(msg_stats[0]["msg_count"]) if msg_stats else 0
+    db_bytes = int(msg_stats[0]["db_bytes"]) if msg_stats else 0
+    media_msg_count = int(msg_stats[0]["media_msg_count"]) if msg_stats else 0
+
+    created_val = g.get("created_at")
+    return {
+        "group": {
+            "id": exact_gid,
+            "name": g.get("name") or "Nhóm không tên",
+            "avatar": g.get("avatar") or "",
+            "bio": g.get("bio") or "",
+            "created_by": g.get("created_by") or "",
+            "created_by_email": g.get("created_by_email") or "",
+            "created_at": created_val.isoformat() if hasattr(created_val, "isoformat") else str(created_val or "")
+        },
+        "stats": {
+            "member_count": member_count,
+            "members_shown": len(members),
+            "message_count": msg_count,
+            "media_message_count": media_msg_count,
+            "db_bytes": db_bytes,
+            "db_formatted": format_bytes(db_bytes)
+        },
+        "members": members
+    }
+
+
+@router.delete("/groups/{group_id}")
+async def api_admin_delete_group(
+    group_id: str,
+    admin: dict = Depends(require_hero_admin)
+):
+    """
+    100% COMPLETE & VPS-SAFE PURGE OF A CHAT GROUP:
+    - Uses per-group lock to prevent duplicate concurrent purges
+    - Streams/batches message attachment extraction & R2/local file deletion in worker thread (non-blocking)
+    - Deletes group avatar from R2 & local disk
+    - Deletes all messages, group members, and group record from PostgreSQL
+    - Broadcasts group_disbanded via WebSocket to online members
+    """
+    gid = group_id.strip().lower()
+    if gid in _group_delete_in_progress:
+        raise HTTPException(status_code=409, detail="Phòng chat này đang được xử lý xóa, vui lòng đợi")
+
+    _group_delete_in_progress.add(gid)
+    try:
+        group_rows = await execute_pg_query(
+            "SELECT id, name, avatar, created_by FROM chat_groups WHERE LOWER(id) = LOWER($1)",
+            gid
+        )
+        if not group_rows:
+            raise HTTPException(status_code=404, detail="Không tìm thấy phòng chat này trong hệ thống")
+
+        group_info = group_rows[0]
+        exact_gid = group_info["id"]
+        group_name = group_info.get("name") or exact_gid
+        old_avatar = (group_info.get("avatar") or "").strip()
+
+        # Fetch members before deleting so we can notify them over WebSocket
+        member_rows = await execute_pg_query(
+            "SELECT username, email FROM chat_group_members WHERE group_id = $1",
+            exact_gid
+        )
+        member_usernames = [r["username"] for r in (member_rows or []) if r.get("username")]
+        member_emails = [r["email"] for r in (member_rows or []) if r.get("email")]
+
+        # 1. Batch-fetch message contents (1000 rows per chunk) to avoid RAM spikes,
+        #    and run synchronous boto3 R2 deletions in asyncio.to_thread to keep VPS responsive.
+        deleted_r2_files = 0
+        total_messages = 0
+        batch_size = 1000
+        offset = 0
+
+        while True:
+            msg_batch = await execute_pg_query(
+                "SELECT content FROM messages WHERE recipient_id = $1 ORDER BY created_at ASC LIMIT $2 OFFSET $3",
+                exact_gid, batch_size, offset
+            )
+            if not msg_batch:
+                break
+            total_messages += len(msg_batch)
+            contents = [r["content"] for r in msg_batch if r.get("content")]
+            if contents:
+                deleted_count = await asyncio.to_thread(delete_message_attachments_from_contents, contents)
+                deleted_r2_files += int(deleted_count or 0)
+            if len(msg_batch) < batch_size:
+                break
+            offset += batch_size
+
+        # 2. Delete group avatar from R2 & local disk in worker thread
+        if old_avatar:
+            avatar_deleted = await asyncio.to_thread(delete_media_url_from_r2_and_local, old_avatar)
+            if avatar_deleted:
+                deleted_r2_files += 1
+
+        # 3. Purge Database records
+        await execute_pg_query("DELETE FROM messages WHERE recipient_id = $1", exact_gid)
+        await execute_pg_query("DELETE FROM chat_group_members WHERE group_id = $1", exact_gid)
+        await execute_pg_query("DELETE FROM chat_groups WHERE id = $1", exact_gid)
+
+        # Invalidate stats cache so total_groups refreshes immediately
+        _stats_cache["ts"] = 0
+
+        # 4. Notify members via WebSocket
+        broadcast_payload = json.dumps({"type": "group_disbanded", "group_id": exact_gid})
+        if member_usernames:
+            try:
+                await send_ws_to_users(member_usernames, broadcast_payload)
+            except Exception as ws_err:
+                print(f"[HERO ADMIN] WS notify users error on group delete: {ws_err}")
+        for m_email in member_emails:
+            try:
+                await send_to_user_by_email(m_email, broadcast_payload)
+            except Exception:
+                pass
+
+        print(f"[HERO ADMIN] Purged chat group '{group_name}' ({exact_gid}): {total_messages} msgs, {len(member_rows or [])} members, {deleted_r2_files} R2/local files")
+
+        return {
+            "status": "success",
+            "message": f"Đã xóa vĩnh viễn phòng chat '{group_name}' cùng {deleted_r2_files} file R2 và {total_messages} tin nhắn!",
+            "deleted_group": {
+                "id": exact_gid,
+                "name": group_name,
+                "deleted_messages": total_messages,
+                "deleted_members": len(member_rows or []),
+                "deleted_r2_files": deleted_r2_files
+            }
+        }
+    finally:
+        _group_delete_in_progress.discard(gid)

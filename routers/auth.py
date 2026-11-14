@@ -81,6 +81,44 @@ def _clear_failed_attempts(key: str):
     _lockouts.pop(key, None)
 
 
+def purge_expired_auth_caches() -> Dict[str, int]:
+    """Purge expired OTPs and stale rate-limit counters from memory to prevent leaks."""
+    now = time.time()
+    purged_counts = {"failed_logins": 0, "lockouts": 0, "email_otp": 0, "reset_otp": 0}
+
+    # 1. Purge expired lockouts
+    for key in list(_lockouts.keys()):
+        if now >= _lockouts.get(key, 0):
+            _lockouts.pop(key, None)
+            purged_counts["lockouts"] += 1
+
+    # 2. Purge stale failed login attempts
+    for key in list(_failed_logins.keys()):
+        attempts = _failed_logins.get(key, [])
+        valid_attempts = [t for t in attempts if now - t < 120]
+        if not valid_attempts:
+            _failed_logins.pop(key, None)
+            purged_counts["failed_logins"] += 1
+        elif len(valid_attempts) != len(attempts):
+            _failed_logins[key] = valid_attempts
+
+    # 3. Purge expired verification OTPs (> 5 mins)
+    for key in list(_email_verification_otp.keys()):
+        rec = _email_verification_otp.get(key)
+        if rec and (now > rec.get("expires_at", 0) or now - rec.get("sent_at", 0) > 600):
+            _email_verification_otp.pop(key, None)
+            purged_counts["email_otp"] += 1
+
+    # 4. Purge expired password reset OTPs (> 5 mins)
+    for key in list(_password_reset_otp.keys()):
+        rec = _password_reset_otp.get(key)
+        if rec and (now > rec.get("expires_at", 0) or now - rec.get("sent_at", 0) > 600):
+            _password_reset_otp.pop(key, None)
+            purged_counts["reset_otp"] += 1
+
+    return purged_counts
+
+
 def _set_auth_cookies(response: Response, token: str, user_data: Dict[str, Any]):
     """Set cross-app authentication cookies for standard 30-day ecosystem persistence."""
     max_age = 30 * 86400  # 30 days

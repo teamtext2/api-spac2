@@ -92,6 +92,17 @@ async def get_domain_max_rev(user_id: int, app_code: str) -> int:
 _sqlite_domain_locks: Dict[str, asyncio.Lock] = {}
 
 
+def purge_unused_sqlite_locks() -> int:
+    """Prune unlocked asyncio.Lock instances to prevent unbounded dict growth in SQLite mode."""
+    purged = 0
+    for key in list(_sqlite_domain_locks.keys()):
+        lock = _sqlite_domain_locks.get(key)
+        if lock and not lock.locked():
+            _sqlite_domain_locks.pop(key, None)
+            purged += 1
+    return purged
+
+
 def _get_sqlite_domain_lock(user_id: int, app_code: str) -> asyncio.Lock:
     key = f"{user_id}:{app_code.lower().strip()}"
     if key not in _sqlite_domain_locks:
