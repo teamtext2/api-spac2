@@ -510,7 +510,8 @@ async def start_pg_invalidation_listener():
             while not conn.is_closed():
                 await asyncio.sleep(20)
                 await conn.execute("SELECT 1")
-        except Exception:
+        except Exception as pg_err:
+            print(f"[PG Listen] Worker {WORKER_ID} listener error: {pg_err}")
             # Reconnect loop with 3s backoff
             await asyncio.sleep(3)
 

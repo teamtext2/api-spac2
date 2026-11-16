@@ -93,21 +93,23 @@ async def websocket_endpoint(websocket: WebSocket, username: str, token: str = Q
             cutoff = time.time() - 35.0
             await execute_pg_query("DELETE FROM call_signal_buffer WHERE created_at < $1", cutoff)
             db_signals = await execute_pg_query(
-                """
-                WITH deleted AS (
-                    DELETE FROM call_signal_buffer
-                    WHERE recipient = $1 AND created_at >= $2
-                    RETURNING id, payload
-                )
-                SELECT payload FROM deleted ORDER BY id ASC
-                """,
+                "SELECT id, payload FROM call_signal_buffer WHERE recipient = $1 AND created_at >= $2 ORDER BY id ASC",
                 username, cutoff
             )
             if db_signals:
+                sig_ids = [r["id"] for r in db_signals if "id" in r]
+                if sig_ids:
+                    await execute_pg_query(
+                        "DELETE FROM call_signal_buffer WHERE id = ANY($1::bigint[])",
+                        sig_ids
+                    )
                 print(f"[CALL] Flushing {len(db_signals)} DB buffered call signals for @{username}")
                 for row in db_signals:
+                    sig_payload = row.get("payload")
+                    if not sig_payload:
+                        continue
                     try:
-                        await websocket.send_text(row["payload"])
+                        await websocket.send_text(sig_payload)
                     except Exception as e:
                         print(f"[CALL] Failed to send DB buffered call signal: {e}")
     except Exception as e:

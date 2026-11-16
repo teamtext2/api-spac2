@@ -17,9 +17,11 @@ async def execute_pg_query(query: str, *args):
     """Execute a PostgreSQL query, binding to active transaction if present, falling back to SQLite for local development."""
     global pg_pool
     # 1. Bind to active transaction connection if within an atomic batch transaction
+    q_upper = query.strip().upper()
+    is_fetch = q_upper.startswith("SELECT") or "RETURNING" in q_upper
     active_conn = _current_pg_conn.get()
     if active_conn:
-        if query.strip().upper().startswith("SELECT"):
+        if is_fetch:
             records = await active_conn.fetch(query, *args)
             return [dict(r) for r in records]
         else:
@@ -30,7 +32,7 @@ async def execute_pg_query(query: str, *args):
     if pg_pool:
         try:
             async with pg_pool.acquire(timeout=5.0) as conn:
-                if query.strip().upper().startswith("SELECT"):
+                if is_fetch:
                     records = await conn.fetch(query, *args)
                     return [dict(r) for r in records]
                 else:
