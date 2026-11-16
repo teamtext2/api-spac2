@@ -536,59 +536,134 @@ async def _handle_reaction(websocket, username, data):
         print(f"Error handling reaction: {e}")
 
 
+# Track active pending outgoing call wait tasks: (recipient, caller) -> asyncio.Task
+_pending_call_wait_tasks = {}
+
+
+def _cancel_pending_call_wait(recipient: str, caller: str):
+    key = (recipient.strip().lower(), caller.strip().lower())
+    task = _pending_call_wait_tasks.pop(key, None)
+    if task and not task.done():
+        task.cancel()
+
+
 async def _handle_call_signal(websocket, username, data, data_str, msg_type):
     recipient = data.get("recipient", "").strip().lower()
     if not recipient:
         return
 
-    # Always attempt local + cross-worker delivery first
-    local_sent = await send_ws_to_user(recipient, data_str)
-    online_elsewhere = (local_sent > 0) or (await is_user_online(recipient))
+    sender = username.strip().lower()
 
-    if not online_elsewhere:
-        if recipient not in buffered_call_signals:
-            buffered_call_signals[recipient] = []
-        # Cap per-user buffer to 50 signals to prevent RAM buildup
-        if len(buffered_call_signals[recipient]) < 50:
-            buffered_call_signals[recipient].append(data_str)
-        buffered_call_timestamps[recipient] = time.time()
-        print(f"[CALL] Buffered {msg_type} for offline/transitioning user @{recipient}")
+    # If caller cancels or either side hangs up/rejects/answers, cancel any pending offline wait task
+    if msg_type in ("call_cancel", "call_reject", "call_hangup", "call_answer"):
+        _cancel_pending_call_wait(recipient, sender)
+        _cancel_pending_call_wait(sender, recipient)
+        if msg_type == "call_answer":
+            buffered_call_signals.pop(sender, None)
+            buffered_call_timestamps.pop(sender, None)
 
-        if msg_type == "call_offer":
-            # Send push notification for the call immediately since the user is offline
-            is_video = data.get("isVideo", True)
-            asyncio.create_task(send_call_push(
-                recipient_username=recipient,
-                sender=username,
-                avatar=data.get("senderAvatar", "") or data.get("callerAvatar", "") or DEFAULT_AVATAR_URL,
-                is_video=is_video
-            ))
-            
-            print(f"[CALL] @{recipient} is offline. Call buffered. Waiting up to 30s for reconnect...")
-
-            forwarded = False
-            for _ in range(30):
-                await asyncio.sleep(1)
-                if await is_user_online(recipient):
-                    forwarded = True
-                    # Re-publish buffered signals across workers in case recipient reconnected to another worker
-                    queued = buffered_call_signals.pop(recipient, [])
-                    buffered_call_timestamps.pop(recipient, None)
-                    for sig in queued:
-                        await send_ws_to_user(recipient, sig)
-                    print(f"[CALL] @{recipient} came online! Buffered signals flushed to recipient.")
-                    break
-
-            if not forwarded:
-                print(f"[CALL] @{recipient} still offline after 30s. Sending call_busy to @{username}.")
+        # Clean up stale buffered offer/candidates from this sender to recipient
+        if recipient in buffered_call_signals:
+            filtered = []
+            for sig_str in buffered_call_signals[recipient]:
+                try:
+                    sig_obj = json.loads(sig_str)
+                    if (
+                        sig_obj.get("sender", "").strip().lower() == sender
+                        and sig_obj.get("type") in ("call_offer", "ice_candidate")
+                    ):
+                        continue
+                except Exception:
+                    pass
+                filtered.append(sig_str)
+            if filtered:
+                buffered_call_signals[recipient] = filtered
+            else:
                 buffered_call_signals.pop(recipient, None)
                 buffered_call_timestamps.pop(recipient, None)
+
+    # Always attempt local + cross-worker delivery first
+    local_sent = await send_ws_to_user(recipient, data_str)
+
+    # If recipient has no local WS on this worker, buffer the signal in case they are
+    # offline, waking from push, or transitioning between /chat/ and /chat/call/
+    if local_sent == 0:
+        if recipient not in buffered_call_signals:
+            buffered_call_signals[recipient] = []
+
+        # On a fresh call_offer, replace any stale call_offer/ice_candidate from the same caller
+        if msg_type == "call_offer" and not data.get("renegotiate"):
+            buffered_call_signals[recipient] = [
+                s for s in buffered_call_signals[recipient]
+                if not (
+                    '"sender": "{}"'.format(sender) in s.lower()
+                    and ('"call_offer"' in s or '"ice_candidate"' in s)
+                )
+            ]
+
+        # Cap per-user buffer to 60 signals to prevent RAM buildup
+        if len(buffered_call_signals[recipient]) < 60:
+            buffered_call_signals[recipient].append(data_str)
+        buffered_call_timestamps[recipient] = time.time()
+        print(f"[CALL] Buffered {msg_type} for @{recipient} (local_sent=0)")
+
+        if msg_type == "call_offer" and not data.get("renegotiate"):
+            is_video = data.get("isVideo", True)
+            recipient_marked_online = await is_user_online(recipient)
+
+            # Always send push notification if recipient is not marked online (or if they don't answer quickly)
+            if not recipient_marked_online:
+                asyncio.create_task(send_call_push(
+                    recipient_username=recipient,
+                    sender=sender,
+                    avatar=data.get("senderAvatar", "") or data.get("callerAvatar", "") or DEFAULT_AVATAR_URL,
+                    is_video=is_video
+                ))
+
+            # Run the reconnect wait in a background task so we NEVER block the caller's WebSocket receive loop!
+            _cancel_pending_call_wait(recipient, sender)
+            wait_key = (recipient, sender)
+
+            async def _wait_for_recipient_reconnect():
                 try:
-                    await websocket.send_text(json.dumps({
-                        "type": "call_busy",
-                        "sender": recipient,
-                        "recipient": username,
-                        "reason": "offline"
-                    }))
-                except Exception as e:
-                    print(f"[CALL] Failed to send call_busy to @{username}: {e}")
+                    # Wait up to 35s for recipient to come online and flush buffered signals
+                    for sec in range(35):
+                        await asyncio.sleep(1)
+                        # If buffer was already flushed (e.g. recipient reconnected in websocket_endpoint), we're done
+                        if recipient not in buffered_call_signals:
+                            return
+                        # If recipient is now connected locally, flush immediately
+                        if recipient in active_connections and active_connections[recipient]:
+                            queued = buffered_call_signals.pop(recipient, [])
+                            buffered_call_timestamps.pop(recipient, None)
+                            for sig in queued:
+                                await send_ws_to_user(recipient, sig)
+                            print(f"[CALL] @{recipient} came online! Buffered signals flushed.")
+                            return
+                        # If recipient was marked online in DB (maybe stale tab) and hasn't connected locally after 3s, send push
+                        if sec == 3 and recipient_marked_online:
+                            asyncio.create_task(send_call_push(
+                                recipient_username=recipient,
+                                sender=sender,
+                                avatar=data.get("senderAvatar", "") or data.get("callerAvatar", "") or DEFAULT_AVATAR_URL,
+                                is_video=is_video
+                            ))
+
+                    # Still not flushed after 35s -> notify caller if still connected
+                    buffered_call_signals.pop(recipient, None)
+                    buffered_call_timestamps.pop(recipient, None)
+                    try:
+                        await websocket.send_text(json.dumps({
+                            "type": "call_busy",
+                            "sender": recipient,
+                            "recipient": sender,
+                            "reason": "offline"
+                        }))
+                    except Exception as e:
+                        print(f"[CALL] Failed to send call_busy to @{sender}: {e}")
+                except asyncio.CancelledError:
+                    pass
+                finally:
+                    _pending_call_wait_tasks.pop(wait_key, None)
+
+            _pending_call_wait_tasks[wait_key] = asyncio.create_task(_wait_for_recipient_reconnect())

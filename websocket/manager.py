@@ -1,6 +1,8 @@
 import json
 import time
 import uuid
+import zlib
+import base64
 import asyncio
 from typing import Dict, Optional, Any, Set, List
 from fastapi import WebSocket
@@ -292,6 +294,12 @@ async def _handle_cross_worker_chat_event(data: dict):
         if isinstance(targets, str):
             targets = [targets]
         payload = data.get("p")
+        if payload and data.get("z") == 1:
+            try:
+                payload = zlib.decompress(base64.b64decode(payload.encode("ascii"))).decode("utf-8")
+            except Exception as err:
+                print(f"[PG Chat Event] Error decompressing payload: {err}")
+                return
         if not payload and data.get("msg_id"):
             # Fallback for oversized messages (>7KB) that couldn't fit directly in pg_notify
             from database.postgres import execute_pg_query
@@ -374,6 +382,7 @@ async def _publish_cross_worker_event(targets: List[str], payload: str):
     envelope = json.dumps({"w": WORKER_ID, "u": targets, "p": payload})
     if len(envelope.encode("utf-8")) > 7200:
         # Handle >7.2KB chat message by stripping `text` and letting receiving workers fetch by `msg_id`
+        compressed_handled = False
         try:
             parsed = json.loads(payload)
             msg_id = parsed.get("id")
@@ -381,8 +390,17 @@ async def _publish_cross_worker_event(targets: List[str], payload: str):
                 meta = dict(parsed)
                 meta.pop("text", None)
                 envelope = json.dumps({"w": WORKER_ID, "u": targets, "msg_id": msg_id, "meta": meta})
+                compressed_handled = True
         except Exception:
-            return
+            pass
+
+        if not compressed_handled:
+            # Compress large signaling payloads (e.g. WebRTC call_offer / call_answer SDPs) so pg_notify doesn't drop them
+            try:
+                compressed_b64 = base64.b64encode(zlib.compress(payload.encode("utf-8"), level=6)).decode("ascii")
+                envelope = json.dumps({"w": WORKER_ID, "u": targets, "z": 1, "p": compressed_b64})
+            except Exception:
+                return
 
     if len(envelope.encode("utf-8")) <= 7900:
         try:
