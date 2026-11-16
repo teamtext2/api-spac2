@@ -571,6 +571,22 @@ async def _run_pg_schema_migrations(conn):
             );
         """)
 
+        # ── Cross-Worker WebRTC Call Signaling Buffer ─────────────────────────
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS call_signal_buffer (
+                id BIGSERIAL PRIMARY KEY,
+                recipient VARCHAR(150) NOT NULL,
+                sender VARCHAR(150) NOT NULL,
+                msg_type VARCHAR(50) NOT NULL,
+                payload TEXT NOT NULL,
+                created_at DOUBLE PRECISION NOT NULL
+            );
+        """)
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_call_signal_recipient
+            ON call_signal_buffer(recipient, created_at);
+        """)
+
         for tbl, id_col in sync_tables_cfg:
             try:
                 await conn.execute(f"ALTER TABLE {tbl} DROP COLUMN IF EXISTS visibility CASCADE;")

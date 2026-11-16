@@ -86,9 +86,35 @@ async def websocket_endpoint(websocket: WebSocket, username: str, token: str = Q
 
     print(f"User connected: @{username} ({email}) (user_id={current_user_id}) (Total connections: {len(active_connections[username])})")
 
-    # Flush buffered call signaling messages immediately
+    # Flush buffered call signaling messages immediately (DB-backed cross-worker + local fallback)
+    try:
+        from database.postgres import pg_pool
+        if pg_pool:
+            cutoff = time.time() - 35.0
+            await execute_pg_query("DELETE FROM call_signal_buffer WHERE created_at < $1", cutoff)
+            db_signals = await execute_pg_query(
+                """
+                WITH deleted AS (
+                    DELETE FROM call_signal_buffer
+                    WHERE recipient = $1 AND created_at >= $2
+                    RETURNING id, payload
+                )
+                SELECT payload FROM deleted ORDER BY id ASC
+                """,
+                username, cutoff
+            )
+            if db_signals:
+                print(f"[CALL] Flushing {len(db_signals)} DB buffered call signals for @{username}")
+                for row in db_signals:
+                    try:
+                        await websocket.send_text(row["payload"])
+                    except Exception as e:
+                        print(f"[CALL] Failed to send DB buffered call signal: {e}")
+    except Exception as e:
+        print(f"[CALL] Error flushing DB call signals for @{username}: {e}")
+
     if username in buffered_call_signals and buffered_call_signals[username]:
-        print(f"[CALL] Flushing {len(buffered_call_signals[username])} buffered call signals for @{username}")
+        print(f"[CALL] Flushing {len(buffered_call_signals[username])} local buffered call signals for @{username}")
         for signal_str in buffered_call_signals[username]:
             try:
                 await websocket.send_text(signal_str)
@@ -197,6 +223,13 @@ async def websocket_endpoint(websocket: WebSocket, username: str, token: str = Q
         cleanup_socket_subscriptions(websocket)
         await _cleanup_connection(websocket, username)
         print(f"User disconnected: @{username}")
+    except RuntimeError as e:
+        cleanup_socket_subscriptions(websocket)
+        await _cleanup_connection(websocket, username)
+        if "not connected" not in str(e).lower():
+            print(f"RuntimeError in WebSocket session for @{username}: {e}")
+        else:
+            print(f"User disconnected: @{username}")
     except Exception as e:
         print(f"Error in WebSocket session for @{username}: {e}")
         cleanup_socket_subscriptions(websocket)
@@ -558,6 +591,20 @@ async def _handle_call_signal(websocket, username, data, data_str, msg_type):
     if msg_type in ("call_cancel", "call_reject", "call_hangup", "call_answer"):
         _cancel_pending_call_wait(recipient, sender)
         _cancel_pending_call_wait(sender, recipient)
+        try:
+            from database.postgres import pg_pool
+            if pg_pool:
+                await execute_pg_query(
+                    "DELETE FROM call_signal_buffer WHERE recipient = $1 AND sender = $2 AND msg_type IN ('call_offer', 'ice_candidate')",
+                    recipient, sender
+                )
+                if msg_type == "call_answer":
+                    await execute_pg_query(
+                        "DELETE FROM call_signal_buffer WHERE recipient = $1 AND sender = $2 AND msg_type = 'call_offer'",
+                        sender, recipient
+                    )
+        except Exception:
+            pass
         if msg_type == "call_answer":
             buffered_call_signals.pop(sender, None)
             buffered_call_timestamps.pop(sender, None)
@@ -585,63 +632,68 @@ async def _handle_call_signal(websocket, username, data, data_str, msg_type):
     # Always attempt local + cross-worker delivery first
     local_sent = await send_ws_to_user(recipient, data_str)
 
-    # If recipient has no local WS on this worker, buffer the signal in case they are
-    # offline, waking from push, or transitioning between /chat/ and /chat/call/
+    # If recipient has no local WS on this worker, buffer the signal in DB (and local fallback)
+    # in case they are offline, waking from push, or transitioning between /chat/ and /chat/call/
     if local_sent == 0:
-        if recipient not in buffered_call_signals:
-            buffered_call_signals[recipient] = []
-
-        # On a fresh call_offer, replace any stale call_offer/ice_candidate from the same caller
-        if msg_type == "call_offer" and not data.get("renegotiate"):
-            buffered_call_signals[recipient] = [
-                s for s in buffered_call_signals[recipient]
-                if not (
-                    '"sender": "{}"'.format(sender) in s.lower()
-                    and ('"call_offer"' in s or '"ice_candidate"' in s)
+        from database.postgres import pg_pool
+        now_ts = time.time()
+        if pg_pool:
+            try:
+                if msg_type == "call_offer" and not data.get("renegotiate"):
+                    await execute_pg_query(
+                        "DELETE FROM call_signal_buffer WHERE recipient = $1 AND sender = $2 AND msg_type IN ('call_offer', 'ice_candidate')",
+                        recipient, sender
+                    )
+                await execute_pg_query(
+                    "INSERT INTO call_signal_buffer (recipient, sender, msg_type, payload, created_at) VALUES ($1, $2, $3, $4, $5)",
+                    recipient, sender, msg_type, data_str, now_ts
                 )
-            ]
+            except Exception as e:
+                print(f"[CALL] Failed to buffer signal in DB: {e}")
+        else:
+            if recipient not in buffered_call_signals:
+                buffered_call_signals[recipient] = []
+            if msg_type == "call_offer" and not data.get("renegotiate"):
+                buffered_call_signals[recipient] = [
+                    s for s in buffered_call_signals[recipient]
+                    if not (
+                        '"sender": "{}"'.format(sender) in s.lower()
+                        and ('"call_offer"' in s or '"ice_candidate"' in s)
+                    )
+                ]
+            if len(buffered_call_signals[recipient]) < 60:
+                buffered_call_signals[recipient].append(data_str)
+            buffered_call_timestamps[recipient] = now_ts
 
-        # Cap per-user buffer to 60 signals to prevent RAM buildup
-        if len(buffered_call_signals[recipient]) < 60:
-            buffered_call_signals[recipient].append(data_str)
-        buffered_call_timestamps[recipient] = time.time()
         print(f"[CALL] Buffered {msg_type} for @{recipient} (local_sent=0)")
 
         if msg_type == "call_offer" and not data.get("renegotiate"):
             is_video = data.get("isVideo", True)
-            recipient_marked_online = await is_user_online(recipient)
-
-            # Always send push notification if recipient is not marked online (or if they don't answer quickly)
-            if not recipient_marked_online:
-                asyncio.create_task(send_call_push(
-                    recipient_username=recipient,
-                    sender=sender,
-                    avatar=data.get("senderAvatar", "") or data.get("callerAvatar", "") or DEFAULT_AVATAR_URL,
-                    is_video=is_video
-                ))
-
-            # Run the reconnect wait in a background task so we NEVER block the caller's WebSocket receive loop!
             _cancel_pending_call_wait(recipient, sender)
             wait_key = (recipient, sender)
 
             async def _wait_for_recipient_reconnect():
                 try:
-                    # Wait up to 35s for recipient to come online and flush buffered signals
+                    push_sent = False
+                    # Give cross-worker pg_notify ~1.2s to deliver if recipient is actually online on another worker
                     for sec in range(35):
                         await asyncio.sleep(1)
-                        # If buffer was already flushed (e.g. recipient reconnected in websocket_endpoint), we're done
-                        if recipient not in buffered_call_signals:
-                            return
-                        # If recipient is now connected locally, flush immediately
-                        if recipient in active_connections and active_connections[recipient]:
-                            queued = buffered_call_signals.pop(recipient, [])
-                            buffered_call_timestamps.pop(recipient, None)
-                            for sig in queued:
-                                await send_ws_to_user(recipient, sig)
-                            print(f"[CALL] @{recipient} came online! Buffered signals flushed.")
-                            return
-                        # If recipient was marked online in DB (maybe stale tab) and hasn't connected locally after 3s, send push
-                        if sec == 3 and recipient_marked_online:
+
+                        # Check if another worker already delivered & deleted the call_offer, or recipient flushed it
+                        if pg_pool:
+                            rows = await execute_pg_query(
+                                "SELECT id FROM call_signal_buffer WHERE recipient = $1 AND sender = $2 AND msg_type = 'call_offer' LIMIT 1",
+                                recipient, sender
+                            )
+                            if not rows:
+                                return
+                        else:
+                            if recipient not in buffered_call_signals:
+                                return
+
+                        # After 1s, if still buffered (not delivered on any worker), send Push Notification once
+                        if sec == 1 and not push_sent:
+                            push_sent = True
                             asyncio.create_task(send_call_push(
                                 recipient_username=recipient,
                                 sender=sender,
@@ -649,9 +701,16 @@ async def _handle_call_signal(websocket, username, data, data_str, msg_type):
                                 is_video=is_video
                             ))
 
-                    # Still not flushed after 35s -> notify caller if still connected
-                    buffered_call_signals.pop(recipient, None)
-                    buffered_call_timestamps.pop(recipient, None)
+                    # Still undelivered after 35s -> clean up and notify caller
+                    if pg_pool:
+                        await execute_pg_query(
+                            "DELETE FROM call_signal_buffer WHERE recipient = $1 AND sender = $2 AND msg_type IN ('call_offer', 'ice_candidate')",
+                            recipient, sender
+                        )
+                    else:
+                        buffered_call_signals.pop(recipient, None)
+                        buffered_call_timestamps.pop(recipient, None)
+
                     try:
                         await websocket.send_text(json.dumps({
                             "type": "call_busy",

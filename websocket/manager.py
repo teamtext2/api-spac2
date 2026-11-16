@@ -324,7 +324,21 @@ async def _handle_cross_worker_chat_event(data: dict):
             except Exception:
                 pass
         for uname in targets:
-            await _deliver_local_ws(uname, payload)
+            sent_cnt = await _deliver_local_ws(uname, payload)
+            if sent_cnt > 0:
+                try:
+                    p_obj = json.loads(payload)
+                    p_type = p_obj.get("type", "")
+                    if p_type in ("call_offer", "call_answer", "ice_candidate", "call_reject", "call_cancel", "call_hangup", "call_busy"):
+                        from database.postgres import execute_pg_query, pg_pool
+                        if pg_pool:
+                            p_sender = (p_obj.get("sender") or "").strip().lower()
+                            await execute_pg_query(
+                                "DELETE FROM call_signal_buffer WHERE recipient = $1 AND sender = $2 AND msg_type = $3",
+                                uname.strip().lower(), p_sender, p_type
+                            )
+                except Exception:
+                    pass
     except Exception as e:
         print(f"[PG Chat Event] Error handling cross-worker payload: {e}")
 
