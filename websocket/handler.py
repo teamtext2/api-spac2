@@ -631,11 +631,11 @@ async def _handle_call_signal(websocket, username, data, data_str, msg_type):
                 buffered_call_signals.pop(recipient, None)
                 buffered_call_timestamps.pop(recipient, None)
 
-    # Always attempt local + cross-worker delivery first
-    local_sent = await send_ws_to_user(recipient, data_str)
+    # Check local delivery first; if not on this worker, insert into DB buffer BEFORE pg_notify
+    # so the receiving worker's DELETE never races ahead of our INSERT.
+    from websocket.manager import _deliver_local_ws, _publish_cross_worker_event
+    local_sent = await _deliver_local_ws(recipient, data_str)
 
-    # If recipient has no local WS on this worker, buffer the signal in DB (and local fallback)
-    # in case they are offline, waking from push, or transitioning between /chat/ and /chat/call/
     if local_sent == 0:
         from database.postgres import pg_pool
         now_ts = time.time()
@@ -667,7 +667,9 @@ async def _handle_call_signal(websocket, username, data, data_str, msg_type):
                 buffered_call_signals[recipient].append(data_str)
             buffered_call_timestamps[recipient] = now_ts
 
-        print(f"[CALL] Buffered {msg_type} for @{recipient} (local_sent=0)")
+        # Now publish across workers (if recipient is connected on another worker, it will deliver & delete from DB)
+        await _publish_cross_worker_event([recipient], data_str)
+        print(f"[CALL] Buffered & fanned out {msg_type} for @{recipient} (local_sent=0)")
 
         if msg_type == "call_offer" and not data.get("renegotiate"):
             is_video = data.get("isVideo", True)
